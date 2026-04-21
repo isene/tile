@@ -47,10 +47,19 @@ session. tile inside Xephyr cannot affect your host i3/Gnome/KDE
 session, so a crash or bug just kills the Xephyr window.
 
 ```bash
-sudo apt install xserver-xephyr      # Debian/Ubuntu (Arch: xorg-server-xephyr)
-make xephyr                           # opens DISPLAY=:9 with tile inside
-make xephyr-multi                     # dual-monitor sim with +xinerama
+sudo apt install xserver-xephyr        # Debian/Ubuntu (Arch: xorg-server-xephyr)
+
+make xephyr-full                       # fullscreen Xephyr (recommended for keybind testing)
+make xephyr                            # windowed Xephyr (visual checks; host WM grabs keys)
+make xephyr-multi                      # windowed dual-output simulation (+xinerama)
 ```
+
+**Important:** in **windowed** Xephyr, the host WM (i3, etc.) intercepts
+its own keybindings (e.g. `Mod4+Return`) before they ever reach the
+Xephyr window, so tile never sees them. Use `make xephyr-full` to test
+keybindings — it runs Xephyr fullscreen so the host WM cannot intercept
+input. With `-terminate`, Xephyr exits when tile exits (`Mod4+Shift+q`),
+so you regain your host session immediately.
 
 To launch a test app inside the Xephyr session:
 
