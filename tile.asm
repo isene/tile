@@ -760,25 +760,32 @@ check_redirect_ok:
     ret
 
 grab_hardcoded_keys:
-    ; Mod4+Return
+    ; Phase 1a uses Mod1 (Alt) instead of Mod4 (Win) for dev binds.
+    ; Reason: when developing inside windowed Xephyr, the host WM's
+    ; passive grabs (e.g. i3's bindsym Mod4+...) fire BEFORE the
+    ; Xephyr window can pass the key inward, so tile would never see
+    ; Mod4+anything. Real Mod4 binds land in phase 1b alongside the
+    ; config parser; until then Alt+ is conflict-free with i3.
+    ;
+    ;   Alt+Return  -> exec glass (or fallback)
+    ;   Alt+q       -> kill latest mapped client
+    ;   Alt+Shift+q -> exit tile
     movzx eax, byte [key_return_kc]
     test eax, eax
     jz .ghk_skip_return
     mov edi, eax
-    mov esi, MOD_MOD4
+    mov esi, MOD_MOD1
     call grab_one_key
 .ghk_skip_return:
-    ; Mod4+q
     movzx eax, byte [key_q_kc]
     test eax, eax
     jz .ghk_skip_q
     mov edi, eax
-    mov esi, MOD_MOD4
+    mov esi, MOD_MOD1
     call grab_one_key
-    ; Mod4+Shift+q
     movzx eax, byte [key_q_kc]
     mov edi, eax
-    mov esi, MOD_MOD4 | MOD_SHIFT
+    mov esi, MOD_MOD1 | MOD_SHIFT
     call grab_one_key
 .ghk_skip_q:
     ret
@@ -950,13 +957,13 @@ event_loop:
     ; bytes 4-7 = root window, bytes 8-11 = event window.
     movzx eax, byte [x11_read_buf + 1]
     movzx edx, word [x11_read_buf + 28]
-    ; Strip locks
+    ; Strip locks (NumLock=Mod2, CapsLock=Lock) so binds work either way.
     and edx, ~(MOD_LOCK | MOD_MOD2)
-    ; Mod4+Return -> exec glass/xterm
+    ; Alt+Return -> exec glass/xterm
     movzx ecx, byte [key_return_kc]
     cmp eax, ecx
     jne .kp_not_return
-    cmp edx, MOD_MOD4
+    cmp edx, MOD_MOD1
     jne .kp_done
     call action_exec_terminal
     jmp .kp_done
@@ -964,9 +971,9 @@ event_loop:
     movzx ecx, byte [key_q_kc]
     cmp eax, ecx
     jne .kp_done
-    cmp edx, MOD_MOD4 | MOD_SHIFT
+    cmp edx, MOD_MOD1 | MOD_SHIFT
     je .kp_exit
-    cmp edx, MOD_MOD4
+    cmp edx, MOD_MOD1
     jne .kp_done
     call action_kill_latest
 .kp_done:

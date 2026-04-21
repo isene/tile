@@ -49,22 +49,33 @@ session, so a crash or bug just kills the Xephyr window.
 ```bash
 sudo apt install xserver-xephyr        # Debian/Ubuntu (Arch: xorg-server-xephyr)
 
-make xephyr-full                       # fullscreen Xephyr (recommended for keybind testing)
-make xephyr                            # windowed Xephyr (visual checks; host WM grabs keys)
-make xephyr-multi                      # windowed dual-output simulation (+xinerama)
+make xephyr                            # windowed Xephyr (1280x800)
+make xephyr-multi                      # dual-output simulation (+xinerama)
 ```
 
-**Important:** in **windowed** Xephyr, the host WM (i3, etc.) intercepts
-its own keybindings (e.g. `Mod4+Return`) before they ever reach the
-Xephyr window, so tile never sees them. Use `make xephyr-full` to test
-keybindings — it runs Xephyr fullscreen so the host WM cannot intercept
-input. With `-terminate`, Xephyr exits when tile exits (`Mod4+Shift+q`),
-so you regain your host session immediately.
+### A subtlety about keybindings
+
+Xephyr (even with `-fullscreen`) does **not** shield keystrokes from
+the host window manager. The host WM's passive key grabs fire first —
+if your host i3 binds `Mod4+Return`, then `Mod4+Return` typed inside
+Xephyr is captured by i3, not delivered to tile.
+
+To stay out of the host's way during phase 1a development, tile uses
+Alt-based dev binds (Alt is essentially unused by typical i3 configs):
+
+| Key | Action |
+|-----|--------|
+| `Alt+Return`  | Spawn glass (or xterm fallback) |
+| `Alt+q`       | Kill the most-recently-mapped client |
+| `Alt+Shift+q` | Exit tile (Xephyr stays open, just unmanaged) |
+
+These are hardcoded for now. Real `Mod4+`-style binds, fully
+configurable from `~/.tilerc`, arrive in phase 1b.
 
 To launch a test app inside the Xephyr session:
 
 ```bash
-DISPLAY=:9 xterm                       # or: DISPLAY=:9 glass
+DISPLAY=:9 glass                        # or: DISPLAY=:9 xterm
 ```
 
 ## Phase 1a current capabilities
@@ -77,10 +88,11 @@ This is the absolute MVP, used to validate the X11 plumbing.
 - Maps incoming MapRequest windows full-screen (no tiling yet, no
   workspaces)
 - Grants ConfigureRequest geometry (clamped to screen)
-- Three hardcoded keybindings:
-  - `Mod4+Return` → exec glass (or fall back to xterm)
-  - `Mod4+q` → kill the focused (most recent) window
-  - `Mod4+Shift+q` → exit tile
+- Three hardcoded keybindings (Alt-based for windowed-Xephyr compatibility,
+  see "A subtlety about keybindings" above):
+  - `Alt+Return` → exec glass (or fall back to xterm)
+  - `Alt+q` → kill the focused (most recent) window
+  - `Alt+Shift+q` → exit tile
 
 No config, no layouts, no workspaces, no bar. Those land in phases
 1b through 2c — see PLAN.md.
