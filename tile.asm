@@ -258,23 +258,6 @@ default_glass_arg:
     db "/home/geir/Main/G/GIT-isene/glass/glass", 0
 default_glass_arg_len equ $ - default_glass_arg - 1
 
-; Diagnostic strings (temporary).
-dbg_binds_str: db "tile: binds="
-dbg_binds_len  equ $ - dbg_binds_str
-dbg_execs_str: db " execs="
-dbg_execs_len  equ $ - dbg_execs_str
-dbg_kp_str:    db "tile: KP kc="
-dbg_kp_len     equ $ - dbg_kp_str
-dbg_mod_str:   db " mod="
-dbg_mod_len    equ $ - dbg_mod_str
-dbg_bind_str:  db "tile: bind["
-dbg_bind_len   equ $ - dbg_bind_str
-dbg_bkc_str:   db "] ks="
-dbg_bkc_len    equ $ - dbg_bkc_str
-dbg_bmod_str:  db " kc="
-dbg_bmod_len   equ $ - dbg_bmod_str
-dbg_bact_str:  db " act="
-dbg_bact_len   equ $ - dbg_bact_str
 
 ; ══════════════════════════════════════════════════════════════════════
 ; BSS
@@ -341,7 +324,6 @@ arg_pool_pos:        resd 1
 config_buf:          resb CFG_BUF_SIZE
 config_len:          resq 1
 config_path:         resb 512
-dbg_buf:             resb 256
 
 ; X11 buffers
 conn_setup_buf:      resb 16384
@@ -382,7 +364,6 @@ _start:
     mov dword [arg_pool_pos], 1
     mov byte [arg_pool], 0
     call load_config
-    call dbg_print_config
 
     ; Become the WM by selecting substructure-redirect on root.
     call select_substructure_redirect
@@ -1141,7 +1122,6 @@ event_loop:
     movzx eax, byte [x11_read_buf + 1]
     movzx edx, word [x11_read_buf + 28]
     and edx, ~(MOD_LOCK | MOD_MOD2)      ; strip locks
-    call dbg_keypress
     call dispatch_keypress
     jmp event_loop
 
@@ -2214,134 +2194,6 @@ lookup_action:
 .la_none:
     xor eax, eax
     pop rbx
-    ret
-
-; ══════════════════════════════════════════════════════════════════════
-; Diagnostic: write "tile: binds=N execs=M kc0=K0 mod0=M0 ks0=S0\n" to
-; stderr so we can see what the config parser produced. Temporary until
-; phase 1b.1 lands cleanly.
-; ══════════════════════════════════════════════════════════════════════
-dbg_print_config:
-    push rbx
-    push r12
-    lea rdi, [dbg_buf]
-    lea rsi, [dbg_binds_str]
-    mov rcx, dbg_binds_len
-    call dbg_copy
-    mov eax, [bind_count]
-    call itoa                    ; itoa advances rdi itself
-    lea rsi, [dbg_execs_str]
-    mov rcx, dbg_execs_len
-    call dbg_copy
-    mov eax, [exec_count]
-    call itoa
-    mov byte [rdi], 10
-    inc rdi
-    lea rsi, [dbg_buf]
-    mov rdx, rdi
-    sub rdx, rsi
-    mov rax, SYS_WRITE
-    mov rdi, 2
-    syscall
-    xor ebx, ebx
-.dpc_loop:
-    cmp ebx, [bind_count]
-    jge .dpc_done
-    mov r12, rbx
-    imul r12, BIND_STRIDE
-    add r12, bind_table
-    lea rdi, [dbg_buf]
-    lea rsi, [dbg_bind_str]
-    mov rcx, dbg_bind_len
-    call dbg_copy
-    mov eax, ebx
-    call itoa
-    lea rsi, [dbg_bkc_str]
-    mov rcx, dbg_bkc_len
-    call dbg_copy
-    mov eax, [r12]
-    call itoa
-    lea rsi, [dbg_bmod_str]      ; " kc="
-    mov rcx, dbg_bmod_len
-    call dbg_copy
-    mov eax, [r12 + 4]
-    call itoa
-    mov byte [rdi], ' '
-    inc rdi
-    mov byte [rdi], 'm'
-    inc rdi
-    mov byte [rdi], '='
-    inc rdi
-    movzx eax, word [r12 + 8]
-    call itoa
-    lea rsi, [dbg_bact_str]
-    mov rcx, dbg_bact_len
-    call dbg_copy
-    movzx eax, byte [r12 + 10]
-    call itoa
-    mov byte [rdi], 10
-    inc rdi
-    lea rsi, [dbg_buf]
-    mov rdx, rdi
-    sub rdx, rsi
-    mov rax, SYS_WRITE
-    mov rdi, 2
-    syscall
-    inc ebx
-    jmp .dpc_loop
-.dpc_done:
-    pop r12
-    pop rbx
-    ret
-
-; Called from .ev_key_press. eax=keycode, edx=modifiers.
-dbg_keypress:
-    push rbx
-    push r12
-    push r13
-    mov r12d, eax                ; keycode
-    mov r13d, edx                ; modifiers
-    lea rdi, [dbg_buf]
-    lea rsi, [dbg_kp_str]
-    mov rcx, dbg_kp_len
-    call dbg_copy
-    mov eax, r12d
-    call itoa                    ; itoa advances rdi
-    lea rsi, [dbg_mod_str]
-    mov rcx, dbg_mod_len
-    call dbg_copy
-    mov eax, r13d
-    call itoa
-    mov byte [rdi], 10
-    inc rdi
-    lea rsi, [dbg_buf]
-    mov rdx, rdi
-    sub rdx, rsi
-    mov rax, SYS_WRITE
-    mov rdi, 2
-    syscall
-    ; Restore caller's eax/edx (it uses them after return).
-    mov eax, r12d
-    mov edx, r13d
-    pop r13
-    pop r12
-    pop rbx
-    ret
-
-; rdi=dest, rsi=src, rcx=len. Copies and advances rdi.
-dbg_copy:
-    push rcx
-    xor edx, edx
-.dc_loop:
-    cmp rdx, rcx
-    jge .dc_done
-    mov al, [rsi + rdx]
-    mov [rdi + rdx], al
-    inc rdx
-    jmp .dc_loop
-.dc_done:
-    add rdi, rcx
-    pop rcx
     ret
 
 ; ══════════════════════════════════════════════════════════════════════
