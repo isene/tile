@@ -50,6 +50,7 @@
 %define X11_CREATE_GC           55
 %define X11_CHANGE_GC           56
 %define X11_FREE_GC             60
+%define X11_POLY_RECTANGLE      67
 %define X11_POLY_FILL_RECT      70
 
 ; CW masks (for CreateWindow / ChangeWindowAttributes value mask)
@@ -130,8 +131,11 @@
 %define DEFAULT_BAR_HEIGHT      10
 %define DEFAULT_TAB_DIM_FACTOR  40    ; inactive tab brightness, 0..100
 %define MAX_PALETTE             16
-%define WS_TAB_GAP              8     ; pixels of gap between WS and tab squares
+%define WS_TAB_GAP              8     ; pixels of gap between WS and tab squares (legacy; kept for clarity)
 %define SQUARE_GAP              2     ; pixels of gap between adjacent squares
+%define WS_GROUP_GAP            6     ; extra gap before WS positions 1, 4, 7
+                                      ; (separates the special "0" slot and
+                                      ; groups the rest into 1-3, 4-6, 7-9)
 
 ; Workspace count and special arg_int sentinels for ACT_WORKSPACE.
 %define WS_COUNT        10
@@ -3408,6 +3412,47 @@ fill_rect:
     pop rbx
     ret
 
+; PolyRectangle (outline only) — same wire format, different opcode.
+; PolyRectangle draws the border using the GC's line-width; the X
+; default line-width is 0 which servers render as a single-pixel-thick
+; outline. Note: PolyRectangle's "w,h" describe the outer dimensions but
+; the spec draws the rectangle with corners at (x,y)..(x+w,y+h), so a
+; w x h request actually paints (w+1) x (h+1) pixels. We compensate by
+; passing w-1, h-1 here so the visible rectangle matches fill_rect's
+; bounding box exactly.
+outline_rect:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12d, edi
+    mov r13d, esi
+    mov r14d, edx
+    dec r14d
+    mov ebx, ecx
+    dec ebx
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_POLY_RECTANGLE
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 5
+    mov eax, [bar_window_id]
+    mov [rdi+4], eax
+    mov eax, [bar_gc_id]
+    mov [rdi+8], eax
+    mov [rdi+12], r12w
+    mov [rdi+14], r13w
+    mov [rdi+16], r14w
+    mov [rdi+18], bx
+    lea rsi, [tmp_buf]
+    mov rdx, 20
+    call x11_buffer
+    inc dword [x11_seq]
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 ; Resolve client_color[i] (palette index, 0 = default) to a CARD32
 ; pixel value. eax = palette index (0..N). Returns pixel in eax.
 client_color_to_pixel:
@@ -3450,37 +3495,62 @@ render_bar:
     movzx ecx, word [bar_height]
     call fill_rect
 
-    ; Workspace squares: one for each populated workspace, current
-    ; highlighted brighter. Empty workspaces are skipped (no slot
-    ; drawn) so the visible WS-square count equals the populated
-    ; count.
+    ; Workspace squares: fixed 10 slots in the order
+    ;   [WS10, WS1, WS2, WS3, WS4, WS5, WS6, WS7, WS8, WS9]
+    ; (display position 0 = the "0" key = internal WS 10 — special;
+    ; will be the external-monitor pin once 1c lands). Non-current
+    ; populated workspaces draw filled in cfg_ws_populated; the current
+    ; workspace draws filled in cfg_ws_active. Empty workspaces draw as
+    ; outlines in the same color so the slot is always visible.
+    ; A small WS_GROUP_GAP precedes display positions 1, 4, 7 to set
+    ; off the special slot and group the remainder into 1-3 / 4-6 / 7-9.
     movzx r14d, word [bar_height]         ; square edge
     xor r12d, r12d                        ; cursor x
-    xor r13d, r13d                        ; ws iterator (0..9)
+    xor r13d, r13d                        ; display position 0..9
 .rb_ws_loop:
     cmp r13d, WS_COUNT
     jge .rb_ws_done
-    movzx eax, byte [workspace_populated + r13]
-    test eax, eax
-    jz .rb_ws_next                        ; empty — don't draw a slot
+    cmp r13d, 1
+    je .rb_ws_gap
+    cmp r13d, 4
+    je .rb_ws_gap
+    cmp r13d, 7
+    je .rb_ws_gap
+    jmp .rb_ws_paint_slot
+.rb_ws_gap:
+    add r12d, WS_GROUP_GAP
+.rb_ws_paint_slot:
+    ; Map display position → internal ws number (1..10).
+    mov ebx, r13d
+    test ebx, ebx
+    jnz .rb_ws_normal
+    mov ebx, 10                           ; display 0 → internal WS 10
+.rb_ws_normal:
+    ; Pick colour: active if this is the current ws, else populated.
     movzx eax, byte [current_ws]
-    dec eax
-    cmp r13d, eax
-    jne .rb_ws_inactive
+    cmp ebx, eax
+    jne .rb_ws_use_pop
     mov eax, [cfg_ws_active]
-    jmp .rb_ws_paint
-.rb_ws_inactive:
+    jmp .rb_ws_have_fg
+.rb_ws_use_pop:
     mov eax, [cfg_ws_populated]
-.rb_ws_paint:
+.rb_ws_have_fg:
     call set_bar_fg
     mov edi, r12d
     xor esi, esi
     mov edx, r14d
     mov ecx, r14d
+    ; Fill if populated, outline if empty.
+    movzx eax, byte [workspace_populated + rbx - 1]
+    test eax, eax
+    jz .rb_ws_outline
     call fill_rect
+    jmp .rb_ws_advance
+.rb_ws_outline:
+    call outline_rect
+.rb_ws_advance:
     add r12d, r14d
     add r12d, SQUARE_GAP
-.rb_ws_next:
     inc r13d
     jmp .rb_ws_loop
 .rb_ws_done:
