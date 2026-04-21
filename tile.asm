@@ -3485,20 +3485,33 @@ render_bar:
     jmp .rb_ws_loop
 .rb_ws_done:
 
-    ; Insert the gap between WS squares and tab squares only if at
-    ; least one WS square was drawn (avoid leading whitespace when no
-    ; workspaces are populated — shouldn't happen but be tidy).
-    test r12d, r12d
-    jz .rb_no_gap
-    add r12d, WS_TAB_GAP
-.rb_no_gap:
-
-    ; Tab squares: walk client_xids, draw one per client on current_ws.
+    ; Tabs are right-justified so they have their own anchor (look
+    ; top-left for workspaces, top-right for tabs). Compute the
+    ; total tab-strip width first, then draw left-to-right starting
+    ; at screen_w - total_tab_width.
     movzx r15d, byte [current_ws]
+    movzx eax, byte [workspace_populated + r15 - 1]
+    ; Number of tab squares = workspace_populated[current_ws-1].
+    test eax, eax
+    jz .rb_done                           ; no tabs on this workspace
+    ; total_tab_width = N * square + (N-1) * SQUARE_GAP
+    mov ecx, eax                          ; N
+    imul eax, r14d                        ; N * square
+    dec ecx                               ; N-1
+    imul ecx, SQUARE_GAP
+    add eax, ecx
+    movzx ecx, word [x11_screen_width]
+    sub ecx, eax
+    test ecx, ecx
+    jns .rb_tabs_have_x
+    xor ecx, ecx                          ; clamp to 0 if it didn't fit
+.rb_tabs_have_x:
+    mov r12d, ecx                         ; cursor x for tab squares
+    ; Active tab XID for this workspace.
     movzx r13d, byte [current_ws]
     dec r13d
-    mov r13d, [ws_active_xid + r13*4]     ; active XID for current ws
-    xor ebx, ebx                          ; client iterator
+    mov r13d, [ws_active_xid + r13*4]
+    xor ebx, ebx
 .rb_tab_loop:
     cmp ebx, [client_count]
     jge .rb_done
