@@ -48,14 +48,26 @@ xephyr: tile xephyr-clean
 	  echo "Xephyr not installed (apt: xserver-xephyr, arch: xorg-server-xephyr)"; \
 	  exit 1; \
 	fi
-	Xephyr -screen 1280x800 :9 &
-	@sleep 1
-	DISPLAY=:9 ./tile
+	@bash -c '\
+	  Xephyr -terminate -screen 1280x800 :9 & \
+	  XPID=$$!; \
+	  sleep 1; \
+	  DISPLAY=:9 ./tile; \
+	  kill $$XPID 2>/dev/null; \
+	  wait $$XPID 2>/dev/null; \
+	  rm -f /tmp/.X9-lock /tmp/.X11-unix/X9 2>/dev/null; \
+	  true'
 
 xephyr-multi: tile xephyr-clean
-	Xephyr +xinerama -screen 1280x800 -screen 1280x800 :9 &
-	@sleep 1
-	DISPLAY=:9 ./tile
+	@bash -c '\
+	  Xephyr -terminate +xinerama -screen 1280x800 -screen 1280x800 :9 & \
+	  XPID=$$!; \
+	  sleep 1; \
+	  DISPLAY=:9 ./tile; \
+	  kill $$XPID 2>/dev/null; \
+	  wait $$XPID 2>/dev/null; \
+	  rm -f /tmp/.X9-lock /tmp/.X11-unix/X9 2>/dev/null; \
+	  true'
 
 clean:
 	rm -f tile tile.o strip strip.o
