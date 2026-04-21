@@ -69,7 +69,20 @@ xephyr-multi: tile xephyr-clean
 	  rm -f /tmp/.X9-lock /tmp/.X11-unix/X9 2>/dev/null; \
 	  true'
 
+# Run tile under gdb in Xephyr. When it crashes, gdb stops; type 'bt'
+# and 'info registers' to capture the diagnostic. 'q' to quit.
+xephyr-gdb: tile xephyr-clean
+	@bash -c '\
+	  Xephyr -terminate -screen 1280x800 :9 & \
+	  XPID=$$!; \
+	  sleep 1; \
+	  DISPLAY=:9 gdb --args ./tile; \
+	  kill $$XPID 2>/dev/null; \
+	  wait $$XPID 2>/dev/null; \
+	  rm -f /tmp/.X9-lock /tmp/.X11-unix/X9 2>/dev/null; \
+	  true'
+
 clean:
 	rm -f tile tile.o strip strip.o
 
-.PHONY: all install uninstall clean xephyr xephyr-clean xephyr-multi strip
+.PHONY: all install uninstall clean xephyr xephyr-clean xephyr-multi xephyr-gdb strip
