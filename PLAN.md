@@ -589,13 +589,20 @@ Five binaries, zero shared dependencies (each is a single static ELF).
 
 ---
 
-## Open questions before phase 1 starts
+## Decisions locked in
 
-1. Does tile need to be a **drop-in replacement** all at once (cold
-   switchover from i3), or is it OK to develop **alongside i3** in
-   Xephyr until v0.1 is solid? **Author's call.**
-2. **Mirror workspace** support: phase 1c (real RRSetCrtcConfig
-   mirroring) or phase 3 (deferred)? **Author's call.**
-3. **strip vs. existing tray (stalonetray, trayer)**: ship strip with
-   tray in v0.1, or initially run trayer as a child and add tray to
-   strip in phase 3? **Author's call.**
+1. **Develop alongside i3 in Xephyr** until v0.1 is solid; only then
+   cold-switch the real X session. Xephyr (`xserver-xephyr` package)
+   is a nested X server that runs as a window inside the existing X
+   session, providing an isolated display (`:1`) where tile can be
+   developed and tested without touching the host i3 session. Multi-
+   output testing uses `Xephyr +xinerama -screen WxH -screen WxH :1`.
+2. **Real workspace mirroring lands in phase 1c.** When `mirror
+   workspace N` is configured and multiple outputs are connected, the
+   same workspace renders identically on all selected outputs (same
+   tree, same window contents). Implementation: per-output root
+   container shares its window list with the mirror source; render-
+   time iteration draws the same windows on each output's geometry.
+3. **System tray lives in strip from v0.1.** XEMBED + `_NET_SYSTEM_
+   TRAY_S0` selection ownership ships in phase 2c; no dependency on
+   stalonetray or trayer at any point.
