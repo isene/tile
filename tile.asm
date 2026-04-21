@@ -1214,14 +1214,22 @@ event_loop:
     ; Always flush before sleeping so the server sees our requests.
     call x11_flush
 
-    ; Read one 32-byte event (X11 always sends events as 32-byte units)
+    ; Read one 32-byte event (X11 always sends events as 32-byte units).
+    ; A blocking read on a Unix socket sleeps the process; that's the
+    ; only path we should ever take when at idle. If the X server has
+    ; gone away, read returns 0 (EOF) — without the .x11_dead exit
+    ; below, we'd spin re-reading the dead socket forever, which is
+    ; exactly the 100%-CPU bug that made tile a battery hog when its
+    ; Xephyr was killed.
     mov rax, SYS_READ
     mov rdi, [x11_fd]
     lea rsi, [x11_read_buf]
     mov rdx, 32
     syscall
+    test rax, rax
+    jle .x11_dead                ; 0 = EOF, negative = -errno (also fatal)
     cmp rax, 32
-    jl event_loop                ; partial / interrupted — try again
+    jl event_loop                ; genuine short read — retry
 
     movzx eax, byte [x11_read_buf]
     and al, 0x7F                 ; strip SendEvent bit
@@ -1247,6 +1255,13 @@ event_loop:
     jne event_loop
     call render_bar
     jmp event_loop
+
+.x11_dead:
+    ; X server connection lost (e.g. xephyr was killed, real X11 crashed).
+    ; Exit cleanly rather than spin on a dead socket.
+    mov rax, SYS_EXIT
+    xor edi, edi
+    syscall
 
 .ev_map_request:
     ; Pre-size to fullscreen, then track, then make this the active
