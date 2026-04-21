@@ -1921,19 +1921,24 @@ run_autostart:
 ; edi = target workspace (1..WS_COUNT). No-op if already there or out
 ; of range. With the per-workspace tab model only the active tab on
 ; each workspace is ever mapped, so a switch is just "unmap old active,
-; map new active".
+; map new active". Stash target ws in r12 (callee-saved) and old ws in
+; r13 because find_client_index/send_unmap_window/send_map_window all
+; clobber rdi (caller-saved).
 switch_workspace:
     push rbx
+    push r12
+    push r13
     test edi, edi
     jz .sw_done
     cmp edi, WS_COUNT
     jg .sw_done
-    movzx eax, byte [current_ws]
-    cmp edi, eax
+    movzx r13d, byte [current_ws]
+    cmp edi, r13d
     je .sw_done
-    mov [prev_ws], al
+    mov r12d, edi                ; r12 = target ws (preserved across calls)
+    mov [prev_ws], r13b
     ; Unmap old workspace's active tab.
-    mov ecx, eax
+    mov ecx, r13d
     dec ecx
     mov ebx, [ws_active_xid + rcx*4]
     test ebx, ebx
@@ -1946,9 +1951,9 @@ switch_workspace:
     mov eax, ebx
     call send_unmap_window
 .sw_no_old:
-    mov [current_ws], dil
+    mov [current_ws], r12b
     ; Map new workspace's active tab (if any).
-    mov ecx, edi
+    mov ecx, r12d
     dec ecx
     mov ebx, [ws_active_xid + rcx*4]
     test ebx, ebx
@@ -1960,6 +1965,8 @@ switch_workspace:
 .sw_no_new:
     call x11_flush
 .sw_done:
+    pop r13
+    pop r12
     pop rbx
     ret
 
