@@ -2029,7 +2029,16 @@ switch_workspace:
     jg .sw_done
     movzx r13d, byte [current_ws]
     cmp edi, r13d
-    je .sw_done
+    jne .sw_proceed
+    ; Already on the requested workspace — i3's
+    ; workspace_auto_back_and_forth: re-pressing the current ws number
+    ; toggles to the previously-active workspace. Silent no-op if no
+    ; previous workspace is recorded yet.
+    movzx eax, byte [prev_ws]
+    test eax, eax
+    jz .sw_done
+    mov edi, eax
+.sw_proceed:
     mov r12d, edi                ; r12 = target ws (preserved across calls)
     mov [prev_ws], r13b
     ; Unmap old workspace's active tab.
