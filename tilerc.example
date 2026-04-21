@@ -29,6 +29,9 @@
 #   focus prev-tab           cycle to the previous tab
 #   move-tab left            reorder the focused tab one slot to the left
 #   move-tab right           reorder the focused tab one slot to the right
+#   tab-color-cycle          bump the focused tab's colour to the next
+#                            entry in tab_palette (mirrors glass's Alt+b
+#                            for terminal backgrounds)
 
 # === Spawn ===
 bind Mod4+Return        exec glass
@@ -75,8 +78,29 @@ bind Mod4+Shift+8       move-to 8
 bind Mod4+Shift+9       move-to 9
 bind Mod4+Shift+0       move-to 10
 
+# === Tab colors (the row-of-squares bar at the top) ===
+bind Mod4+c             tab-color-cycle
+
 # === Lock screen ===
 bind Mod4+Escape        exec i3lock -c 000000
+
+# === Bar (the row-of-squares strip at the top of the screen) ===
+# bar_height       = strip thickness in pixels (also the side length of each square)
+# bar_bg           = background color of the strip
+# tab_default      = colour for newly-spawned (uncoloured) tabs
+# tab_dim_factor   = inactive-tab brightness, 0..100 (40 = 40%)
+# tab_palette      = comma-separated list of tab colours that
+#                    `tab-color-cycle` rotates through
+# ws_active        = colour of the current-workspace square
+# ws_populated     = colour of any other populated workspace
+
+bar_height       = 4
+bar_bg           = #000000
+tab_default      = #555555
+tab_dim_factor   = 40
+tab_palette      = #ff5555,#50fa7b,#bd93f9,#ffb86c,#8be9fd,#f1fa8c,#ff79c6,#9aedfe
+ws_active        = #ffffff
+ws_populated     = #555555
 
 # === Autostart ===
 exec feh --bg-fill /home/geir/setup/wallpapers/blue.png

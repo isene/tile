@@ -93,18 +93,26 @@ DISPLAY=:9 glass                        # or: DISPLAY=:9 xterm
   list. New windows append as tabs; only the active tab is mapped at
   any time. `focus next-tab` / `focus prev-tab` cycles tabs.
   `move-tab left/right` reorders. Closing the active tab auto-focuses
-  the next-most-recent one. (Phase 1b.3a — visual tab bar lands in
-  1b.3a.2.)
+  the next-most-recent one.
+- **Row-of-squares bar** at the very top of the screen (default 4px tall):
+  one square per populated workspace (current = bright, others = dim),
+  a small gap, then one square per tab on the current workspace
+  (active = bright, others = dimmed to ~40%). Each tab carries a colour
+  index; `tab-color-cycle` rotates it through `tab_palette` so you can
+  visually tag tabs (red for build, green for logs, etc.). Mirrors
+  glass's Alt+b colour cycling for terminal backgrounds.
 - WM-initiated unmaps don't get treated as window-closed
 - `~/.tilerc` config parser
 
 See `tilerc.example` for the full config syntax. Recognised statements:
-`bind <chord> <action> [arg]`, `exec <cmdline>`, `# comments`.
+`bind <chord> <action> [arg]`, `exec <cmdline>`, `key = value` for bar
+appearance, `# comments`.
 Modifiers: `Shift`, `Ctrl`/`Control`, `Alt`/`Mod1`, `Mod4`/`Win`/`Super`.
-Actions: `exec`, `kill`, `exit`, `workspace`, `move-to`, `focus`, `move-tab`.
+Actions: `exec`, `kill`, `exit`, `workspace`, `move-to`, `focus`,
+`move-tab`, `tab-color-cycle`.
 
-No tab bar UI yet, no splits, no multi-monitor, no `strip` bar yet.
-Those land in phases 1b.3a.2 through 2c — see PLAN.md.
+No splits, no multi-monitor, no `strip` (heavyweight bar with text /
+clock / tray) yet. Those land in phases 1b.3b through 2c.
 
 ## License
 

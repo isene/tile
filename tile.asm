@@ -31,6 +31,7 @@
 %define SOCK_STREAM             1
 
 ; X11 opcodes
+%define X11_CREATE_WINDOW       1
 %define X11_CHANGE_WINDOW_ATTRS 2
 %define X11_GET_WINDOW_ATTRS    3
 %define X11_DESTROY_WINDOW      4
@@ -46,6 +47,22 @@
 %define X11_KILL_CLIENT         113
 %define X11_SET_INPUT_FOCUS     42
 %define X11_SEND_EVENT          25
+%define X11_CREATE_GC           55
+%define X11_CHANGE_GC           56
+%define X11_FREE_GC             60
+%define X11_POLY_FILL_RECT      70
+
+; CW masks (for CreateWindow / ChangeWindowAttributes value mask)
+; CW_EVENT_MASK (0x00000800) is already defined further down in this file.
+%define CW_BACK_PIXEL           0x00000002
+%define CW_BORDER_PIXEL         0x00000008
+%define CW_OVERRIDE_REDIRECT    0x00000200
+%define EXPOSURE_MASK           0x00008000
+%define EV_EXPOSE               12
+
+; GC value mask (CreateGC / ChangeGC)
+%define GC_FOREGROUND           0x00000004
+%define GC_BACKGROUND           0x00000008
 
 ; X11 event types
 %define EV_KEY_PRESS            2
@@ -107,6 +124,14 @@
 %define ACT_MOVE_TO     5
 %define ACT_FOCUS       6
 %define ACT_MOVE_TAB    7
+%define ACT_TAB_COLOR   8
+
+; Bar (the row-of-squares strip at the top of the screen).
+%define DEFAULT_BAR_HEIGHT      3
+%define DEFAULT_TAB_DIM_FACTOR  40    ; inactive tab brightness, 0..100
+%define MAX_PALETTE             16
+%define WS_TAB_GAP              8     ; pixels of gap between WS and tab squares
+%define SQUARE_GAP              2     ; pixels of gap between adjacent squares
 
 ; Workspace count and special arg_int sentinels for ACT_WORKSPACE.
 %define WS_COUNT        10
@@ -274,6 +299,8 @@ action_table:
     db ACT_FOCUS, 0
     db "move-tab", 0
     db ACT_MOVE_TAB, 0
+    db "tab-color-cycle", 0
+    db ACT_TAB_COLOR, 0
     db 0                       ; terminator
 
 ; Focus arg keyword table for `focus <direction>`.
@@ -337,8 +364,25 @@ keysyms_per_kc:      resd 1
 ; keysym_map[keycode * 8 + sym_index]: 256 keycodes × up to 8 syms each
 keysym_map:          resd 256 * 8
 
-; Bar reservation (top of screen, in pixels). 0 in phase 1a.
-bar_height:          resw 1
+; Bar (the row-of-squares strip across the top of the screen).
+;   bar_height          height in pixels (also the side length of each square)
+;   bar_window_id       XID of tile's override-redirect bar window
+;   bar_gc_id           GC for filling the bar
+;   client_color[i]     palette index for client i. 0 = tab_default colour;
+;                       1..palette_count = palette[idx-1].
+bar_height:              resw 1
+bar_window_id:           resd 1
+bar_gc_id:               resd 1
+client_color:            resb MAX_CLIENTS
+
+; Configurable bar colors (CARD32 X11 pixel values, set by load_config).
+cfg_bar_bg:              resd 1
+cfg_tab_default:         resd 1
+cfg_tab_dim_factor:      resb 1
+cfg_tab_palette:         resd MAX_PALETTE
+cfg_tab_palette_count:   resb 1
+cfg_ws_active:           resd 1
+cfg_ws_populated:        resd 1
 
 ; Tracked top-level clients (most recent / focused at the end of the
 ; stack — kill action acts on the top entry of the current workspace).
@@ -440,6 +484,14 @@ _start:
     ; Start on workspace 1.
     mov byte [current_ws], 1
     mov byte [prev_ws], 0
+    ; Bar defaults (~/.tilerc may override).
+    mov word [bar_height], DEFAULT_BAR_HEIGHT
+    mov dword [cfg_bar_bg], 0x000000
+    mov dword [cfg_tab_default], 0x555555
+    mov byte [cfg_tab_dim_factor], DEFAULT_TAB_DIM_FACTOR
+    mov dword [cfg_ws_active], 0xffffff
+    mov dword [cfg_ws_populated], 0x555555
+    mov byte [cfg_tab_palette_count], 0
     call load_config
 
     ; Become the WM by selecting substructure-redirect on root.
@@ -454,6 +506,11 @@ _start:
 
     ; Resolve every bind's keysym to a keycode and grab them on root.
     call resolve_and_grab_binds
+    call x11_flush
+
+    ; Create the row-of-squares bar window across the top of the screen.
+    call create_bar
+    call render_bar
     call x11_flush
 
     ; Run autostart entries from ~/.tilerc.
@@ -1084,6 +1141,14 @@ grab_one_key:
 ; X11 buffered I/O
 ; ══════════════════════════════════════════════════════════════════════
 
+; Allocate a new X resource ID. Returns the XID in eax.
+alloc_xid:
+    mov eax, [x11_rid_next]
+    inc dword [x11_rid_next]
+    and eax, [x11_rid_mask]
+    or eax, [x11_rid_base]
+    ret
+
 ; rsi = data, rdx = length — append to write buffer.
 x11_buffer:
     push rbx
@@ -1143,7 +1208,17 @@ event_loop:
     je .ev_unmap_notify
     cmp al, EV_DESTROY_NOTIFY
     je .ev_destroy_notify
+    cmp al, EV_EXPOSE
+    je .ev_expose
     ; Ignore anything else (MapNotify, ConfigureNotify, errors, replies).
+    jmp event_loop
+
+.ev_expose:
+    ; Expose bytes 8-11 = window. Only redraw if it's our bar window.
+    mov eax, [x11_read_buf + 8]
+    cmp eax, [bar_window_id]
+    jne event_loop
+    call render_bar
     jmp event_loop
 
 .ev_map_request:
@@ -1286,6 +1361,7 @@ track_client:
     movzx ecx, byte [current_ws]
     mov [client_ws + rbx], cl
     mov byte [client_unmap_expected + rbx], 0
+    mov byte [client_color + rbx], 0      ; tab_default colour
     inc dword [client_count]
     ; Bump populated count for the workspace this client lives on.
     movzx ecx, byte [current_ws]
@@ -1332,6 +1408,8 @@ untrack_client:
     mov [client_ws + rbx], dl
     mov dl, [client_unmap_expected + rcx]
     mov [client_unmap_expected + rbx], dl
+    mov dl, [client_color + rcx]
+    mov [client_color + rbx], dl
     inc ebx
     jmp .uc_shift
 .uc_dec:
@@ -1594,6 +1672,7 @@ set_active_tab:
     call send_map_window
     mov eax, r12d
     call set_input_focus
+    call render_bar
     call x11_flush
 .sat_done:
     pop r12
@@ -1635,6 +1714,7 @@ client_closed:
     inc ebx
     jmp .cc_loop
 .cc_done:
+    call render_bar
     call x11_flush
     pop r12
     pop rbx
@@ -1728,6 +1808,12 @@ move_tab:
     mov dil, [client_unmap_expected + rsi]
     mov [client_unmap_expected + rsi], al
     mov [client_unmap_expected + r12], dil
+    mov al, [client_color + r12]
+    mov dil, [client_color + rsi]
+    mov [client_color + rsi], al
+    mov [client_color + r12], dil
+    call render_bar
+    call x11_flush
 .mt_done:
     pop r13
     pop r12
@@ -1783,6 +1869,8 @@ dispatch_keypress:
     je .dk_focus
     cmp eax, ACT_MOVE_TAB
     je .dk_move_tab
+    cmp eax, ACT_TAB_COLOR
+    je .dk_tab_color
     jmp .dk_done
 .dk_exec:
     test edx, edx
@@ -1846,6 +1934,9 @@ dispatch_keypress:
     jne .dk_done
     mov edi, 1
     call move_tab
+    jmp .dk_done
+.dk_tab_color:
+    call tab_color_cycle
     jmp .dk_done
 .dk_skip:
     inc ebx
@@ -1963,6 +2054,7 @@ switch_workspace:
     mov eax, ebx
     call set_input_focus
 .sw_no_new:
+    call render_bar
     call x11_flush
 .sw_done:
     pop r13
@@ -2085,6 +2177,7 @@ move_focused_to_workspace:
     pop rax
     call set_input_focus
 .mtw_flush:
+    call render_bar
     call x11_flush
 .mtw_done:
     pop r13
@@ -2430,7 +2523,7 @@ parse_config_line:
     mov byte [r12], 0
     inc r12
 .pcl_have_cmd:
-    ; Compare command against "bind", "exec", "mod"
+    ; Compare command against the recognised keywords.
     mov rdi, r13
     lea rsi, [.pcl_kw_bind]
     call .pcl_streq
@@ -2441,7 +2534,14 @@ parse_config_line:
     call .pcl_streq
     test eax, eax
     jnz .pcl_handle_exec
-    ; Unknown keyword — silently ignore for now.
+    ; bar / palette settings (key = value)
+    call .pcl_skip_ws
+    cmp byte [r12], '='
+    jne .pcl_done                ; not a key=value line, ignore
+    inc r12
+    call .pcl_skip_ws
+    mov rdi, r13
+    call apply_setting
     jmp .pcl_done
 
 .pcl_handle_bind:
@@ -2901,6 +3001,563 @@ lookup_action:
     ret
 .la_none:
     xor eax, eax
+    pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Bar — the row-of-squares strip across the top of the screen.
+;
+; Layout (left-to-right):
+;   <ws-square>(<gap><ws-square>)*  <ws_tab_gap>  <tab-square>(<gap><tab-square>)*
+;
+; All squares are bar_height x bar_height pixels. Active squares draw
+; in their full color; inactive squares are dimmed to
+; cfg_tab_dim_factor / 100 of full intensity (per RGB channel).
+;
+; Workspace squares: cfg_ws_active for the current ws; cfg_ws_populated
+; for any ws with at least one client; not drawn at all for empty
+; workspaces (so the visible WS-square count = how many workspaces
+; have something).
+;
+; Tab squares: each client carries client_color[i] which indexes the
+; palette (0 = cfg_tab_default; 1..N = cfg_tab_palette[N-1]). The
+; active tab is drawn at full intensity, others dimmed.
+; ══════════════════════════════════════════════════════════════════════
+
+; Apply a "key value" setting line. rdi = NUL-terminated key, r12 (the
+; caller's parse_config_line scan ptr) points at the start of the value.
+apply_setting:
+    push rbx
+    push r13
+    mov r13, rdi                          ; r13 = key
+    mov rdi, r13
+    lea rsi, [.as_kw_bar_height]
+    call .as_streq
+    test eax, eax
+    jnz .as_bar_height
+    mov rdi, r13
+    lea rsi, [.as_kw_bar_bg]
+    call .as_streq
+    test eax, eax
+    jnz .as_bar_bg
+    mov rdi, r13
+    lea rsi, [.as_kw_tab_default]
+    call .as_streq
+    test eax, eax
+    jnz .as_tab_default
+    mov rdi, r13
+    lea rsi, [.as_kw_tab_dim_factor]
+    call .as_streq
+    test eax, eax
+    jnz .as_tab_dim_factor
+    mov rdi, r13
+    lea rsi, [.as_kw_tab_palette]
+    call .as_streq
+    test eax, eax
+    jnz .as_tab_palette
+    mov rdi, r13
+    lea rsi, [.as_kw_ws_active]
+    call .as_streq
+    test eax, eax
+    jnz .as_ws_active
+    mov rdi, r13
+    lea rsi, [.as_kw_ws_populated]
+    call .as_streq
+    test eax, eax
+    jnz .as_ws_populated
+    jmp .as_done
+
+.as_bar_height:
+    mov rdi, r12
+    call parse_decimal_byte
+    mov [bar_height], ax
+    jmp .as_done
+.as_bar_bg:
+    mov rdi, r12
+    call parse_hex_color
+    mov [cfg_bar_bg], eax
+    jmp .as_done
+.as_tab_default:
+    mov rdi, r12
+    call parse_hex_color
+    mov [cfg_tab_default], eax
+    jmp .as_done
+.as_tab_dim_factor:
+    mov rdi, r12
+    call parse_decimal_byte
+    cmp eax, 100
+    jle .as_dim_ok
+    mov eax, 100
+.as_dim_ok:
+    mov [cfg_tab_dim_factor], al
+    jmp .as_done
+.as_tab_palette:
+    mov rdi, r12
+    call parse_palette
+    jmp .as_done
+.as_ws_active:
+    mov rdi, r12
+    call parse_hex_color
+    mov [cfg_ws_active], eax
+    jmp .as_done
+.as_ws_populated:
+    mov rdi, r12
+    call parse_hex_color
+    mov [cfg_ws_populated], eax
+    jmp .as_done
+.as_done:
+    pop r13
+    pop rbx
+    ret
+
+.as_streq:
+    push rbx
+.as_se_loop:
+    mov al, [rdi]
+    mov bl, [rsi]
+    cmp al, bl
+    jne .as_se_no
+    test al, al
+    je .as_se_yes
+    inc rdi
+    inc rsi
+    jmp .as_se_loop
+.as_se_yes:
+    mov eax, 1
+    pop rbx
+    ret
+.as_se_no:
+    xor eax, eax
+    pop rbx
+    ret
+
+.as_kw_bar_height:    db "bar_height", 0
+.as_kw_bar_bg:        db "bar_bg", 0
+.as_kw_tab_default:   db "tab_default", 0
+.as_kw_tab_dim_factor:db "tab_dim_factor", 0
+.as_kw_tab_palette:   db "tab_palette", 0
+.as_kw_ws_active:     db "ws_active", 0
+.as_kw_ws_populated:  db "ws_populated", 0
+
+; rdi = NUL-terminated string starting with optional '#' then 6 hex
+; digits. Returns CARD32 0x00RRGGBB in eax. Garbage in → 0 in eax.
+parse_hex_color:
+    push rbx
+    push r12
+    cmp byte [rdi], '#'
+    jne .phc_start
+    inc rdi
+.phc_start:
+    xor r12d, r12d                        ; accumulator
+    mov ecx, 6                            ; expect exactly 6 hex digits
+.phc_loop:
+    movzx eax, byte [rdi]
+    test eax, eax
+    jz .phc_done
+    cmp al, '0'
+    jb .phc_done
+    cmp al, '9'
+    jbe .phc_dig
+    or al, 0x20                           ; tolower
+    cmp al, 'a'
+    jb .phc_done
+    cmp al, 'f'
+    ja .phc_done
+    sub al, 'a' - 10
+    jmp .phc_acc
+.phc_dig:
+    sub al, '0'
+.phc_acc:
+    shl r12d, 4
+    or r12d, eax
+    inc rdi
+    dec ecx
+    jnz .phc_loop
+.phc_done:
+    mov eax, r12d
+    pop r12
+    pop rbx
+    ret
+
+; rdi = NUL-terminated decimal number (terminated by NUL or whitespace).
+; Returns value in eax (clamped to 0..255 implicitly via the byte storage
+; sites).
+parse_decimal_byte:
+    xor eax, eax
+.pdb_loop:
+    movzx ecx, byte [rdi]
+    cmp cl, '0'
+    jb .pdb_done
+    cmp cl, '9'
+    ja .pdb_done
+    sub cl, '0'
+    imul eax, 10
+    add eax, ecx
+    inc rdi
+    jmp .pdb_loop
+.pdb_done:
+    ret
+
+; rdi = NUL-terminated comma-separated list of hex colors, e.g.
+;   #ff5555,#50fa7b,#bd93f9
+; Stores each parsed color in cfg_tab_palette[] up to MAX_PALETTE
+; entries; sets cfg_tab_palette_count.
+parse_palette:
+    push rbx
+    push r12
+    push r13
+    mov r12, rdi                          ; current scan position
+    xor r13d, r13d                        ; palette index
+.pp_loop:
+    cmp r13d, MAX_PALETTE
+    jge .pp_done
+    mov rdi, r12
+    call parse_hex_color
+    test eax, eax
+    jz .pp_done                           ; bad/empty entry — stop here
+    mov [cfg_tab_palette + r13*4], eax
+    inc r13d
+    ; Skip remaining hex digits until ',' / NUL / ws
+    mov r12, rdi                          ; parse_hex_color advanced rdi
+.pp_skip_to_sep:
+    movzx eax, byte [r12]
+    test eax, eax
+    jz .pp_done
+    cmp al, ','
+    je .pp_at_comma
+    cmp al, ' '
+    je .pp_done
+    cmp al, 9
+    je .pp_done
+    inc r12
+    jmp .pp_skip_to_sep
+.pp_at_comma:
+    inc r12
+    jmp .pp_loop
+.pp_done:
+    mov [cfg_tab_palette_count], r13b
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; eax = source CARD32 0x00RRGGBB. Multiplies each channel by
+; cfg_tab_dim_factor / 100 and returns the result in eax. Used to draw
+; inactive tab squares dimly while keeping their hue recognisable.
+dim_color:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r14d, eax                         ; original 0x00RRGGBB
+    movzx r13d, byte [cfg_tab_dim_factor]
+    ; --- R channel ---
+    mov eax, r14d
+    shr eax, 16
+    and eax, 0xff
+    imul eax, r13d
+    mov ecx, 100
+    xor edx, edx
+    div ecx
+    mov ebx, eax
+    shl ebx, 16
+    ; --- G channel ---
+    mov eax, r14d
+    shr eax, 8
+    and eax, 0xff
+    imul eax, r13d
+    xor edx, edx
+    mov ecx, 100
+    div ecx
+    shl eax, 8
+    or ebx, eax
+    ; --- B channel ---
+    mov eax, r14d
+    and eax, 0xff
+    imul eax, r13d
+    xor edx, edx
+    mov ecx, 100
+    div ecx
+    or ebx, eax
+    mov eax, ebx
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; Create the bar window (override-redirect, bar_height tall, full
+; screen width, at y=0) and a GC for filling it. Subscribes to Expose
+; so we can redraw when something covers and uncovers it.
+create_bar:
+    push rbx
+    push r12
+    call alloc_xid
+    mov [bar_window_id], eax
+    mov r12d, eax                         ; window XID
+
+    ; CreateWindow(depth=root_depth, wid=r12, parent=root,
+    ;              x=0, y=0, w=screen_w, h=bar_height,
+    ;              border-width=0, class=InputOutput,
+    ;              visual=CopyFromParent,
+    ;              value-mask = CW_BACK_PIXEL | CW_OVERRIDE_REDIRECT
+    ;                          | CW_EVENT_MASK,
+    ;              values: bg=cfg_bar_bg, override=1,
+    ;                      events=ExposureMask)
+    lea rdi, [tmp_buf]
+    movzx eax, byte [x11_root_depth]
+    mov [rdi], al
+    mov byte [rdi+1], al                  ; depth
+    mov word [rdi+2], 11                  ; request length (8 hdr + 3 values = 11 words)
+    mov [rdi+4], r12d                     ; wid
+    mov eax, [x11_root_window]
+    mov [rdi+8], eax                      ; parent
+    mov word [rdi+12], 0                  ; x
+    mov word [rdi+14], 0                  ; y
+    movzx eax, word [x11_screen_width]
+    mov [rdi+16], ax                      ; width
+    movzx eax, word [bar_height]
+    mov [rdi+18], ax                      ; height
+    mov word [rdi+20], 0                  ; border-width
+    mov word [rdi+22], 1                  ; class = InputOutput
+    mov dword [rdi+24], 0                 ; visual = CopyFromParent
+    mov dword [rdi+28], CW_BACK_PIXEL | CW_OVERRIDE_REDIRECT | CW_EVENT_MASK
+    mov eax, [cfg_bar_bg]
+    mov [rdi+32], eax                     ; back pixel
+    mov dword [rdi+36], 1                 ; override-redirect = true
+    mov dword [rdi+40], EXPOSURE_MASK     ; event mask
+    ; Set the X11 opcode now (rdi[0] got clobbered by the depth write).
+    mov byte [rdi], X11_CREATE_WINDOW
+    lea rsi, [tmp_buf]
+    mov rdx, 44
+    call x11_buffer
+    inc dword [x11_seq]
+
+    ; CreateGC(cid, drawable=bar_window_id, value-mask=GC_FOREGROUND,
+    ;          values: foreground=0)  — foreground is set per-square.
+    call alloc_xid
+    mov [bar_gc_id], eax
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CREATE_GC
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 5                   ; length (4 hdr + 1 value = 5 words)
+    mov [rdi+4], eax                      ; cid
+    mov [rdi+8], r12d                     ; drawable
+    mov dword [rdi+12], GC_FOREGROUND
+    mov dword [rdi+16], 0                 ; foreground = 0 (overwritten per draw)
+    lea rsi, [tmp_buf]
+    mov rdx, 20
+    call x11_buffer
+    inc dword [x11_seq]
+
+    ; Map the bar window.
+    mov eax, r12d
+    call send_map_window
+    pop r12
+    pop rbx
+    ret
+
+; ChangeGC(gc=bar_gc_id, mask=GC_FOREGROUND, value=eax).
+set_bar_fg:
+    push rax
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_GC
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4                   ; length (3 hdr + 1 value = 4 words)
+    mov eax, [bar_gc_id]
+    mov [rdi+4], eax
+    mov dword [rdi+8], GC_FOREGROUND
+    pop rax
+    mov [rdi+12], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    ret
+
+; PolyFillRectangle(drawable=bar_window_id, gc=bar_gc_id, one rect).
+; di = x, si = y, dx = w, cx = h.
+fill_rect:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12d, edi
+    mov r13d, esi
+    mov r14d, edx
+    mov ebx, ecx
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_POLY_FILL_RECT
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 5                   ; length (3 hdr + 2 rect words = 5)
+    mov eax, [bar_window_id]
+    mov [rdi+4], eax
+    mov eax, [bar_gc_id]
+    mov [rdi+8], eax
+    mov [rdi+12], r12w                    ; x
+    mov [rdi+14], r13w                    ; y
+    mov [rdi+16], r14w                    ; w
+    mov [rdi+18], bx                      ; h
+    lea rsi, [tmp_buf]
+    mov rdx, 20
+    call x11_buffer
+    inc dword [x11_seq]
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; Resolve client_color[i] (palette index, 0 = default) to a CARD32
+; pixel value. eax = palette index (0..N). Returns pixel in eax.
+client_color_to_pixel:
+    test eax, eax
+    jnz .cctp_palette
+    mov eax, [cfg_tab_default]
+    ret
+.cctp_palette:
+    movzx ecx, byte [cfg_tab_palette_count]
+    test ecx, ecx
+    jz .cctp_default                      ; no palette configured
+    dec eax                               ; palette is 1-indexed in client_color
+    cmp eax, ecx
+    jb .cctp_lookup
+    xor edx, edx
+    div ecx                               ; eax %= count
+.cctp_lookup:
+    mov eax, [cfg_tab_palette + rax*4]
+    ret
+.cctp_default:
+    mov eax, [cfg_tab_default]
+    ret
+
+; Render the entire bar: clear, draw workspace squares, gap, tab squares.
+render_bar:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    cmp dword [bar_window_id], 0
+    je .rb_done                           ; bar not created yet
+
+    ; Clear the whole bar with bar_bg.
+    mov eax, [cfg_bar_bg]
+    call set_bar_fg
+    xor edi, edi
+    xor esi, esi
+    movzx edx, word [x11_screen_width]
+    movzx ecx, word [bar_height]
+    call fill_rect
+
+    ; Workspace squares: one for each populated workspace, current
+    ; highlighted brighter. Empty workspaces are skipped (no slot
+    ; drawn) so the visible WS-square count equals the populated
+    ; count.
+    movzx r14d, word [bar_height]         ; square edge
+    xor r12d, r12d                        ; cursor x
+    xor r13d, r13d                        ; ws iterator (0..9)
+.rb_ws_loop:
+    cmp r13d, WS_COUNT
+    jge .rb_ws_done
+    movzx eax, byte [workspace_populated + r13]
+    test eax, eax
+    jz .rb_ws_next                        ; empty — don't draw a slot
+    movzx eax, byte [current_ws]
+    dec eax
+    cmp r13d, eax
+    jne .rb_ws_inactive
+    mov eax, [cfg_ws_active]
+    jmp .rb_ws_paint
+.rb_ws_inactive:
+    mov eax, [cfg_ws_populated]
+.rb_ws_paint:
+    call set_bar_fg
+    mov edi, r12d
+    xor esi, esi
+    mov edx, r14d
+    mov ecx, r14d
+    call fill_rect
+    add r12d, r14d
+    add r12d, SQUARE_GAP
+.rb_ws_next:
+    inc r13d
+    jmp .rb_ws_loop
+.rb_ws_done:
+
+    ; Insert the gap between WS squares and tab squares only if at
+    ; least one WS square was drawn (avoid leading whitespace when no
+    ; workspaces are populated — shouldn't happen but be tidy).
+    test r12d, r12d
+    jz .rb_no_gap
+    add r12d, WS_TAB_GAP
+.rb_no_gap:
+
+    ; Tab squares: walk client_xids, draw one per client on current_ws.
+    movzx r15d, byte [current_ws]
+    movzx r13d, byte [current_ws]
+    dec r13d
+    mov r13d, [ws_active_xid + r13*4]     ; active XID for current ws
+    xor ebx, ebx                          ; client iterator
+.rb_tab_loop:
+    cmp ebx, [client_count]
+    jge .rb_done
+    movzx eax, byte [client_ws + rbx]
+    cmp eax, r15d
+    jne .rb_tab_next
+    movzx eax, byte [client_color + rbx]
+    call client_color_to_pixel
+    mov ecx, [client_xids + rbx*4]
+    cmp ecx, r13d
+    je .rb_tab_active
+    call dim_color
+.rb_tab_active:
+    call set_bar_fg
+    mov edi, r12d
+    xor esi, esi
+    mov edx, r14d
+    mov ecx, r14d
+    call fill_rect
+    add r12d, r14d
+    add r12d, SQUARE_GAP
+.rb_tab_next:
+    inc ebx
+    jmp .rb_tab_loop
+.rb_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; Bump the focused tab's colour to the next palette index. Wraps around
+; back to 0 (= default colour) after the last palette entry, so a tab
+; cycles default → palette[0] → palette[1] → ... → default.
+tab_color_cycle:
+    push rbx
+    movzx eax, byte [current_ws]
+    test eax, eax
+    jz .tcc_done
+    dec eax
+    mov ebx, [ws_active_xid + rax*4]
+    test ebx, ebx
+    jz .tcc_done
+    mov eax, ebx
+    call find_client_index
+    cmp eax, -1
+    je .tcc_done
+    movzx ecx, byte [client_color + rax]
+    inc ecx
+    movzx edx, byte [cfg_tab_palette_count]
+    cmp ecx, edx
+    jbe .tcc_store
+    xor ecx, ecx                          ; wrap to default
+.tcc_store:
+    mov [client_color + rax], cl
+    call render_bar
+    call x11_flush
+.tcc_done:
     pop rbx
     ret
 
