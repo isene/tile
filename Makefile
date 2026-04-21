@@ -36,18 +36,23 @@ uninstall:
 #   make xephyr        — windowed Xephyr (1280x800), Alt+ binds work
 #   make xephyr-multi  — windowed dual-output simulation via +xinerama,
 #                        for testing workspace pinning + RandR logic
-xephyr: tile
+# Clean up any leftover Xephyr on :9 (process + lock + socket).
+xephyr-clean:
+	-@pkill -f "Xephyr :9" 2>/dev/null; true
+	-@pkill -x Xephyr 2>/dev/null; true
+	-@sleep 0.3
+	-@rm -f /tmp/.X9-lock /tmp/.X11-unix/X9 2>/dev/null; true
+
+xephyr: tile xephyr-clean
 	@if ! command -v Xephyr >/dev/null; then \
 	  echo "Xephyr not installed (apt: xserver-xephyr, arch: xorg-server-xephyr)"; \
 	  exit 1; \
 	fi
-	-pkill -f "Xephyr :9" 2>/dev/null || true
 	Xephyr -screen 1280x800 :9 &
 	@sleep 1
 	DISPLAY=:9 ./tile
 
-xephyr-multi: tile
-	-pkill -f "Xephyr :9" 2>/dev/null || true
+xephyr-multi: tile xephyr-clean
 	Xephyr +xinerama -screen 1280x800 -screen 1280x800 :9 &
 	@sleep 1
 	DISPLAY=:9 ./tile
@@ -55,4 +60,4 @@ xephyr-multi: tile
 clean:
 	rm -f tile tile.o strip strip.o
 
-.PHONY: all install uninstall clean xephyr xephyr-multi strip
+.PHONY: all install uninstall clean xephyr xephyr-clean xephyr-multi strip
