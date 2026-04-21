@@ -71,12 +71,14 @@ xephyr-multi: tile xephyr-clean
 
 # Run tile under gdb in Xephyr. When it crashes, gdb stops; type 'bt'
 # and 'info registers' to capture the diagnostic. 'q' to quit.
+# Force SHELL=/bin/sh so gdb can launch the program (the user's bare
+# shell doesn't recognise gdb's "exec" wrapper).
 xephyr-gdb: tile xephyr-clean
 	@bash -c '\
 	  Xephyr -terminate -screen 1280x800 :9 & \
 	  XPID=$$!; \
 	  sleep 1; \
-	  DISPLAY=:9 gdb --args ./tile; \
+	  SHELL=/bin/sh DISPLAY=:9 gdb -ex "set startup-with-shell off" --args ./tile; \
 	  kill $$XPID 2>/dev/null; \
 	  wait $$XPID 2>/dev/null; \
 	  rm -f /tmp/.X9-lock /tmp/.X11-unix/X9 2>/dev/null; \
