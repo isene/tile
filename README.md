@@ -79,29 +79,32 @@ To launch a test app inside the Xephyr session:
 DISPLAY=:9 glass                        # or: DISPLAY=:9 xterm
 ```
 
-## Current capabilities (phases 1a + 1b.1 + 1b.2)
+## Current capabilities (phases 1a + 1b.1 + 1b.2 + 1b.3a)
 
 - Connects to X11 via Unix socket, MIT-MAGIC-COOKIE-1 authentication
 - Claims SubstructureRedirectMask on the root window (single-WM enforcement)
 - Maps incoming MapRequest windows full-screen
-- LIFO per-workspace client stack with auto-focus on top
 - ICCCM `WM_DELETE_WINDOW` protocol — `kill` asks the app to close
   cleanly rather than yanking its X11 connection
-- Closing the top window auto-focuses the next one
 - **10 workspaces** with `workspace N` / `move-to N` / smart cycling
   (`workspace next-populated` walks only workspaces that have at least
   one window — improvement over i3) / `workspace back-and-forth`
-- WM-initiated unmaps (workspace switches, move-to) don't get
-  treated as window-closed
+- **Tabbed semantics per workspace** — every workspace is a flat tab
+  list. New windows append as tabs; only the active tab is mapped at
+  any time. `focus next-tab` / `focus prev-tab` cycles tabs.
+  `move-tab left/right` reorders. Closing the active tab auto-focuses
+  the next-most-recent one. (Phase 1b.3a — visual tab bar lands in
+  1b.3a.2.)
+- WM-initiated unmaps don't get treated as window-closed
 - `~/.tilerc` config parser
 
 See `tilerc.example` for the full config syntax. Recognised statements:
 `bind <chord> <action> [arg]`, `exec <cmdline>`, `# comments`.
 Modifiers: `Shift`, `Ctrl`/`Control`, `Alt`/`Mod1`, `Mod4`/`Win`/`Super`.
-Actions: `exec`, `kill`, `exit`, `workspace`, `move-to`.
+Actions: `exec`, `kill`, `exit`, `workspace`, `move-to`, `focus`, `move-tab`.
 
-No layouts (tabbed/split), no multi-monitor, no bar yet. Those land
-in phases 1b.3 through 2c — see PLAN.md.
+No tab bar UI yet, no splits, no multi-monitor, no `strip` bar yet.
+Those land in phases 1b.3a.2 through 2c — see PLAN.md.
 
 ## License
 

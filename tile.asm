@@ -105,12 +105,20 @@
 %define ACT_EXIT        3
 %define ACT_WORKSPACE   4
 %define ACT_MOVE_TO     5
+%define ACT_FOCUS       6
+%define ACT_MOVE_TAB    7
 
 ; Workspace count and special arg_int sentinels for ACT_WORKSPACE.
 %define WS_COUNT        10
 %define WS_NEXT_POP     0xff
 %define WS_PREV_POP     0xfe
 %define WS_BACK_FORTH   0xfd
+
+; Focus and move-tab arg_int sentinels (single byte, also stored in arg_int).
+%define FOC_NEXT_TAB    1
+%define FOC_PREV_TAB    2
+%define MTAB_LEFT       1
+%define MTAB_RIGHT      2
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Data
@@ -262,7 +270,27 @@ action_table:
     db ACT_WORKSPACE, 0
     db "move-to", 0
     db ACT_MOVE_TO, 0
+    db "focus", 0
+    db ACT_FOCUS, 0
+    db "move-tab", 0
+    db ACT_MOVE_TAB, 0
     db 0                       ; terminator
+
+; Focus arg keyword table for `focus <direction>`.
+focus_arg_table:
+    db "next-tab", 0
+    db FOC_NEXT_TAB, 0
+    db "prev-tab", 0
+    db FOC_PREV_TAB, 0
+    db 0
+
+; move-tab arg keyword table.
+mtab_arg_table:
+    db "left", 0
+    db MTAB_LEFT, 0
+    db "right", 0
+    db MTAB_RIGHT, 0
+    db 0
 
 ; Workspace argument keyword table for `workspace <name>`. Same packed
 ; format: name, NUL, value (BYTE), pad. Values are sentinels in the
@@ -330,9 +358,15 @@ client_count:            resd 1
 ;   prev_ws                  = workspace we last switched away from (for
 ;                               `workspace back-and-forth`); 0 = none yet
 ;   workspace_populated[w-1] = client count on workspace w, byte
+;   ws_active_xid[w-1]       = XID of the currently-visible tab on
+;                              workspace w (0 if the workspace is empty).
+;                              Phase 1b.3a: each workspace is a flat
+;                              tab list; only ws_active_xid[w-1] is
+;                              actually mapped at any given time.
 current_ws:              resb 1
 prev_ws:                 resb 1
 workspace_populated:     resb WS_COUNT
+ws_active_xid:           resd WS_COUNT
 
 ; ICCCM atoms (resolved at startup via InternAtom).
 wm_protocols_atom:   resd 1
@@ -1113,18 +1147,16 @@ event_loop:
     jmp event_loop
 
 .ev_map_request:
-    ; Bytes 4-7: parent window (root); Bytes 8-11: window XID.
+    ; Pre-size to fullscreen, then track, then make this the active
+    ; tab on the current workspace (set_active_tab unmaps whatever
+    ; was previously visible and maps the new client).
     mov eax, [x11_read_buf + 8]
-    push rax
-    call track_client
-    pop rax
-    ; Configure to full screen first, then Map.
     mov edi, eax
     call configure_client_fullscreen
     mov eax, [x11_read_buf + 8]
-    call send_map_window
+    call track_client
     mov eax, [x11_read_buf + 8]
-    call set_input_focus
+    call set_active_tab
     jmp event_loop
 
 .ev_configure_request:
@@ -1163,14 +1195,12 @@ event_loop:
     jmp event_loop
 .eun_real:
     mov eax, [x11_read_buf + 8]
-    call untrack_client
-    call focus_top
+    call client_closed
     jmp event_loop
 
 .ev_destroy_notify:
     mov eax, [x11_read_buf + 8]
-    call untrack_client
-    call focus_top
+    call client_closed
     jmp event_loop
 
 .ev_key_press:
@@ -1504,39 +1534,197 @@ send_delete_message:
     pop rbx
     ret
 
-; Focus the top-most client on the current workspace (highest-indexed
-; entry whose client_ws matches current_ws). No-op if the workspace is
-; empty.
-focus_top:
+; ══════════════════════════════════════════════════════════════════════
+; Tab semantics (phase 1b.3a)
+; ══════════════════════════════════════════════════════════════════════
+
+; eax = ws (1..WS_COUNT). Returns the XID of the highest-indexed client
+; on that workspace (or 0 if the workspace is empty).
+find_top_of_workspace:
     push rbx
-    movzx edx, byte [current_ws]
-    mov ebx, [client_count]
-.ft_loop:
+    mov ebx, eax
+    mov ecx, [client_count]
+.ftow_loop:
+    test ecx, ecx
+    jz .ftow_none
+    dec ecx
+    movzx eax, byte [client_ws + rcx]
+    cmp eax, ebx
+    jne .ftow_loop
+    mov eax, [client_xids + rcx*4]
+    pop rbx
+    ret
+.ftow_none:
+    xor eax, eax
+    pop rbx
+    ret
+
+; eax = new XID. Make it the active (visible) tab on the current
+; workspace. Unmaps whatever was previously active. Idempotent if eax
+; is already the active tab.
+set_active_tab:
+    push rbx
+    push r12
+    mov r12d, eax                ; new active XID
+    movzx ecx, byte [current_ws]
+    dec ecx
+    mov ebx, [ws_active_xid + rcx*4]
+    cmp ebx, r12d
+    je .sat_done
     test ebx, ebx
-    jz .ft_none
-    dec ebx
-    movzx eax, byte [client_ws + rbx]
-    cmp eax, edx
-    jne .ft_loop
-    mov eax, [client_xids + rbx*4]
-    push rax
+    jz .sat_skip_unmap
+    mov eax, ebx
+    call find_client_index
+    cmp eax, -1
+    je .sat_skip_unmap
+    mov byte [client_unmap_expected + rax], 1
+    mov eax, ebx
+    call send_unmap_window
+.sat_skip_unmap:
+    movzx ecx, byte [current_ws]
+    dec ecx
+    mov [ws_active_xid + rcx*4], r12d
+    mov eax, r12d
+    call send_map_window
+    mov eax, r12d
     call set_input_focus
-    pop rax
+    call x11_flush
+.sat_done:
+    pop r12
+    pop rbx
+    ret
+
+; eax = XID that has been destroyed or unmapped client-initiated.
+; Untracks it, then if it was the active tab on any workspace, re-elects
+; a new top for that workspace and (if it's the current ws) makes it
+; visible.
+client_closed:
+    push rbx
+    push r12
+    mov r12d, eax                ; the dying XID
+    mov eax, r12d
+    call untrack_client
+    xor ebx, ebx                 ; ws index 0..9
+.cc_loop:
+    cmp ebx, WS_COUNT
+    jge .cc_done
+    cmp [ws_active_xid + rbx*4], r12d
+    jne .cc_next
+    ; Stale active tab — find a replacement on this workspace.
+    mov eax, ebx
+    inc eax                      ; ws number
+    call find_top_of_workspace
+    mov [ws_active_xid + rbx*4], eax
+    test eax, eax
+    jz .cc_next                  ; workspace now empty
+    movzx edx, byte [current_ws]
+    dec edx
+    cmp edx, ebx
+    jne .cc_next                 ; not the current ws — stays hidden
     push rax
-    lea rdi, [tmp_buf]
-    mov byte [rdi], X11_CONFIGURE_WINDOW
-    mov byte [rdi+1], 0
-    mov word [rdi+2], 4
+    call send_map_window
     pop rax
-    mov [rdi+4], eax
-    mov word [rdi+8], CFG_STACK
-    mov word [rdi+10], 0
-    mov dword [rdi+12], 0                   ; stack mode = Above
-    lea rsi, [tmp_buf]
-    mov rdx, 16
-    call x11_buffer
-    inc dword [x11_seq]
-.ft_none:
+    call set_input_focus
+.cc_next:
+    inc ebx
+    jmp .cc_loop
+.cc_done:
+    call x11_flush
+    pop r12
+    pop rbx
+    ret
+
+; edi = direction (1 = forward, -1 = backward). Cycles the active tab
+; on the current workspace by one position.
+focus_cycle_tab:
+    push rbx
+    push r12
+    push r13
+    mov r13d, edi                ; +1 or -1
+    movzx ecx, byte [current_ws]
+    dec ecx
+    mov ebx, [ws_active_xid + rcx*4]
+    test ebx, ebx
+    jz .fct_done                 ; empty
+    mov eax, ebx
+    call find_client_index
+    cmp eax, -1
+    je .fct_done
+    mov r12d, eax                ; current index
+    movzx ecx, byte [current_ws]
+    mov edx, [client_count]
+    test edx, edx
+    jz .fct_done
+.fct_walk:
+    add r12d, r13d
+    cmp r12d, edx
+    jl .fct_neg
+    xor r12d, r12d
+    jmp .fct_check
+.fct_neg:
+    test r12d, r12d
+    jns .fct_check
+    mov r12d, edx
+    dec r12d
+.fct_check:
+    cmp byte [client_ws + r12], cl
+    jne .fct_walk
+    mov eax, [client_xids + r12*4]
+    cmp eax, ebx
+    je .fct_done                 ; only one tab on this ws
+    call set_active_tab
+.fct_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; edi = direction (1 = right, -1 = left). Reorder the active tab one
+; slot in the workspace's tab order (= order it appears in client_xids
+; restricted to the same workspace). Swaps the active tab with its
+; nearest same-ws neighbor in the requested direction.
+move_tab:
+    push rbx
+    push r12
+    push r13
+    mov r13d, edi
+    movzx ecx, byte [current_ws]
+    dec ecx
+    mov ebx, [ws_active_xid + rcx*4]
+    test ebx, ebx
+    jz .mt_done
+    mov eax, ebx
+    call find_client_index
+    cmp eax, -1
+    je .mt_done
+    mov r12d, eax                ; current index
+    movzx ecx, byte [current_ws]
+    mov edx, [client_count]
+    mov esi, r12d                ; scan position
+.mt_search:
+    add esi, r13d
+    cmp esi, edx
+    jge .mt_done
+    test esi, esi
+    js .mt_done
+    cmp byte [client_ws + rsi], cl
+    jne .mt_search
+    ; esi points at next same-ws neighbor. Swap entry r12 with esi.
+    mov eax, [client_xids + r12*4]
+    mov edi, [client_xids + rsi*4]
+    mov [client_xids + rsi*4], eax
+    mov [client_xids + r12*4], edi
+    mov al, [client_ws + r12]
+    mov dil, [client_ws + rsi]
+    mov [client_ws + rsi], al
+    mov [client_ws + r12], dil
+    mov al, [client_unmap_expected + r12]
+    mov dil, [client_unmap_expected + rsi]
+    mov [client_unmap_expected + rsi], al
+    mov [client_unmap_expected + r12], dil
+.mt_done:
+    pop r13
+    pop r12
     pop rbx
     ret
 
@@ -1585,6 +1773,10 @@ dispatch_keypress:
     je .dk_workspace
     cmp eax, ACT_MOVE_TO
     je .dk_move_to
+    cmp eax, ACT_FOCUS
+    je .dk_focus
+    cmp eax, ACT_MOVE_TAB
+    je .dk_move_tab
     jmp .dk_done
 .dk_exec:
     test edx, edx
@@ -1624,6 +1816,30 @@ dispatch_keypress:
 .dk_move_to:
     mov edi, esi
     call move_focused_to_workspace
+    jmp .dk_done
+.dk_focus:
+    cmp esi, FOC_NEXT_TAB
+    jne .dk_focus_prev
+    mov edi, 1
+    call focus_cycle_tab
+    jmp .dk_done
+.dk_focus_prev:
+    cmp esi, FOC_PREV_TAB
+    jne .dk_done
+    mov edi, -1
+    call focus_cycle_tab
+    jmp .dk_done
+.dk_move_tab:
+    cmp esi, MTAB_LEFT
+    jne .dk_mt_right
+    mov edi, -1
+    call move_tab
+    jmp .dk_done
+.dk_mt_right:
+    cmp esi, MTAB_RIGHT
+    jne .dk_done
+    mov edi, 1
+    call move_tab
     jmp .dk_done
 .dk_skip:
     inc ebx
@@ -1697,12 +1913,11 @@ run_autostart:
 ; ══════════════════════════════════════════════════════════════════════
 
 ; edi = target workspace (1..WS_COUNT). No-op if already there or out
-; of range. Walks every client: unmaps those on the old workspace and
-; maps those on the new one.
+; of range. With the per-workspace tab model only the active tab on
+; each workspace is ever mapped, so a switch is just "unmap old active,
+; map new active".
 switch_workspace:
     push rbx
-    push r12
-    push r13
     test edi, edi
     jz .sw_done
     cmp edi, WS_COUNT
@@ -1711,35 +1926,34 @@ switch_workspace:
     cmp edi, eax
     je .sw_done
     mov [prev_ws], al
-    mov r12d, eax                 ; old ws
-    mov r13d, edi                 ; new ws
-    xor ebx, ebx
-.sw_loop:
-    cmp ebx, [client_count]
-    jge .sw_loop_done
-    movzx eax, byte [client_ws + rbx]
-    cmp eax, r12d
-    jne .sw_check_new
-    ; Was on old ws — unmap, mark expected.
-    mov byte [client_unmap_expected + rbx], 1
-    mov eax, [client_xids + rbx*4]
+    ; Unmap old workspace's active tab.
+    mov ecx, eax
+    dec ecx
+    mov ebx, [ws_active_xid + rcx*4]
+    test ebx, ebx
+    jz .sw_no_old
+    mov eax, ebx
+    call find_client_index
+    cmp eax, -1
+    je .sw_no_old
+    mov byte [client_unmap_expected + rax], 1
+    mov eax, ebx
     call send_unmap_window
-    jmp .sw_inc
-.sw_check_new:
-    cmp eax, r13d
-    jne .sw_inc
-    mov eax, [client_xids + rbx*4]
+.sw_no_old:
+    mov [current_ws], dil
+    ; Map new workspace's active tab (if any).
+    mov ecx, edi
+    dec ecx
+    mov ebx, [ws_active_xid + rcx*4]
+    test ebx, ebx
+    jz .sw_no_new
+    mov eax, ebx
     call send_map_window
-.sw_inc:
-    inc ebx
-    jmp .sw_loop
-.sw_loop_done:
-    mov [current_ws], r13b
-    call focus_top
+    mov eax, ebx
+    call set_input_focus
+.sw_no_new:
     call x11_flush
 .sw_done:
-    pop r13
-    pop r12
     pop rbx
     ret
 
@@ -1802,12 +2016,15 @@ workspace_prev_populated:
     pop rbx
     jmp switch_workspace
 
-; edi = target workspace. Move the focused (top of current ws) client
-; to the target workspace and unmap it from the current view. Refocus
-; the next client on the current workspace.
+; edi = target workspace. Move the active tab from the current
+; workspace to the target. The window becomes the active tab on the
+; target workspace and is unmapped from the current view; the current
+; workspace re-elects its next-most-recent client as the new active
+; tab.
 move_focused_to_workspace:
     push rbx
     push r12
+    push r13
     test edi, edi
     jz .mtw_done
     cmp edi, WS_COUNT
@@ -1815,29 +2032,49 @@ move_focused_to_workspace:
     movzx eax, byte [current_ws]
     cmp edi, eax
     je .mtw_done                  ; same ws — no-op
-    mov r12d, edi                 ; target
+    mov r13d, edi                 ; target ws
     movzx ecx, byte [current_ws]
-    mov ebx, [client_count]
-.mtw_find:
+    dec ecx
+    mov ebx, [ws_active_xid + rcx*4]
     test ebx, ebx
-    jz .mtw_done
-    dec ebx
-    cmp byte [client_ws + rbx], cl
-    jne .mtw_find
-    ; Found focused at index ebx.
-    movzx eax, byte [client_ws + rbx]
+    jz .mtw_done                  ; nothing to move
+    mov eax, ebx
+    call find_client_index
+    cmp eax, -1
+    je .mtw_done
+    mov r12d, eax                 ; index of moving client
+    ; Update populated counters.
+    movzx eax, byte [client_ws + r12]
     dec eax
     dec byte [workspace_populated + rax]
-    mov [client_ws + rbx], r12b
-    mov eax, r12d
+    mov [client_ws + r12], r13b
+    mov eax, r13d
     dec eax
     inc byte [workspace_populated + rax]
-    mov byte [client_unmap_expected + rbx], 1
-    mov eax, [client_xids + rbx*4]
+    ; Unmap from current view.
+    mov byte [client_unmap_expected + r12], 1
+    mov eax, ebx
     call send_unmap_window
-    call focus_top
+    ; Make this client the active tab on the target workspace.
+    movzx eax, r13b
+    dec eax
+    mov [ws_active_xid + rax*4], ebx
+    ; Re-elect a new active tab on the source (current) workspace.
+    movzx eax, byte [current_ws]
+    call find_top_of_workspace    ; eax = new top XID or 0
+    movzx edx, byte [current_ws]
+    dec edx
+    mov [ws_active_xid + rdx*4], eax
+    test eax, eax
+    jz .mtw_flush
+    push rax
+    call send_map_window
+    pop rax
+    call set_input_focus
+.mtw_flush:
     call x11_flush
 .mtw_done:
+    pop r13
     pop r12
     pop rbx
     ret
@@ -2049,47 +2286,54 @@ parse_workspace_number:
 ; rdi = NUL-terminated string. Lookup in ws_arg_table. Returns sentinel
 ; in eax (0xff/0xfe/0xfd) or 0 on miss.
 lookup_ws_arg:
+    lea rdx, [ws_arg_table]
+    jmp lookup_packed_byte
+
+; rdi = NUL-terminated string, rdx = pointer to a "name\0value\0pad"
+; packed table (terminated with an empty name = single NUL byte).
+; Returns the value byte in eax, or 0 if no match.
+lookup_packed_byte:
     push rbx
-    lea rsi, [ws_arg_table]
-.lwa_loop:
+    mov rsi, rdx
+.lpb_loop:
     mov al, [rsi]
     test al, al
-    jz .lwa_none
+    jz .lpb_none
     push rsi
     push rdi
     mov rbx, rdi
-.lwa_cmp:
+.lpb_cmp:
     mov al, [rsi]
     mov dl, [rbx]
     cmp al, dl
-    jne .lwa_neq
+    jne .lpb_neq
     test al, al
-    je .lwa_match
+    je .lpb_match
     inc rsi
     inc rbx
-    jmp .lwa_cmp
-.lwa_neq:
+    jmp .lpb_cmp
+.lpb_neq:
     pop rdi
     pop rsi
-.lwa_skip:
+.lpb_skip:
     mov al, [rsi]
     inc rsi
     test al, al
-    jnz .lwa_skip
+    jnz .lpb_skip
     add rsi, 2                   ; skip value byte + pad
-    jmp .lwa_loop
-.lwa_match:
+    jmp .lpb_loop
+.lpb_match:
     pop rdi
     pop rsi
-.lwa_to_val:
+.lpb_to_val:
     mov al, [rsi]
     inc rsi
     test al, al
-    jnz .lwa_to_val
+    jnz .lpb_to_val
     movzx eax, byte [rsi]
     pop rbx
     ret
-.lwa_none:
+.lpb_none:
     xor eax, eax
     pop rbx
     ret
@@ -2241,6 +2485,10 @@ parse_config_line:
     je .pcl_arg_ws
     cmp ecx, ACT_MOVE_TO
     je .pcl_arg_mt
+    cmp ecx, ACT_FOCUS
+    je .pcl_arg_focus
+    cmp ecx, ACT_MOVE_TAB
+    je .pcl_arg_mtab
     ; kill / exit / unknown — no arg.
     xor edx, edx
     xor r8b, r8b
@@ -2281,6 +2529,32 @@ parse_config_line:
     je .pcl_pop_mod_done
     mov rdi, r12
     call parse_workspace_number
+    test eax, eax
+    jz .pcl_pop_mod_done
+    mov r8b, al
+    xor edx, edx
+    jmp .pcl_emit
+.pcl_arg_focus:
+    call .pcl_skip_ws
+    mov al, [r12]
+    test al, al
+    je .pcl_pop_mod_done
+    mov rdi, r12
+    lea rdx, [focus_arg_table]
+    call lookup_packed_byte
+    test eax, eax
+    jz .pcl_pop_mod_done
+    mov r8b, al
+    xor edx, edx
+    jmp .pcl_emit
+.pcl_arg_mtab:
+    call .pcl_skip_ws
+    mov al, [r12]
+    test al, al
+    je .pcl_pop_mod_done
+    mov rdi, r12
+    lea rdx, [mtab_arg_table]
+    call lookup_packed_byte
     test eax, eax
     jz .pcl_pop_mod_done
     mov r8b, al

@@ -25,6 +25,10 @@
 #   workspace prev-populated walk to the previous non-empty workspace
 #   workspace back-and-forth toggle to the previously-active workspace
 #   move-to N                move the focused window to workspace N
+#   focus next-tab           cycle to the next tab on the current workspace
+#   focus prev-tab           cycle to the previous tab
+#   move-tab left            reorder the focused tab one slot to the left
+#   move-tab right           reorder the focused tab one slot to the right
 
 # === Spawn ===
 bind Mod4+Return        exec glass
@@ -33,6 +37,12 @@ bind Mod4+space         exec rofi -show run
 # === Window management ===
 bind Mod4+q             kill
 bind Mod4+Shift+q       exit
+
+# === Tabs (within a workspace) ===
+bind Mod4+Page_Down     focus next-tab
+bind Mod4+Page_Up       focus prev-tab
+bind Mod4+Shift+Page_Down  move-tab right
+bind Mod4+Shift+Page_Up    move-tab left
 
 # === Workspaces (Mod4 + 1..0) ===
 bind Mod4+1             workspace 1
