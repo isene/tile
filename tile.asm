@@ -790,44 +790,37 @@ grab_hardcoded_keys:
 .ghk_skip_q:
     ret
 
-; edi = keycode (8-bit), esi = modifier mask (16-bit)
+; edi = keycode (low 8 bits), esi = base modifier mask (low 16 bits).
+; Grabs all four lock-state combinations (none, CapsLock, NumLock,
+; CapsLock+NumLock) so the binding fires regardless of lock state.
+; Uses callee-saved r12/r13/rbx because x11_buffer clobbers ecx/edx.
 grab_one_key:
     push rbx
-    mov ebx, edi
-    mov ecx, esi
-
-    ; X11 GrabKey: opcode=33, owner_events=1, length=4
-    ; window=root, modifiers, key, pointer-mode=Async, keyboard-mode=Async, pad(3)
-    lea rdi, [tmp_buf]
-    mov byte [rdi], X11_GRAB_KEY
-    mov byte [rdi+1], 1         ; owner_events
-    mov word [rdi+2], 4
-    mov eax, [x11_root_window]
-    mov [rdi+4], eax
-    mov word [rdi+8], cx        ; modifiers
-    mov [rdi+10], bl            ; keycode
-    mov byte [rdi+11], 1        ; pointer mode = Async
-    mov byte [rdi+12], 1        ; keyboard mode = Async
-    mov byte [rdi+13], 0
-    mov byte [rdi+14], 0
-    mov byte [rdi+15], 0
-    lea rsi, [tmp_buf]
-    mov rdx, 16
-    call x11_buffer
-    inc dword [x11_seq]
-
-    ; Also grab with NumLock (Mod2) so the binding works when NumLock is on.
+    push r12
+    push r13
+    mov r12d, edi              ; keycode
+    mov r13d, esi              ; base modifiers
+    xor ebx, ebx               ; iterator: 0..3 over lock combinations
+.gok_loop:
+    mov ecx, r13d
+    test ebx, 1
+    jz .gok_no_caps
+    or ecx, MOD_LOCK
+.gok_no_caps:
+    test ebx, 2
+    jz .gok_no_num
     or ecx, MOD_MOD2
+.gok_no_num:
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_GRAB_KEY
-    mov byte [rdi+1], 1
-    mov word [rdi+2], 4
+    mov byte [rdi+1], 1                ; owner_events
+    mov word [rdi+2], 4                ; request length (4 words = 16 bytes)
     mov eax, [x11_root_window]
     mov [rdi+4], eax
-    mov word [rdi+8], cx
-    mov [rdi+10], bl
-    mov byte [rdi+11], 1
-    mov byte [rdi+12], 1
+    mov word [rdi+8], cx               ; modifiers
+    mov [rdi+10], r12b                 ; keycode
+    mov byte [rdi+11], 1               ; pointer-mode = Async
+    mov byte [rdi+12], 1               ; keyboard-mode = Async
     mov byte [rdi+13], 0
     mov byte [rdi+14], 0
     mov byte [rdi+15], 0
@@ -835,7 +828,11 @@ grab_one_key:
     mov rdx, 16
     call x11_buffer
     inc dword [x11_seq]
-
+    inc ebx
+    cmp ebx, 4
+    jl .gok_loop
+    pop r13
+    pop r12
     pop rbx
     ret
 
@@ -957,25 +954,27 @@ event_loop:
     ; bytes 4-7 = root window, bytes 8-11 = event window.
     movzx eax, byte [x11_read_buf + 1]
     movzx edx, word [x11_read_buf + 28]
-    ; Strip locks (NumLock=Mod2, CapsLock=Lock) so binds work either way.
+    ; Strip locks (CapsLock=Lock, NumLock=Mod2) before checking modifiers.
     and edx, ~(MOD_LOCK | MOD_MOD2)
-    ; Alt+Return -> exec glass/xterm
+    ; Alt+Return -> exec glass/xterm. Match if Mod1 is set and Shift is not.
     movzx ecx, byte [key_return_kc]
     cmp eax, ecx
     jne .kp_not_return
-    cmp edx, MOD_MOD1
-    jne .kp_done
+    test edx, MOD_MOD1
+    jz .kp_done
+    test edx, MOD_SHIFT
+    jnz .kp_done
     call action_exec_terminal
     jmp .kp_done
 .kp_not_return:
     movzx ecx, byte [key_q_kc]
     cmp eax, ecx
     jne .kp_done
-    cmp edx, MOD_MOD1 | MOD_SHIFT
-    je .kp_exit
-    cmp edx, MOD_MOD1
-    jne .kp_done
-    call action_kill_latest
+    test edx, MOD_MOD1
+    jz .kp_done                          ; q without Alt = ignore
+    test edx, MOD_SHIFT
+    jnz .kp_exit                         ; Alt+Shift+q = exit
+    call action_kill_latest              ; Alt+q (any other extra mods ok)
 .kp_done:
     jmp event_loop
 .kp_exit:
