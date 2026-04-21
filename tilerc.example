@@ -32,6 +32,10 @@
 #   tab-color-cycle          bump the focused tab's colour to the next
 #                            entry in tab_palette (mirrors glass's Alt+b
 #                            for terminal backgrounds)
+#   stash                    hide the focused window (replaces i3's
+#                            scratchpad — pushes onto a small LIFO)
+#   unstash                  pop the most-recently-stashed window back
+#                            onto the current workspace
 
 # === Spawn ===
 bind Mod4+Return        exec glass
@@ -81,6 +85,10 @@ bind Mod4+Shift+0       move-to 10
 # === Tab colors (the row-of-squares bar at the top) ===
 bind Mod4+c             tab-color-cycle
 
+# === Stash (replaces i3's scratchpad) ===
+bind Mod4+i             stash
+bind Mod4+o             unstash
+
 # === Lock screen ===
 bind Mod4+Escape        exec i3lock -c 000000
 
@@ -95,6 +103,7 @@ bind Mod4+Escape        exec i3lock -c 000000
 # ws_populated     = colour of any other populated workspace
 
 bar_height       = 10
+gap_inner        = 0           # pixels of padding around managed windows
 bar_bg           = #000000
 tab_default      = #555555
 tab_dim_factor   = 40

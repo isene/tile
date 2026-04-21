@@ -109,7 +109,7 @@ See `tilerc.example` for the full config syntax. Recognised statements:
 appearance, `# comments`.
 Modifiers: `Shift`, `Ctrl`/`Control`, `Alt`/`Mod1`, `Mod4`/`Win`/`Super`.
 Actions: `exec`, `kill`, `exit`, `workspace`, `move-to`, `focus`,
-`move-tab`, `tab-color-cycle`.
+`move-tab`, `tab-color-cycle`, `stash`, `unstash`.
 
 No splits, no multi-monitor, no `strip` (heavyweight bar with text /
 clock / tray) yet. Those land in phases 1b.3b through 2c.

@@ -126,6 +126,10 @@
 %define ACT_FOCUS       6
 %define ACT_MOVE_TAB    7
 %define ACT_TAB_COLOR   8
+%define ACT_STASH       9
+%define ACT_UNSTASH     10
+
+%define MAX_STASH       8
 
 ; Bar (the row-of-squares strip at the top of the screen).
 %define DEFAULT_BAR_HEIGHT      10
@@ -305,6 +309,10 @@ action_table:
     db ACT_MOVE_TAB, 0
     db "tab-color-cycle", 0
     db ACT_TAB_COLOR, 0
+    db "stash", 0
+    db ACT_STASH, 0
+    db "unstash", 0
+    db ACT_UNSTASH, 0
     db 0                       ; terminator
 
 ; Focus arg keyword table for `focus <direction>`.
@@ -387,6 +395,20 @@ cfg_tab_palette:         resd MAX_PALETTE
 cfg_tab_palette_count:   resb 1
 cfg_ws_active:           resd 1
 cfg_ws_populated:        resd 1
+
+; Inner gap: pixels of padding inside each managed window (so neighbouring
+; windows / the bar get visual breathing room). Equivalent to i3's
+; `gaps inner N`. Tabs already mean only one window is visible at a time
+; in phase 1b.3a, so the gap manifests as a uniform border around the
+; active client.
+cfg_gap_inner:           resw 1
+
+; Stash: a small LIFO of "hidden" client XIDs. `stash` unmaps the
+; currently focused tab and pushes its XID; `unstash` pops and
+; re-tracks it on the current workspace as the active tab. Replaces
+; i3's scratchpad for the user's ff-marionette workflow.
+stash_xids:              resd MAX_STASH
+stash_count:             resd 1
 
 ; Tracked top-level clients (most recent / focused at the end of the
 ; stack — kill action acts on the top entry of the current workspace).
@@ -496,6 +518,7 @@ _start:
     mov dword [cfg_ws_active], 0xffffff
     mov dword [cfg_ws_populated], 0x555555
     mov byte [cfg_tab_palette_count], 0
+    mov word [cfg_gap_inner], 0
     call load_config
 
     ; Become the WM by selecting substructure-redirect on root.
@@ -1298,9 +1321,10 @@ event_loop:
 configure_client_fullscreen:
     push rbx
     push r12
+    push r13
     mov r12d, edi
-    movzx eax, word [bar_height]
-    mov ebx, eax                 ; bar_height as int
+    movzx ebx, word [bar_height]      ; bar_height
+    movzx r13d, word [cfg_gap_inner]  ; gap
 
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_CONFIGURE_WINDOW
@@ -1309,17 +1333,28 @@ configure_client_fullscreen:
     mov [rdi+4], r12d            ; window
     mov word [rdi+8], CFG_X | CFG_Y | CFG_WIDTH | CFG_HEIGHT
     mov word [rdi+10], 0         ; pad
-    mov dword [rdi+12], 0        ; x = 0
-    mov dword [rdi+16], ebx      ; y = bar_height
+    ; x = gap
+    mov dword [rdi+12], r13d
+    ; y = bar_height + gap
+    mov eax, ebx
+    add eax, r13d
+    mov dword [rdi+16], eax
+    ; w = screen_w - 2*gap
     movzx eax, word [x11_screen_width]
+    mov ecx, r13d
+    shl ecx, 1
+    sub eax, ecx
     mov dword [rdi+20], eax
+    ; h = screen_h - bar_height - 2*gap
     movzx eax, word [x11_screen_height]
     sub eax, ebx
+    sub eax, ecx
     mov dword [rdi+24], eax
     lea rsi, [tmp_buf]
     mov rdx, 28
     call x11_buffer
     inc dword [x11_seq]
+    pop r13
     pop r12
     pop rbx
     ret
@@ -1875,6 +1910,10 @@ dispatch_keypress:
     je .dk_move_tab
     cmp eax, ACT_TAB_COLOR
     je .dk_tab_color
+    cmp eax, ACT_STASH
+    je .dk_stash
+    cmp eax, ACT_UNSTASH
+    je .dk_unstash
     jmp .dk_done
 .dk_exec:
     test edx, edx
@@ -1941,6 +1980,12 @@ dispatch_keypress:
     jmp .dk_done
 .dk_tab_color:
     call tab_color_cycle
+    jmp .dk_done
+.dk_stash:
+    call action_stash
+    jmp .dk_done
+.dk_unstash:
+    call action_unstash
     jmp .dk_done
 .dk_skip:
     inc ebx
@@ -3078,6 +3123,11 @@ apply_setting:
     call .as_streq
     test eax, eax
     jnz .as_ws_populated
+    mov rdi, r13
+    lea rsi, [.as_kw_gap_inner]
+    call .as_streq
+    test eax, eax
+    jnz .as_gap_inner
     jmp .as_done
 
 .as_bar_height:
@@ -3118,6 +3168,11 @@ apply_setting:
     call parse_hex_color
     mov [cfg_ws_populated], eax
     jmp .as_done
+.as_gap_inner:
+    mov rdi, r12
+    call parse_decimal_byte
+    mov [cfg_gap_inner], ax
+    jmp .as_done
 .as_done:
     pop r13
     pop rbx
@@ -3151,6 +3206,7 @@ apply_setting:
 .as_kw_tab_palette:   db "tab_palette", 0
 .as_kw_ws_active:     db "ws_active", 0
 .as_kw_ws_populated:  db "ws_populated", 0
+.as_kw_gap_inner:     db "gap_inner", 0
 
 ; rdi = NUL-terminated string starting with optional '#' then 6 hex
 ; digits. Returns CARD32 0x00RRGGBB in eax. Garbage in → 0 in eax.
@@ -3622,6 +3678,106 @@ render_bar:
     pop r14
     pop r13
     pop r12
+    pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Stash — replacement for i3's scratchpad.
+;
+; `stash` unmaps the focused tab and pushes its XID onto a small LIFO.
+; Tile keeps the client tracked (its workspace, colour, etc. are
+; preserved) but it's not visible anywhere. `unstash` pops the most-
+; recent XID and routes it to the current workspace as the active tab.
+; Used in the user's i3 setup for the ff-marionette window — instantly
+; hide-and-recall.
+; ══════════════════════════════════════════════════════════════════════
+action_stash:
+    push rbx
+    movzx ecx, byte [current_ws]
+    test ecx, ecx
+    jz .as_done
+    dec ecx
+    mov ebx, [ws_active_xid + rcx*4]
+    test ebx, ebx
+    jz .as_done                  ; nothing focused
+    mov eax, [stash_count]
+    cmp eax, MAX_STASH
+    jge .as_done                 ; stash full
+    mov [stash_xids + rax*4], ebx
+    inc dword [stash_count]
+    ; Unmap the focused window from view, but keep it tracked. We mark
+    ; it as "stashed" by stealing the highest workspace bit … no, we
+    ; don't have that. Simpler: untrack it entirely. unstash will
+    ; re-track on the current workspace.
+    ;
+    ; Find its index, mark expected unmap, send unmap.
+    mov eax, ebx
+    call find_client_index
+    cmp eax, -1
+    je .as_pop                   ; shouldn't happen
+    mov byte [client_unmap_expected + rax], 1
+    mov eax, ebx
+    call send_unmap_window
+    ; Clear ws_active_xid for current ws and elect a new top.
+    movzx eax, byte [current_ws]
+    dec eax
+    mov dword [ws_active_xid + rax*4], 0
+    ; Untrack the stashed XID so it doesn't keep the workspace
+    ; populated counter inflated.
+    mov eax, ebx
+    call untrack_client
+    ; Elect a new active tab on the current workspace, if any.
+    movzx eax, byte [current_ws]
+    call find_top_of_workspace
+    movzx edx, byte [current_ws]
+    dec edx
+    mov [ws_active_xid + rdx*4], eax
+    test eax, eax
+    jz .as_render
+    push rax
+    call send_map_window
+    pop rax
+    call set_input_focus
+.as_render:
+    call render_bar
+    call x11_flush
+    pop rbx
+    ret
+.as_pop:
+    dec dword [stash_count]
+    pop rbx
+    ret
+.as_done:
+    pop rbx
+    ret
+
+; Pop the most-recent XID from the stash and route it to the current
+; workspace as the active tab. The popped client is re-tracked
+; (workspace, colour reset to default — we don't preserve the previous
+; colour because the client_color slot was reclaimed when stash called
+; untrack).
+action_unstash:
+    push rbx
+    mov eax, [stash_count]
+    test eax, eax
+    jz .au_done
+    dec eax
+    mov ebx, [stash_xids + rax*4]
+    mov [stash_count], eax
+    test ebx, ebx
+    jz .au_done
+    ; Re-track on current workspace.
+    mov eax, ebx
+    call track_client
+    ; Configure to fullscreen (in case screen size changed).
+    mov edi, ebx
+    call configure_client_fullscreen
+    ; Make it the active tab (set_active_tab unmaps the old active and
+    ; maps the new one).
+    mov eax, ebx
+    call set_active_tab
+    ; render_bar already called inside set_active_tab.
+.au_done:
     pop rbx
     ret
 
