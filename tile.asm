@@ -103,6 +103,14 @@
 %define ACT_EXEC        1
 %define ACT_KILL        2
 %define ACT_EXIT        3
+%define ACT_WORKSPACE   4
+%define ACT_MOVE_TO     5
+
+; Workspace count and special arg_int sentinels for ACT_WORKSPACE.
+%define WS_COUNT        10
+%define WS_NEXT_POP     0xff
+%define WS_PREV_POP     0xfe
+%define WS_BACK_FORTH   0xfd
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Data
@@ -250,7 +258,23 @@ action_table:
     db ACT_KILL, 0
     db "exit", 0
     db ACT_EXIT, 0
+    db "workspace", 0
+    db ACT_WORKSPACE, 0
+    db "move-to", 0
+    db ACT_MOVE_TO, 0
     db 0                       ; terminator
+
+; Workspace argument keyword table for `workspace <name>`. Same packed
+; format: name, NUL, value (BYTE), pad. Values are sentinels in the
+; 0xfd..0xff range so they don't collide with literal workspace numbers.
+ws_arg_table:
+    db "next-populated", 0
+    db WS_NEXT_POP, 0
+    db "prev-populated", 0
+    db WS_PREV_POP, 0
+    db "back-and-forth", 0
+    db WS_BACK_FORTH, 0
+    db 0
 
 ; Default exec command path for the built-in Alt+Return bind, used when
 ; no ~/.tilerc is found. Same fallback as the phase 1a action.
@@ -289,10 +313,26 @@ keysym_map:          resd 256 * 8
 bar_height:          resw 1
 
 ; Tracked top-level clients (most recent / focused at the end of the
-; stack — Alt+q acts on the top entry). Phase 1a.2 keeps it as a flat
-; LIFO; phase 1b replaces it with the real workspace tree.
-client_xids:         resd MAX_CLIENTS
-client_count:        resd 1
+; stack — kill action acts on the top entry of the current workspace).
+client_xids:             resd MAX_CLIENTS
+; Parallel byte arrays:
+;   client_ws[i]              = workspace this client belongs to (1..10)
+;   client_unmap_expected[i]  = nonzero when WE issued an UnmapWindow on
+;                               this client (e.g. workspace switch); the
+;                               UnmapNotify it generates must NOT be
+;                               treated as the client closing.
+client_ws:               resb MAX_CLIENTS
+client_unmap_expected:   resb MAX_CLIENTS
+client_count:            resd 1
+
+; Workspace state.
+;   current_ws               = active workspace, 1..10
+;   prev_ws                  = workspace we last switched away from (for
+;                               `workspace back-and-forth`); 0 = none yet
+;   workspace_populated[w-1] = client count on workspace w, byte
+current_ws:              resb 1
+prev_ws:                 resb 1
+workspace_populated:     resb WS_COUNT
 
 ; ICCCM atoms (resolved at startup via InternAtom).
 wm_protocols_atom:   resd 1
@@ -363,6 +403,9 @@ _start:
     ; Reserve arg_pool[0] as the "no arg" sentinel and load ~/.tilerc.
     mov dword [arg_pool_pos], 1
     mov byte [arg_pool], 0
+    ; Start on workspace 1.
+    mov byte [current_ws], 1
+    mov byte [prev_ws], 0
     call load_config
 
     ; Become the WM by selecting substructure-redirect on root.
@@ -1106,6 +1149,19 @@ event_loop:
     jmp event_loop
 
 .ev_unmap_notify:
+    ; If the unmap matches a pending WM-initiated unmap (workspace
+    ; switch, move-to), just clear the flag and leave the client in
+    ; the stack. Real client-initiated closes get untracked.
+    mov eax, [x11_read_buf + 8]
+    call find_client_index
+    cmp eax, -1
+    je event_loop
+    mov ebx, eax
+    cmp byte [client_unmap_expected + rbx], 0
+    je .eun_real
+    mov byte [client_unmap_expected + rbx], 0
+    jmp event_loop
+.eun_real:
     mov eax, [x11_read_buf + 8]
     call untrack_client
     call focus_top
@@ -1190,19 +1246,28 @@ set_input_focus:
     inc dword [x11_seq]
     ret
 
-; eax = window XID. Append to client_xids if there's room.
+; eax = window XID. Append to client_xids on the current workspace.
 track_client:
     push rbx
     mov ebx, [client_count]
     cmp ebx, MAX_CLIENTS
     jge .tc_full
     mov [client_xids + rbx*4], eax
+    movzx ecx, byte [current_ws]
+    mov [client_ws + rbx], cl
+    mov byte [client_unmap_expected + rbx], 0
     inc dword [client_count]
+    ; Bump populated count for the workspace this client lives on.
+    movzx ecx, byte [current_ws]
+    dec ecx
+    inc byte [workspace_populated + rcx]
 .tc_full:
     pop rbx
     ret
 
-; eax = window XID. Remove from client_xids (no-op if not present).
+; eax = window XID. Remove from client_xids (no-op if not present),
+; including its parallel client_ws and client_unmap_expected entries,
+; and decrement the workspace-populated counter.
 untrack_client:
     push rbx
     push r12
@@ -1216,7 +1281,14 @@ untrack_client:
     inc ebx
     jmp .uc_find
 .uc_remove:
-    ; Shift down
+    ; Decrement populated for this client's workspace.
+    movzx ecx, byte [client_ws + rbx]
+    test ecx, ecx
+    jz .uc_no_dec                   ; defensive: unset workspace
+    dec ecx
+    dec byte [workspace_populated + rcx]
+.uc_no_dec:
+    ; Shift parallel arrays down.
 .uc_shift:
     mov eax, [client_count]
     dec eax
@@ -1226,6 +1298,10 @@ untrack_client:
     inc ecx
     mov edx, [client_xids + rcx*4]
     mov [client_xids + rbx*4], edx
+    mov dl, [client_ws + rcx]
+    mov [client_ws + rbx], dl
+    mov dl, [client_unmap_expected + rcx]
+    mov [client_unmap_expected + rbx], dl
     inc ebx
     jmp .uc_shift
 .uc_dec:
@@ -1233,6 +1309,43 @@ untrack_client:
 .uc_done:
     pop r12
     pop rbx
+    ret
+
+; Returns the index of the client with XID = eax, or -1 in eax if not
+; present.
+find_client_index:
+    push rbx
+    mov ebx, eax
+    xor ecx, ecx
+.fci_loop:
+    cmp ecx, [client_count]
+    jge .fci_none
+    cmp [client_xids + rcx*4], ebx
+    je .fci_found
+    inc ecx
+    jmp .fci_loop
+.fci_none:
+    mov eax, -1
+    pop rbx
+    ret
+.fci_found:
+    mov eax, ecx
+    pop rbx
+    ret
+
+; eax = window XID. UnmapWindow request.
+send_unmap_window:
+    push rax
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_UNMAP_WINDOW
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    pop rax
+    mov [rdi+4], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    call x11_buffer
+    inc dword [x11_seq]
     ret
 
 action_kill_latest:
@@ -1391,19 +1504,24 @@ send_delete_message:
     pop rbx
     ret
 
-; Focus the top of the client stack (highest-numbered live entry). No-op
-; if no clients exist. Also raises that window to the top of the
-; stacking order so it isn't obscured by stale fullscreen frames.
+; Focus the top-most client on the current workspace (highest-indexed
+; entry whose client_ws matches current_ws). No-op if the workspace is
+; empty.
 focus_top:
-    mov eax, [client_count]
-    test eax, eax
+    push rbx
+    movzx edx, byte [current_ws]
+    mov ebx, [client_count]
+.ft_loop:
+    test ebx, ebx
     jz .ft_none
-    dec eax
-    mov eax, [client_xids + rax*4]
+    dec ebx
+    movzx eax, byte [client_ws + rbx]
+    cmp eax, edx
+    jne .ft_loop
+    mov eax, [client_xids + rbx*4]
     push rax
     call set_input_focus
     pop rax
-    ; ConfigureWindow(window, stack-mode = Above)
     push rax
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_CONFIGURE_WINDOW
@@ -1419,6 +1537,7 @@ focus_top:
     call x11_buffer
     inc dword [x11_seq]
 .ft_none:
+    pop rbx
     ret
 
 ; ══════════════════════════════════════════════════════════════════════
@@ -1449,15 +1568,23 @@ dispatch_keypress:
     movzx eax, word [rcx + 8]    ; modifiers
     cmp eax, r12d
     jne .dk_skip
-    ; Match — dispatch by action_id.
+    ; Match — dispatch by action_id. arg_off (CARD16) lives at +12;
+    ; arg_int (BYTE) lives at +11 and carries small numeric args
+    ; (workspace numbers, sentinels) for actions that don't need a
+    ; string.
     movzx eax, byte [rcx + 10]
-    movzx edx, word [rcx + 12]   ; arg_off
+    movzx edx, word [rcx + 12]
+    movzx esi, byte [rcx + 11]
     cmp eax, ACT_EXEC
     je .dk_exec
     cmp eax, ACT_KILL
     je .dk_kill
     cmp eax, ACT_EXIT
     je .dk_exit
+    cmp eax, ACT_WORKSPACE
+    je .dk_workspace
+    cmp eax, ACT_MOVE_TO
+    je .dk_move_to
     jmp .dk_done
 .dk_exec:
     test edx, edx
@@ -1472,6 +1599,32 @@ dispatch_keypress:
     mov rax, SYS_EXIT
     xor edi, edi
     syscall
+.dk_workspace:
+    cmp esi, WS_NEXT_POP
+    je .dk_ws_next
+    cmp esi, WS_PREV_POP
+    je .dk_ws_prev
+    cmp esi, WS_BACK_FORTH
+    je .dk_ws_baf
+    mov edi, esi
+    call switch_workspace
+    jmp .dk_done
+.dk_ws_next:
+    call workspace_next_populated
+    jmp .dk_done
+.dk_ws_prev:
+    call workspace_prev_populated
+    jmp .dk_done
+.dk_ws_baf:
+    movzx edi, byte [prev_ws]
+    test edi, edi
+    jz .dk_done
+    call switch_workspace
+    jmp .dk_done
+.dk_move_to:
+    mov edi, esi
+    call move_focused_to_workspace
+    jmp .dk_done
 .dk_skip:
     inc ebx
     jmp .dk_loop
@@ -1536,6 +1689,156 @@ run_autostart:
     inc ebx
     jmp .ra_loop
 .ra_done:
+    pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Workspace actions
+; ══════════════════════════════════════════════════════════════════════
+
+; edi = target workspace (1..WS_COUNT). No-op if already there or out
+; of range. Walks every client: unmaps those on the old workspace and
+; maps those on the new one.
+switch_workspace:
+    push rbx
+    push r12
+    push r13
+    test edi, edi
+    jz .sw_done
+    cmp edi, WS_COUNT
+    jg .sw_done
+    movzx eax, byte [current_ws]
+    cmp edi, eax
+    je .sw_done
+    mov [prev_ws], al
+    mov r12d, eax                 ; old ws
+    mov r13d, edi                 ; new ws
+    xor ebx, ebx
+.sw_loop:
+    cmp ebx, [client_count]
+    jge .sw_loop_done
+    movzx eax, byte [client_ws + rbx]
+    cmp eax, r12d
+    jne .sw_check_new
+    ; Was on old ws — unmap, mark expected.
+    mov byte [client_unmap_expected + rbx], 1
+    mov eax, [client_xids + rbx*4]
+    call send_unmap_window
+    jmp .sw_inc
+.sw_check_new:
+    cmp eax, r13d
+    jne .sw_inc
+    mov eax, [client_xids + rbx*4]
+    call send_map_window
+.sw_inc:
+    inc ebx
+    jmp .sw_loop
+.sw_loop_done:
+    mov [current_ws], r13b
+    call focus_top
+    call x11_flush
+.sw_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; Switch to the next workspace that has at least one client. Wraps
+; around. No-op if the only populated workspace is the current one.
+workspace_next_populated:
+    push rbx
+    movzx ebx, byte [current_ws]
+    mov ecx, WS_COUNT
+.wnp_loop:
+    inc ebx
+    cmp ebx, WS_COUNT
+    jle .wnp_check
+    mov ebx, 1
+.wnp_check:
+    movzx eax, byte [current_ws]
+    cmp ebx, eax
+    je .wnp_skip                  ; back to current — nothing populated elsewhere
+    mov eax, ebx
+    dec eax
+    movzx eax, byte [workspace_populated + rax]
+    test eax, eax
+    jnz .wnp_found
+.wnp_skip:
+    dec ecx
+    jnz .wnp_loop
+    pop rbx
+    ret
+.wnp_found:
+    mov edi, ebx
+    pop rbx
+    jmp switch_workspace          ; tail call
+
+; Mirror of the above, walking backwards.
+workspace_prev_populated:
+    push rbx
+    movzx ebx, byte [current_ws]
+    mov ecx, WS_COUNT
+.wpp_loop:
+    dec ebx
+    cmp ebx, 1
+    jge .wpp_check
+    mov ebx, WS_COUNT
+.wpp_check:
+    movzx eax, byte [current_ws]
+    cmp ebx, eax
+    je .wpp_skip
+    mov eax, ebx
+    dec eax
+    movzx eax, byte [workspace_populated + rax]
+    test eax, eax
+    jnz .wpp_found
+.wpp_skip:
+    dec ecx
+    jnz .wpp_loop
+    pop rbx
+    ret
+.wpp_found:
+    mov edi, ebx
+    pop rbx
+    jmp switch_workspace
+
+; edi = target workspace. Move the focused (top of current ws) client
+; to the target workspace and unmap it from the current view. Refocus
+; the next client on the current workspace.
+move_focused_to_workspace:
+    push rbx
+    push r12
+    test edi, edi
+    jz .mtw_done
+    cmp edi, WS_COUNT
+    jg .mtw_done
+    movzx eax, byte [current_ws]
+    cmp edi, eax
+    je .mtw_done                  ; same ws — no-op
+    mov r12d, edi                 ; target
+    movzx ecx, byte [current_ws]
+    mov ebx, [client_count]
+.mtw_find:
+    test ebx, ebx
+    jz .mtw_done
+    dec ebx
+    cmp byte [client_ws + rbx], cl
+    jne .mtw_find
+    ; Found focused at index ebx.
+    movzx eax, byte [client_ws + rbx]
+    dec eax
+    dec byte [workspace_populated + rax]
+    mov [client_ws + rbx], r12b
+    mov eax, r12d
+    dec eax
+    inc byte [workspace_populated + rax]
+    mov byte [client_unmap_expected + rbx], 1
+    mov eax, [client_xids + rbx*4]
+    call send_unmap_window
+    call focus_top
+    call x11_flush
+.mtw_done:
+    pop r12
     pop rbx
     ret
 
@@ -1670,34 +1973,34 @@ load_config:
 ; Hardcoded fallback: Alt+Return → exec glass, Alt+q → kill, Alt+Shift+q → exit.
 install_default_binds:
     push rbx
-    ; Stash glass path into arg_pool, capture offset.
     lea rdi, [default_glass_arg]
     call arg_pool_dup
     mov ebx, eax                 ; arg_off
-    ; Alt+Return / exec / glass
     mov dword [bind_count], 0
     mov edi, 0xff0d              ; XK_Return
     mov esi, MOD_MOD1
     mov edx, ACT_EXEC
     mov ecx, ebx
+    xor r8b, r8b
     call add_bind
-    ; Alt+q / kill
     mov edi, 0x71                ; XK_q
     mov esi, MOD_MOD1
     mov edx, ACT_KILL
     xor ecx, ecx
+    xor r8b, r8b
     call add_bind
-    ; Alt+Shift+q / exit
     mov edi, 0x71
     mov esi, MOD_MOD1 | MOD_SHIFT
     mov edx, ACT_EXIT
     xor ecx, ecx
+    xor r8b, r8b
     call add_bind
     pop rbx
     ret
 
-; rdi = keysym, esi = modifiers, edx = action_id, ecx = arg_off.
-; Appends a new bind entry. Silently drops if table is full.
+; rdi = keysym, esi = modifiers, edx = action_id, ecx = arg_off,
+; r8b = arg_int. Appends a new bind entry. Silently drops if table is
+; full.
 add_bind:
     push rbx
     mov ebx, [bind_count]
@@ -1705,16 +2008,89 @@ add_bind:
     jge .ab_full
     mov eax, ebx
     imul eax, BIND_STRIDE
-    lea r8, [bind_table + rax]
-    mov [r8], edi                ; keysym
-    mov dword [r8 + 4], 0        ; keycode placeholder
-    mov [r8 + 8], si             ; modifiers
-    mov [r8 + 10], dl            ; action_id
-    mov byte [r8 + 11], 0
-    mov [r8 + 12], cx            ; arg_off
-    mov word [r8 + 14], 0
+    lea r9, [bind_table + rax]
+    mov [r9], edi                ; keysym
+    mov dword [r9 + 4], 0        ; keycode placeholder
+    mov [r9 + 8], si             ; modifiers
+    mov [r9 + 10], dl            ; action_id
+    mov [r9 + 11], r8b           ; arg_int
+    mov [r9 + 12], cx            ; arg_off
+    mov word [r9 + 14], 0
     inc dword [bind_count]
 .ab_full:
+    pop rbx
+    ret
+
+; rdi = NUL-terminated string. Parse as integer. Returns workspace
+; number in eax: 1..9 for "1".."9", 10 for "0" (matches i3-style
+; numbering on the row of digit keys); 0 if not a valid digit.
+parse_workspace_number:
+    mov al, [rdi]
+    cmp al, '1'
+    jb .pwn_check_zero
+    cmp al, '9'
+    ja .pwn_no
+    cmp byte [rdi + 1], 0
+    jne .pwn_no                  ; multi-char like "10" not supported here
+    sub al, '0'
+    movzx eax, al
+    ret
+.pwn_check_zero:
+    cmp al, '0'
+    jne .pwn_no
+    cmp byte [rdi + 1], 0
+    jne .pwn_no
+    mov eax, 10
+    ret
+.pwn_no:
+    xor eax, eax
+    ret
+
+; rdi = NUL-terminated string. Lookup in ws_arg_table. Returns sentinel
+; in eax (0xff/0xfe/0xfd) or 0 on miss.
+lookup_ws_arg:
+    push rbx
+    lea rsi, [ws_arg_table]
+.lwa_loop:
+    mov al, [rsi]
+    test al, al
+    jz .lwa_none
+    push rsi
+    push rdi
+    mov rbx, rdi
+.lwa_cmp:
+    mov al, [rsi]
+    mov dl, [rbx]
+    cmp al, dl
+    jne .lwa_neq
+    test al, al
+    je .lwa_match
+    inc rsi
+    inc rbx
+    jmp .lwa_cmp
+.lwa_neq:
+    pop rdi
+    pop rsi
+.lwa_skip:
+    mov al, [rsi]
+    inc rsi
+    test al, al
+    jnz .lwa_skip
+    add rsi, 2                   ; skip value byte + pad
+    jmp .lwa_loop
+.lwa_match:
+    pop rdi
+    pop rsi
+.lwa_to_val:
+    mov al, [rsi]
+    inc rsi
+    test al, al
+    jnz .lwa_to_val
+    movzx eax, byte [rsi]
+    pop rbx
+    ret
+.lwa_none:
+    xor eax, eax
     pop rbx
     ret
 
@@ -1854,10 +2230,22 @@ parse_config_line:
     test eax, eax
     jz .pcl_pop_mod_done         ; unknown action
     mov ecx, eax                 ; action_id
-    ; If exec, the rest of the line is the command. arg_pool_dup
-    ; clobbers ecx, so save the action_id on the stack across the call.
+    ; Per-action argument parsing. ecx = action_id at entry to each
+    ; branch. We need to set:
+    ;   edx = arg_off   (offset into arg_pool, or 0)
+    ;   r8b = arg_int   (small numeric arg, or 0)
+    ; before falling into .pcl_emit.
     cmp ecx, ACT_EXEC
-    jne .pcl_no_arg
+    je .pcl_arg_exec
+    cmp ecx, ACT_WORKSPACE
+    je .pcl_arg_ws
+    cmp ecx, ACT_MOVE_TO
+    je .pcl_arg_mt
+    ; kill / exit / unknown — no arg.
+    xor edx, edx
+    xor r8b, r8b
+    jmp .pcl_emit
+.pcl_arg_exec:
     call .pcl_skip_ws
     mov al, [r12]
     test al, al
@@ -1865,18 +2253,51 @@ parse_config_line:
     push rcx                     ; save action_id across arg_pool_dup
     mov rdi, r12
     call arg_pool_dup
-    pop rcx                      ; restore action_id
+    pop rcx
     mov edx, eax                 ; arg_off
+    xor r8b, r8b                 ; no arg_int
     jmp .pcl_emit
-.pcl_no_arg:
+.pcl_arg_ws:
+    call .pcl_skip_ws
+    mov al, [r12]
+    test al, al
+    je .pcl_pop_mod_done
+    mov rdi, r12
+    call lookup_ws_arg           ; handles next/prev/back-and-forth
+    test eax, eax
+    jnz .pcl_ws_have
+    mov rdi, r12
+    call parse_workspace_number
+    test eax, eax
+    jz .pcl_pop_mod_done         ; not a number, not a name
+.pcl_ws_have:
+    mov r8b, al                  ; arg_int
+    xor edx, edx                 ; no arg_off
+    jmp .pcl_emit
+.pcl_arg_mt:
+    call .pcl_skip_ws
+    mov al, [r12]
+    test al, al
+    je .pcl_pop_mod_done
+    mov rdi, r12
+    call parse_workspace_number
+    test eax, eax
+    jz .pcl_pop_mod_done
+    mov r8b, al
     xor edx, edx
+    jmp .pcl_emit
 .pcl_emit:
-    pop r8                       ; modifiers
+    pop r9                       ; modifiers (was push rdx earlier)
+    push rcx                     ; preserve action_id
+    push r8                      ; preserve arg_int
     mov edi, ebx                 ; keysym
-    mov esi, r8d                 ; modifiers
-    mov r9, rdx                  ; arg_off
-    mov edx, ecx                 ; action_id
-    mov ecx, r9d
+    mov esi, r9d                 ; modifiers
+    mov r9, rdx                  ; arg_off (param 5)
+    pop rcx                      ; arg_int from stack into rcx temporarily
+    mov r8b, cl                  ; restore arg_int into r8b for add_bind
+    pop rcx                      ; action_id
+    mov edx, ecx                 ; action_id (param 3)
+    mov ecx, r9d                 ; arg_off (param 4)
     call add_bind
     jmp .pcl_done
 .pcl_pop_mod_done:

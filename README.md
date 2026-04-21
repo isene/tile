@@ -79,28 +79,29 @@ To launch a test app inside the Xephyr session:
 DISPLAY=:9 glass                        # or: DISPLAY=:9 xterm
 ```
 
-## Current capabilities (phases 1a + 1b.1)
+## Current capabilities (phases 1a + 1b.1 + 1b.2)
 
 - Connects to X11 via Unix socket, MIT-MAGIC-COOKIE-1 authentication
 - Claims SubstructureRedirectMask on the root window (single-WM enforcement)
 - Maps incoming MapRequest windows full-screen
-- Grants ConfigureRequest geometry (clamped to screen)
-- LIFO client stack with auto-focus on top
-- ICCCM `WM_DELETE_WINDOW` protocol — `kill` action asks the app to
-  close cleanly (save state, exit) rather than yanking its X11
-  connection
-- Closing the top window auto-focuses the next one in the stack
-- **`~/.tilerc` config parser** — keybinds and autostart are no
-  longer hardcoded. Built-in defaults match the previous Alt+Return /
-  Alt+q / Alt+Shift+q behaviour if no config file is present.
+- LIFO per-workspace client stack with auto-focus on top
+- ICCCM `WM_DELETE_WINDOW` protocol — `kill` asks the app to close
+  cleanly rather than yanking its X11 connection
+- Closing the top window auto-focuses the next one
+- **10 workspaces** with `workspace N` / `move-to N` / smart cycling
+  (`workspace next-populated` walks only workspaces that have at least
+  one window — improvement over i3) / `workspace back-and-forth`
+- WM-initiated unmaps (workspace switches, move-to) don't get
+  treated as window-closed
+- `~/.tilerc` config parser
 
 See `tilerc.example` for the full config syntax. Recognised statements:
 `bind <chord> <action> [arg]`, `exec <cmdline>`, `# comments`.
 Modifiers: `Shift`, `Ctrl`/`Control`, `Alt`/`Mod1`, `Mod4`/`Win`/`Super`.
-Actions: `exec`, `kill`, `exit`.
+Actions: `exec`, `kill`, `exit`, `workspace`, `move-to`.
 
-No layouts, no workspaces, no bar yet. Those land in phases 1b.2
-through 2c — see PLAN.md.
+No layouts (tabbed/split), no multi-monitor, no bar yet. Those land
+in phases 1b.3 through 2c — see PLAN.md.
 
 ## License
 
