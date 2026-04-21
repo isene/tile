@@ -3495,37 +3495,54 @@ render_bar:
     movzx ecx, word [bar_height]
     call fill_rect
 
-    ; Workspace squares: fixed 10 slots in the order
-    ;   [WS10, WS1, WS2, WS3, WS4, WS5, WS6, WS7, WS8, WS9]
-    ; (display position 0 = the "0" key = internal WS 10 — special;
-    ; will be the external-monitor pin once 1c lands). Non-current
-    ; populated workspaces draw filled in cfg_ws_populated; the current
-    ; workspace draws filled in cfg_ws_active. Empty workspaces draw as
-    ; outlines in the same color so the slot is always visible.
-    ; A small WS_GROUP_GAP precedes display positions 1, 4, 7 to set
-    ; off the special slot and group the remainder into 1-3 / 4-6 / 7-9.
+    ; Workspace squares: fixed 10 slots, right-justified, in the order
+    ;   [WS1 WS2 WS3] [WS4 WS5 WS6] [WS7 WS8 WS9] [WS10]
+    ; (display positions 0..8 = WS 1..9; display 9 = the "0" key =
+    ; internal WS 10 — special; will be the external-monitor pin once
+    ; 1c lands). Non-current populated workspaces draw filled in
+    ; cfg_ws_populated; the current workspace fills in cfg_ws_active.
+    ; Empty workspaces draw as outlines in the same colour so the slot
+    ; is always visible. A small WS_GROUP_GAP precedes display positions
+    ; 3, 6, 9 to group the bar as [1 2 3] [4 5 6] [7 8 9] [0].
     movzx r14d, word [bar_height]         ; square edge
-    xor r12d, r12d                        ; cursor x
+    ; Compute total WS-strip width: 10 squares + 9 inter-square gaps +
+    ; 3 group gaps (one each before slots 3, 6, 9).
+    mov eax, r14d
+    imul eax, WS_COUNT                    ; 10 * square
+    mov ecx, WS_COUNT - 1
+    imul ecx, SQUARE_GAP                  ; 9 inter-square gaps
+    add eax, ecx
+    add eax, 3 * WS_GROUP_GAP             ; 3 group gaps
+    movzx ecx, word [x11_screen_width]
+    sub ecx, eax
+    test ecx, ecx
+    jns .rb_ws_have_x
+    xor ecx, ecx                          ; clamp if it doesn't fit
+.rb_ws_have_x:
+    mov r12d, ecx                         ; cursor x
     xor r13d, r13d                        ; display position 0..9
 .rb_ws_loop:
     cmp r13d, WS_COUNT
     jge .rb_ws_done
-    cmp r13d, 1
+    cmp r13d, 3
     je .rb_ws_gap
-    cmp r13d, 4
+    cmp r13d, 6
     je .rb_ws_gap
-    cmp r13d, 7
+    cmp r13d, 9
     je .rb_ws_gap
     jmp .rb_ws_paint_slot
 .rb_ws_gap:
     add r12d, WS_GROUP_GAP
 .rb_ws_paint_slot:
     ; Map display position → internal ws number (1..10).
+    cmp r13d, 9
+    je .rb_ws_zero
     mov ebx, r13d
-    test ebx, ebx
-    jnz .rb_ws_normal
-    mov ebx, 10                           ; display 0 → internal WS 10
-.rb_ws_normal:
+    inc ebx                               ; display 0..8 → WS 1..9
+    jmp .rb_ws_have_ws
+.rb_ws_zero:
+    mov ebx, 10                           ; display 9 → internal WS 10
+.rb_ws_have_ws:
     ; Pick colour: active if this is the current ws, else populated.
     movzx eax, byte [current_ws]
     cmp ebx, eax
@@ -3555,28 +3572,13 @@ render_bar:
     jmp .rb_ws_loop
 .rb_ws_done:
 
-    ; Tabs are right-justified so they have their own anchor (look
-    ; top-left for workspaces, top-right for tabs). Compute the
-    ; total tab-strip width first, then draw left-to-right starting
-    ; at screen_w - total_tab_width.
+    ; Tabs are left-justified at x=0 so they have their own anchor
+    ; (look top-left for tabs, top-right for workspaces).
     movzx r15d, byte [current_ws]
     movzx eax, byte [workspace_populated + r15 - 1]
-    ; Number of tab squares = workspace_populated[current_ws-1].
     test eax, eax
     jz .rb_done                           ; no tabs on this workspace
-    ; total_tab_width = N * square + (N-1) * SQUARE_GAP
-    mov ecx, eax                          ; N
-    imul eax, r14d                        ; N * square
-    dec ecx                               ; N-1
-    imul ecx, SQUARE_GAP
-    add eax, ecx
-    movzx ecx, word [x11_screen_width]
-    sub ecx, eax
-    test ecx, ecx
-    jns .rb_tabs_have_x
-    xor ecx, ecx                          ; clamp to 0 if it didn't fit
-.rb_tabs_have_x:
-    mov r12d, ecx                         ; cursor x for tab squares
+    xor r12d, r12d                        ; cursor x = 0
     ; Active tab XID for this workspace.
     movzx r13d, byte [current_ws]
     dec r13d
