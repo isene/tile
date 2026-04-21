@@ -1378,35 +1378,41 @@ send_unmap_window:
     inc dword [x11_seq]
     ret
 
-action_kill_latest:
-    mov eax, [client_count]
+; Close the focused (active-tab) window on the current workspace.
+; Prefer WM_DELETE_WINDOW; fall back to KillClient if the atoms aren't
+; available. Replaces phase 1a.2's action_kill_latest, which killed the
+; chronologically last-mapped client — wrong once tabs make the active
+; tab independent of map order.
+action_kill_focused:
+    movzx ecx, byte [current_ws]
+    test ecx, ecx
+    jz .akf_none
+    dec ecx
+    mov eax, [ws_active_xid + rcx*4]
     test eax, eax
-    jz .akl_none
-    dec eax
-    mov eax, [client_xids + rax*4]
-    ; Prefer WM_DELETE_WINDOW (the app gets to save and exit cleanly).
-    ; Fall back to KillClient only if we couldn't intern the atoms.
+    jz .akf_none
     mov ecx, [wm_protocols_atom]
     test ecx, ecx
-    jz .akl_force
+    jz .akf_force
     mov ecx, [wm_delete_atom]
     test ecx, ecx
-    jz .akl_force
+    jz .akf_force
     mov edi, eax
     call send_delete_message
     ret
-.akl_force:
-    ; KillClient(window)
+.akf_force:
+    push rax
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_KILL_CLIENT
     mov byte [rdi+1], 0
     mov word [rdi+2], 2
+    pop rax
     mov [rdi+4], eax
     lea rsi, [tmp_buf]
     mov rdx, 8
     call x11_buffer
     inc dword [x11_seq]
-.akl_none:
+.akf_none:
     ret
 
 ; ══════════════════════════════════════════════════════════════════════
@@ -1785,7 +1791,7 @@ dispatch_keypress:
     call fork_exec_string
     jmp .dk_done
 .dk_kill:
-    call action_kill_latest
+    call action_kill_focused
     jmp .dk_done
 .dk_exit:
     mov rax, SYS_EXIT
