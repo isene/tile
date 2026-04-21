@@ -1,5 +1,7 @@
 # tile - Pure Assembly Tiling Window Manager
 
+<img src="img/tile.svg" align="left" width="150" height="150">
+
 ![Version](https://img.shields.io/badge/version-0.0.1-blue)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
@@ -11,10 +13,12 @@ Tiling window manager written in x86_64 Linux assembly. No libc, no
 toolkit, pure syscalls. Speaks X11 wire protocol directly via Unix
 socket.
 
-Part of the **CHasm** (CHange to ASM) suite, alongside
-[bare](https://github.com/isene/bare) (shell),
+Part of the **[CHasm](https://github.com/isene/chasm)** (CHange to ASM)
+suite, alongside [bare](https://github.com/isene/bare) (shell),
 [show](https://github.com/isene/show) (file viewer), and
 [glass](https://github.com/isene/glass) (terminal emulator).
+
+<br clear="left"/>
 
 **Status: phase 1a (early development).** See
 [PLAN.md](PLAN.md) for the full architecture and roadmap.
