@@ -94,7 +94,7 @@ bind Mod4+Escape        exec i3lock -c 000000
 # ws_active        = colour of the current-workspace square
 # ws_populated     = colour of any other populated workspace
 
-bar_height       = 4
+bar_height       = 10
 bar_bg           = #000000
 tab_default      = #555555
 tab_dim_factor   = 40

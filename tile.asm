@@ -127,7 +127,7 @@
 %define ACT_TAB_COLOR   8
 
 ; Bar (the row-of-squares strip at the top of the screen).
-%define DEFAULT_BAR_HEIGHT      3
+%define DEFAULT_BAR_HEIGHT      10
 %define DEFAULT_TAB_DIM_FACTOR  40    ; inactive tab brightness, 0..100
 %define MAX_PALETTE             16
 %define WS_TAB_GAP              8     ; pixels of gap between WS and tab squares
