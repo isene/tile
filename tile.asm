@@ -111,12 +111,20 @@ err_x11_len      equ $ - err_x11
 err_redirect:    db "tile: another window manager is already running (substructure redirect denied)", 10
 err_redirect_len equ $ - err_redirect
 
-; Spawn fallback chain for Mod4+Return: try glass, then xterm.
+; Spawn fallback chain for Alt+Return: try glass, then xterm.
 glass_path:      db "/usr/local/bin/glass", 0
 glass_path_alt:  db "/home/geir/Main/G/GIT-isene/glass/glass", 0
 xterm_path:      db "/usr/bin/xterm", 0
 
 env_display:     db "DISPLAY=", 0  ; placeholder; tile inherits envp directly
+
+; ICCCM atoms we intern at startup so we can speak the WM_DELETE_WINDOW
+; protocol — gives apps a chance to save state before closing rather
+; than the connection being yanked out from under them with KillClient.
+wm_protocols_str: db "WM_PROTOCOLS"
+wm_protocols_len  equ 12
+wm_delete_str:    db "WM_DELETE_WINDOW"
+wm_delete_len     equ 16
 
 ; ══════════════════════════════════════════════════════════════════════
 ; BSS
@@ -151,10 +159,15 @@ key_return_kc:       resb 1
 ; Bar reservation (top of screen, in pixels). 0 in phase 1a.
 bar_height:          resw 1
 
-; Tracked top-level clients (most recent at the end). Used by Mod4+q to
-; kill "the latest" until we have proper focus tracking.
+; Tracked top-level clients (most recent / focused at the end of the
+; stack — Alt+q acts on the top entry). Phase 1a.2 keeps it as a flat
+; LIFO; phase 1b replaces it with the real workspace tree.
 client_xids:         resd MAX_CLIENTS
 client_count:        resd 1
+
+; ICCCM atoms (resolved at startup via InternAtom).
+wm_protocols_atom:   resd 1
+wm_delete_atom:      resd 1
 
 ; X11 buffers
 conn_setup_buf:      resb 16384
@@ -201,6 +214,9 @@ _start:
     call check_redirect_ok
     test rax, rax
     jnz .die_redirect
+
+    ; Resolve the ICCCM atoms we need to speak the delete protocol.
+    call intern_wm_atoms
 
     ; Grab our hardcoded keybinds on the root window.
     call grab_hardcoded_keys
@@ -939,14 +955,15 @@ event_loop:
     jmp event_loop
 
 .ev_unmap_notify:
-    ; Bytes 8-11: window
     mov eax, [x11_read_buf + 8]
     call untrack_client
+    call focus_top
     jmp event_loop
 
 .ev_destroy_notify:
     mov eax, [x11_read_buf + 8]
     call untrack_client
+    call focus_top
     jmp event_loop
 
 .ev_key_press:
@@ -1098,6 +1115,18 @@ action_kill_latest:
     jz .akl_none
     dec eax
     mov eax, [client_xids + rax*4]
+    ; Prefer WM_DELETE_WINDOW (the app gets to save and exit cleanly).
+    ; Fall back to KillClient only if we couldn't intern the atoms.
+    mov ecx, [wm_protocols_atom]
+    test ecx, ecx
+    jz .akl_force
+    mov ecx, [wm_delete_atom]
+    test ecx, ecx
+    jz .akl_force
+    mov edi, eax
+    call send_delete_message
+    ret
+.akl_force:
     ; KillClient(window)
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_KILL_CLIENT
@@ -1109,6 +1138,161 @@ action_kill_latest:
     call x11_buffer
     inc dword [x11_seq]
 .akl_none:
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; ICCCM: WM_PROTOCOLS / WM_DELETE_WINDOW
+; ══════════════════════════════════════════════════════════════════════
+
+; Intern WM_PROTOCOLS and WM_DELETE_WINDOW atoms.
+intern_wm_atoms:
+    push rbx
+    push r12
+    ; Flush so any prior writes are out before we issue InternAtom.
+    call x11_flush
+
+    ; --- WM_PROTOCOLS ---
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_INTERN_ATOM
+    mov byte [rdi+1], 0                    ; only-if-exists = false
+    mov word [rdi+2], 2 + (wm_protocols_len + 3) / 4
+    mov word [rdi+4], wm_protocols_len
+    mov word [rdi+6], 0
+    lea rsi, [wm_protocols_str]
+    lea rbx, [tmp_buf + 8]
+    xor ecx, ecx
+.iwa_cp1:
+    cmp ecx, wm_protocols_len
+    jge .iwa_pad1
+    movzx eax, byte [rsi + rcx]
+    mov [rbx + rcx], al
+    inc ecx
+    jmp .iwa_cp1
+.iwa_pad1:
+    mov eax, wm_protocols_len
+    add eax, 3
+    and eax, ~3
+    add eax, 8
+    mov rdx, rax
+    lea rsi, [tmp_buf]
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    inc dword [x11_seq]
+    ; Read 32-byte reply
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_read_buf]
+    mov rdx, 32
+    syscall
+    mov eax, [x11_read_buf + 8]
+    mov [wm_protocols_atom], eax
+
+    ; --- WM_DELETE_WINDOW ---
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_INTERN_ATOM
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2 + (wm_delete_len + 3) / 4
+    mov word [rdi+4], wm_delete_len
+    mov word [rdi+6], 0
+    lea rsi, [wm_delete_str]
+    lea rbx, [tmp_buf + 8]
+    xor ecx, ecx
+.iwa_cp2:
+    cmp ecx, wm_delete_len
+    jge .iwa_pad2
+    movzx eax, byte [rsi + rcx]
+    mov [rbx + rcx], al
+    inc ecx
+    jmp .iwa_cp2
+.iwa_pad2:
+    mov eax, wm_delete_len
+    add eax, 3
+    and eax, ~3
+    add eax, 8
+    mov rdx, rax
+    lea rsi, [tmp_buf]
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    inc dword [x11_seq]
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_read_buf]
+    mov rdx, 32
+    syscall
+    mov eax, [x11_read_buf + 8]
+    mov [wm_delete_atom], eax
+    pop r12
+    pop rbx
+    ret
+
+; Send a ClientMessage(WM_PROTOCOLS, WM_DELETE_WINDOW) to a window.
+; edi = target window XID. The wire format is a 32-byte SendEvent
+; request whose body is a 32-byte ClientMessage event.
+;
+; Apps that listed WM_DELETE_WINDOW in their WM_PROTOCOLS property
+; respond by closing themselves cleanly (xterm, glass, browsers, etc).
+; Apps that didn't will silently ignore it; their window stays open and
+; the user can fall back to action_force_kill (TBD in a later phase).
+send_delete_message:
+    push rbx
+    mov ebx, edi                            ; target window
+    lea rdi, [tmp_buf]
+    ; SendEvent: opcode=25, propagate=0, length=11
+    mov byte [rdi], X11_SEND_EVENT
+    mov byte [rdi+1], 0                     ; propagate
+    mov word [rdi+2], 11                    ; request length in 4-byte units
+    mov [rdi+4], ebx                        ; destination window
+    mov dword [rdi+8], 0                    ; event-mask = 0 (delivered to client)
+    ; --- 32-byte ClientMessage event body starts at offset 12 ---
+    mov byte [rdi+12], 33                   ; type = ClientMessage
+    mov byte [rdi+13], 32                   ; format
+    mov word [rdi+14], 0                    ; sequence (ignored by send)
+    mov [rdi+16], ebx                       ; window
+    mov eax, [wm_protocols_atom]
+    mov [rdi+20], eax                       ; message type
+    mov eax, [wm_delete_atom]
+    mov [rdi+24], eax                       ; data.l[0] = WM_DELETE_WINDOW
+    mov dword [rdi+28], 0                   ; data.l[1] = CurrentTime
+    mov dword [rdi+32], 0                   ; data.l[2..4] padding
+    mov dword [rdi+36], 0
+    mov dword [rdi+40], 0
+    lea rsi, [tmp_buf]
+    mov rdx, 44
+    call x11_buffer
+    inc dword [x11_seq]
+    pop rbx
+    ret
+
+; Focus the top of the client stack (highest-numbered live entry). No-op
+; if no clients exist. Also raises that window to the top of the
+; stacking order so it isn't obscured by stale fullscreen frames.
+focus_top:
+    mov eax, [client_count]
+    test eax, eax
+    jz .ft_none
+    dec eax
+    mov eax, [client_xids + rax*4]
+    push rax
+    call set_input_focus
+    pop rax
+    ; ConfigureWindow(window, stack-mode = Above)
+    push rax
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CONFIGURE_WINDOW
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    pop rax
+    mov [rdi+4], eax
+    mov word [rdi+8], CFG_STACK
+    mov word [rdi+10], 0
+    mov dword [rdi+12], 0                   ; stack mode = Above
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+.ft_none:
     ret
 
 ; Try glass (system, then dev path), then xterm.

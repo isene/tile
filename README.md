@@ -80,18 +80,22 @@ DISPLAY=:9 glass                        # or: DISPLAY=:9 xterm
 
 ## Phase 1a current capabilities
 
-This is the absolute MVP, used to validate the X11 plumbing.
+The MVP plumbing for a window manager.
 
 - Connects to X11 via Unix socket, MIT-MAGIC-COOKIE-1 authentication
 - Claims SubstructureRedirectMask on the root window (single WM
   enforcement)
-- Maps incoming MapRequest windows full-screen (no tiling yet, no
-  workspaces)
+- Maps incoming MapRequest windows full-screen
 - Grants ConfigureRequest geometry (clamped to screen)
-- Three hardcoded keybindings (Alt-based for windowed-Xephyr compatibility,
+- LIFO stack of clients (most recent on top); the top window has
+  keyboard focus and is raised
+- ICCCM WM_DELETE_WINDOW protocol — `Alt+q` asks the app to close
+  cleanly (save state, exit), rather than killing the connection
+- Closing the top window auto-focuses the next one in the stack
+- Hardcoded keybindings (Alt-based for windowed-Xephyr compatibility,
   see "A subtlety about keybindings" above):
   - `Alt+Return` → exec glass (or fall back to xterm)
-  - `Alt+q` → kill the focused (most recent) window
+  - `Alt+q` → graceful close of the focused window (WM_DELETE_WINDOW)
   - `Alt+Shift+q` → exit tile
 
 No config, no layouts, no workspaces, no bar. Those land in phases
