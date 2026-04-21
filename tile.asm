@@ -89,13 +89,20 @@
 %define MOD_MOD4        0x0040
 %define MOD_NUM_LOCK    0x0010
 
-; X11 keysyms we care about
-%define XK_q            0x71
-%define XK_Q            0x51
-%define XK_Return       0xff0d
 
 ; Limits
 %define MAX_CLIENTS     128
+%define MAX_BINDS       64
+%define MAX_EXECS       32
+%define BIND_STRIDE     16        ; bytes per bind entry (see layout below)
+%define ARG_POOL_SIZE   16384
+%define CFG_BUF_SIZE    16384
+
+; Action IDs (encoded in bind entries' action_id byte)
+%define ACT_NONE        0
+%define ACT_EXEC        1
+%define ACT_KILL        2
+%define ACT_EXIT        3
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Data
@@ -126,6 +133,131 @@ wm_protocols_len  equ 12
 wm_delete_str:    db "WM_DELETE_WINDOW"
 wm_delete_len     equ 16
 
+; Path suffixes
+tilerc_suffix:    db "/.tilerc", 0
+tilerc_suffix_len equ 8
+
+; Modifier name → mask table. Format: name, NUL, mask (CARD16), pad.
+; Entries packed contiguously, terminator = empty name (one NUL byte).
+mod_table:
+    db "Shift", 0
+    dw 0x0001
+    db "Ctrl", 0
+    dw 0x0004
+    db "Control", 0
+    dw 0x0004
+    db "Mod1", 0
+    dw 0x0008
+    db "Alt", 0
+    dw 0x0008
+    db "Mod4", 0
+    dw 0x0040
+    db "Win", 0
+    dw 0x0040
+    db "Super", 0
+    dw 0x0040
+    db 0                       ; terminator (empty name)
+
+; Named key → keysym (CARD32). Same packed format: name, NUL, keysym.
+key_table:
+    db "Return", 0
+    dd 0xff0d
+    db "Escape", 0
+    dd 0xff1b
+    db "space", 0
+    dd 0x0020
+    db "Tab", 0
+    dd 0xff09
+    db "BackSpace", 0
+    dd 0xff08
+    db "Delete", 0
+    dd 0xffff
+    db "Left", 0
+    dd 0xff51
+    db "Up", 0
+    dd 0xff52
+    db "Right", 0
+    dd 0xff53
+    db "Down", 0
+    dd 0xff54
+    db "Home", 0
+    dd 0xff50
+    db "End", 0
+    dd 0xff57
+    db "Page_Up", 0
+    dd 0xff55
+    db "Page_Down", 0
+    dd 0xff56
+    db "F1", 0
+    dd 0xffbe
+    db "F2", 0
+    dd 0xffbf
+    db "F3", 0
+    dd 0xffc0
+    db "F4", 0
+    dd 0xffc1
+    db "F5", 0
+    dd 0xffc2
+    db "F6", 0
+    dd 0xffc3
+    db "F7", 0
+    dd 0xffc4
+    db "F8", 0
+    dd 0xffc5
+    db "F9", 0
+    dd 0xffc6
+    db "F10", 0
+    dd 0xffc7
+    db "F11", 0
+    dd 0xffc8
+    db "F12", 0
+    dd 0xffc9
+    db "plus", 0
+    dd 0x002b
+    db "minus", 0
+    dd 0x002d
+    db "underscore", 0
+    dd 0x005f
+    db "equal", 0
+    dd 0x003d
+    db "comma", 0
+    dd 0x002c
+    db "period", 0
+    dd 0x002e
+    db "less", 0
+    dd 0x003c
+    db "greater", 0
+    dd 0x003e
+    db "slash", 0
+    dd 0x002f
+    db "backslash", 0
+    dd 0x005c
+    db "semicolon", 0
+    dd 0x003b
+    db "apostrophe", 0
+    dd 0x0027
+    db "bracketleft", 0
+    dd 0x005b
+    db "bracketright", 0
+    dd 0x005d
+    db 0                       ; terminator
+
+; Action keyword table: name, NUL, action_id (BYTE), pad.
+action_table:
+    db "exec", 0
+    db ACT_EXEC, 0
+    db "kill", 0
+    db ACT_KILL, 0
+    db "exit", 0
+    db ACT_EXIT, 0
+    db 0                       ; terminator
+
+; Default exec command path for the built-in Alt+Return bind, used when
+; no ~/.tilerc is found. Same fallback as the phase 1a action.
+default_glass_arg:
+    db "/home/geir/Main/G/GIT-isene/glass/glass", 0
+default_glass_arg_len equ $ - default_glass_arg - 1
+
 ; ══════════════════════════════════════════════════════════════════════
 ; BSS
 ; ══════════════════════════════════════════════════════════════════════
@@ -152,10 +284,6 @@ keysyms_per_kc:      resd 1
 ; keysym_map[keycode * 8 + sym_index]: 256 keycodes × up to 8 syms each
 keysym_map:          resd 256 * 8
 
-; Resolved keycodes for our hardcoded grabs (looked up after GetKeyboardMapping).
-key_q_kc:            resb 1
-key_return_kc:       resb 1
-
 ; Bar reservation (top of screen, in pixels). 0 in phase 1a.
 bar_height:          resw 1
 
@@ -168,6 +296,33 @@ client_count:        resd 1
 ; ICCCM atoms (resolved at startup via InternAtom).
 wm_protocols_atom:   resd 1
 wm_delete_atom:      resd 1
+
+; Binding table.
+; Per-entry layout (BIND_STRIDE = 16):
+;   +0  CARD32  keysym (during parse)
+;   +4  CARD32  keycode (low 8 bits used; resolved after GetKeyboardMapping)
+;   +8  CARD16  modifiers
+;   +10 BYTE    action_id
+;   +11 BYTE    pad
+;   +12 CARD16  arg_off (offset into arg_pool; 0 = no arg)
+;   +14 CARD16  pad
+bind_table:          resb MAX_BINDS * BIND_STRIDE
+bind_count:          resd 1
+
+; Autostart command list. Each entry is a CARD16 offset into arg_pool.
+exec_list:           resw MAX_EXECS
+exec_count:          resd 1
+
+; Pool for null-terminated argument strings (exec commands, etc).
+; Index 0 is reserved as "no arg" sentinel; we always start writes
+; at offset 1.
+arg_pool:            resb ARG_POOL_SIZE
+arg_pool_pos:        resd 1
+
+; Buffer used to slurp ~/.tilerc.
+config_buf:          resb CFG_BUF_SIZE
+config_len:          resq 1
+config_path:         resb 512
 
 ; X11 buffers
 conn_setup_buf:      resb 16384
@@ -203,24 +358,28 @@ _start:
 
     call x11_parse_setup
     call x11_get_keymap
-    call resolve_keycodes
+
+    ; Reserve arg_pool[0] as the "no arg" sentinel and load ~/.tilerc.
+    mov dword [arg_pool_pos], 1
+    mov byte [arg_pool], 0
+    call load_config
 
     ; Become the WM by selecting substructure-redirect on root.
     call select_substructure_redirect
     call x11_flush
-    ; Read back any error reply for the SelectInput (we should see only
-    ; replies — if a BadAccess error arrives, it means another WM holds
-    ; the redirect already).
     call check_redirect_ok
     test rax, rax
     jnz .die_redirect
 
-    ; Resolve the ICCCM atoms we need to speak the delete protocol.
+    ; Resolve the ICCCM atoms used for WM_DELETE_WINDOW.
     call intern_wm_atoms
 
-    ; Grab our hardcoded keybinds on the root window.
-    call grab_hardcoded_keys
+    ; Resolve every bind's keysym to a keycode and grab them on root.
+    call resolve_and_grab_binds
     call x11_flush
+
+    ; Run autostart entries from ~/.tilerc.
+    call run_autostart
 
     ; Enter event loop.
     jmp event_loop
@@ -706,13 +865,35 @@ find_keycode_for_keysym:
     pop rbx
     ret
 
-resolve_keycodes:
-    mov eax, XK_q
+; Walk every bind in bind_table, look up its keysym in keysym_map, store
+; the resulting keycode at offset +4. Then GrabKey it on root with all
+; lock-state combinations. Skips entries whose keysym doesn't resolve.
+resolve_and_grab_binds:
+    push rbx
+    push r12
+    push r13
+    xor ebx, ebx                 ; iterator
+.rgb_loop:
+    cmp ebx, [bind_count]
+    jge .rgb_done
+    mov r12, rbx
+    imul r12, BIND_STRIDE
+    add r12, bind_table          ; r12 = &bind_table[i]
+    mov eax, [r12]               ; keysym
     call find_keycode_for_keysym
-    mov [key_q_kc], al
-    mov eax, XK_Return
-    call find_keycode_for_keysym
-    mov [key_return_kc], al
+    test eax, eax
+    jz .rgb_skip
+    mov [r12 + 4], eax           ; store resolved keycode (low 8 bits used)
+    movzx esi, word [r12 + 8]    ; modifiers
+    mov edi, eax                 ; keycode
+    call grab_one_key
+.rgb_skip:
+    inc ebx
+    jmp .rgb_loop
+.rgb_done:
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; ══════════════════════════════════════════════════════════════════════
@@ -773,37 +954,6 @@ check_redirect_ok:
     add rsp, 16
     xor eax, eax
     pop rbx
-    ret
-
-grab_hardcoded_keys:
-    ; Phase 1a uses Mod1 (Alt) instead of Mod4 (Win) for dev binds.
-    ; Reason: when developing inside windowed Xephyr, the host WM's
-    ; passive grabs (e.g. i3's bindsym Mod4+...) fire BEFORE the
-    ; Xephyr window can pass the key inward, so tile would never see
-    ; Mod4+anything. Real Mod4 binds land in phase 1b alongside the
-    ; config parser; until then Alt+ is conflict-free with i3.
-    ;
-    ;   Alt+Return  -> exec glass (or fallback)
-    ;   Alt+q       -> kill latest mapped client
-    ;   Alt+Shift+q -> exit tile
-    movzx eax, byte [key_return_kc]
-    test eax, eax
-    jz .ghk_skip_return
-    mov edi, eax
-    mov esi, MOD_MOD1
-    call grab_one_key
-.ghk_skip_return:
-    movzx eax, byte [key_q_kc]
-    test eax, eax
-    jz .ghk_skip_q
-    mov edi, eax
-    mov esi, MOD_MOD1
-    call grab_one_key
-    movzx eax, byte [key_q_kc]
-    mov edi, eax
-    mov esi, MOD_MOD1 | MOD_SHIFT
-    call grab_one_key
-.ghk_skip_q:
     ret
 
 ; edi = keycode (low 8 bits), esi = base modifier mask (low 16 bits).
@@ -967,37 +1117,12 @@ event_loop:
     jmp event_loop
 
 .ev_key_press:
-    ; KeyPress layout: byte 1 = keycode, bytes 28-29 = state (modifiers),
-    ; bytes 4-7 = root window, bytes 8-11 = event window.
+    ; KeyPress layout: byte 1 = keycode, bytes 28-29 = state (modifiers).
     movzx eax, byte [x11_read_buf + 1]
     movzx edx, word [x11_read_buf + 28]
-    ; Strip locks (CapsLock=Lock, NumLock=Mod2) before checking modifiers.
-    and edx, ~(MOD_LOCK | MOD_MOD2)
-    ; Alt+Return -> exec glass/xterm. Match if Mod1 is set and Shift is not.
-    movzx ecx, byte [key_return_kc]
-    cmp eax, ecx
-    jne .kp_not_return
-    test edx, MOD_MOD1
-    jz .kp_done
-    test edx, MOD_SHIFT
-    jnz .kp_done
-    call action_exec_terminal
-    jmp .kp_done
-.kp_not_return:
-    movzx ecx, byte [key_q_kc]
-    cmp eax, ecx
-    jne .kp_done
-    test edx, MOD_MOD1
-    jz .kp_done                          ; q without Alt = ignore
-    test edx, MOD_SHIFT
-    jnz .kp_exit                         ; Alt+Shift+q = exit
-    call action_kill_latest              ; Alt+q (any other extra mods ok)
-.kp_done:
+    and edx, ~(MOD_LOCK | MOD_MOD2)      ; strip locks
+    call dispatch_keypress
     jmp event_loop
-.kp_exit:
-    mov rax, SYS_EXIT
-    xor edi, edi
-    syscall
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Window management actions
@@ -1295,43 +1420,776 @@ focus_top:
 .ft_none:
     ret
 
-; Try glass (system, then dev path), then xterm.
-action_exec_terminal:
+; ══════════════════════════════════════════════════════════════════════
+; Bind dispatch + actions
+; ══════════════════════════════════════════════════════════════════════
+
+; eax = keycode, edx = modifier state (locks already stripped).
+; Walks bind_table for an exact (keycode, modifier) match and runs the
+; bound action. Silently no-ops on miss.
+dispatch_keypress:
+    push rbx
+    push r12
+    push r13
+    mov r13d, eax                ; keycode
+    mov r12d, edx                ; modifiers
+    xor ebx, ebx
+.dk_loop:
+    cmp ebx, [bind_count]
+    jge .dk_done
+    mov rax, rbx
+    imul rax, BIND_STRIDE
+    lea rcx, [bind_table + rax]
+    mov eax, [rcx + 4]           ; resolved keycode
+    test eax, eax
+    jz .dk_skip
+    cmp eax, r13d
+    jne .dk_skip
+    movzx eax, word [rcx + 8]    ; modifiers
+    cmp eax, r12d
+    jne .dk_skip
+    ; Match — dispatch by action_id.
+    movzx eax, byte [rcx + 10]
+    movzx edx, word [rcx + 12]   ; arg_off
+    cmp eax, ACT_EXEC
+    je .dk_exec
+    cmp eax, ACT_KILL
+    je .dk_kill
+    cmp eax, ACT_EXIT
+    je .dk_exit
+    jmp .dk_done
+.dk_exec:
+    test edx, edx
+    jz .dk_done
+    lea rdi, [arg_pool + rdx]
+    call fork_exec_string
+    jmp .dk_done
+.dk_kill:
+    call action_kill_latest
+    jmp .dk_done
+.dk_exit:
+    mov rax, SYS_EXIT
+    xor edi, edi
+    syscall
+.dk_skip:
+    inc ebx
+    jmp .dk_loop
+.dk_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; rdi = null-terminated command line. Forks; child execve's via /bin/sh
+; -c so users don't have to write absolute paths and so we get shell
+; expansion for free.
+fork_exec_string:
+    push rbx
+    push r12
+    mov r12, rdi                 ; save command string
     mov rax, SYS_FORK
     syscall
     test rax, rax
-    jnz .aet_parent             ; child: rax = 0
-    ; child
-    sub rsp, 16
-    lea rax, [glass_path]
+    jnz .fes_parent
+    ; child: build argv = [/bin/sh, -c, cmd, NULL]
+    sub rsp, 32
+    lea rax, [.fes_sh]
     mov [rsp], rax
-    mov qword [rsp + 8], 0
+    lea rax, [.fes_dashc]
+    mov [rsp + 8], rax
+    mov [rsp + 16], r12
+    mov qword [rsp + 24], 0
     mov rax, SYS_EXECVE
-    lea rdi, [glass_path]
+    lea rdi, [.fes_sh]
     mov rsi, rsp
     mov rdx, [envp]
     syscall
-    ; Try alt glass path
-    lea rax, [glass_path_alt]
-    mov [rsp], rax
-    mov rax, SYS_EXECVE
-    lea rdi, [glass_path_alt]
-    mov rsi, rsp
-    mov rdx, [envp]
-    syscall
-    ; Fallback xterm
-    lea rax, [xterm_path]
-    mov [rsp], rax
-    mov rax, SYS_EXECVE
-    lea rdi, [xterm_path]
-    mov rsi, rsp
-    mov rdx, [envp]
-    syscall
-    ; All failed
     mov rax, SYS_EXIT
     mov edi, 127
     syscall
-.aet_parent:
+.fes_parent:
+    ; Don't wait4: autostart and exec actions are fire-and-forget.
+    ; Without WAIT, children become zombies until reaped — set a
+    ; SIGCHLD ignore so the kernel auto-reaps. (Default action of
+    ; SIGCHLD is already SIG_DFL which doesn't auto-reap; we'll fix
+    ; that in a phase 1b polish pass with proper SIGCHLD handler.)
+    pop r12
+    pop rbx
+    ret
+.fes_sh:    db "/bin/sh", 0
+.fes_dashc: db "-c", 0
+
+; Iterate exec_list, fire-and-forget each command.
+run_autostart:
+    push rbx
+    xor ebx, ebx
+.ra_loop:
+    cmp ebx, [exec_count]
+    jge .ra_done
+    movzx eax, word [exec_list + rbx*2]
+    test eax, eax
+    jz .ra_next
+    lea rdi, [arg_pool + rax]
+    call fork_exec_string
+.ra_next:
+    inc ebx
+    jmp .ra_loop
+.ra_done:
+    pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Config file: ~/.tilerc
+; ══════════════════════════════════════════════════════════════════════
+
+; Build $HOME/.tilerc into config_path. Returns rax=ptr or NULL if
+; HOME isn't set.
+build_config_path:
+    push rbx
+    mov rdi, [envp]
+.bcp_loop:
+    mov rax, [rdi]
+    test rax, rax
+    jz .bcp_none
+    cmp dword [rax], 'HOME'
+    jne .bcp_next
+    cmp byte [rax + 4], '='
+    jne .bcp_next
+    lea rsi, [rax + 5]
+    lea rdi, [config_path]
+.bcp_cp_home:
+    mov al, [rsi]
+    test al, al
+    jz .bcp_append
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    jmp .bcp_cp_home
+.bcp_append:
+    lea rsi, [tilerc_suffix]
+    mov ecx, tilerc_suffix_len + 1   ; include trailing NUL
+.bcp_cp_suf:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec ecx
+    jnz .bcp_cp_suf
+    lea rax, [config_path]
+    pop rbx
+    ret
+.bcp_next:
+    add rdi, 8
+    jmp .bcp_loop
+.bcp_none:
+    xor eax, eax
+    pop rbx
+    ret
+
+; Read ~/.tilerc into config_buf, parse it. If file is missing or empty,
+; install built-in defaults.
+load_config:
+    push rbx
+    push r12
+    mov dword [bind_count], 0
+    mov dword [exec_count], 0
+    mov qword [config_len], 0
+
+    call build_config_path
+    test rax, rax
+    jz .lc_defaults
+    mov rdi, rax
+    mov rax, SYS_OPEN
+    xor esi, esi                 ; O_RDONLY
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .lc_defaults
+    mov rbx, rax                 ; fd
+
+    xor r12, r12                 ; bytes read
+.lc_read:
+    mov rax, SYS_READ
+    mov rdi, rbx
+    lea rsi, [config_buf]
+    add rsi, r12
+    mov rdx, CFG_BUF_SIZE
+    sub rdx, r12
+    jle .lc_read_done
+    syscall
+    test rax, rax
+    jle .lc_read_done
+    add r12, rax
+    jmp .lc_read
+.lc_read_done:
+    mov [config_len], r12
+    mov rax, SYS_CLOSE
+    mov rdi, rbx
+    syscall
+
+    test r12, r12
+    jz .lc_defaults
+
+    ; Parse line by line.
+    lea rbx, [config_buf]        ; rbx = current pointer
+    mov r12, rbx
+    add r12, [config_len]        ; r12 = end
+.lc_lineloop:
+    cmp rbx, r12
+    jge .lc_check_empty
+    ; Find end of current line (LF or end of buffer).
+    mov rsi, rbx
+.lc_find_lf:
+    cmp rsi, r12
+    jge .lc_lf_found
+    cmp byte [rsi], 10
+    je .lc_lf_found
+    inc rsi
+    jmp .lc_find_lf
+.lc_lf_found:
+    ; Null-terminate this line in place (overwrite the LF).
+    mov byte [rsi], 0
+    push rsi                     ; save end-of-line ptr for advance
+    mov rdi, rbx
+    call parse_config_line
+    pop rsi
+    mov rbx, rsi
+    inc rbx                      ; skip past the (now-NUL) terminator
+    jmp .lc_lineloop
+.lc_check_empty:
+    cmp dword [bind_count], 0
+    jne .lc_done
+.lc_defaults:
+    call install_default_binds
+.lc_done:
+    pop r12
+    pop rbx
+    ret
+
+; Hardcoded fallback: Alt+Return → exec glass, Alt+q → kill, Alt+Shift+q → exit.
+install_default_binds:
+    push rbx
+    ; Stash glass path into arg_pool, capture offset.
+    lea rdi, [default_glass_arg]
+    call arg_pool_dup
+    mov ebx, eax                 ; arg_off
+    ; Alt+Return / exec / glass
+    mov dword [bind_count], 0
+    mov edi, 0xff0d              ; XK_Return
+    mov esi, MOD_MOD1
+    mov edx, ACT_EXEC
+    mov ecx, ebx
+    call add_bind
+    ; Alt+q / kill
+    mov edi, 0x71                ; XK_q
+    mov esi, MOD_MOD1
+    mov edx, ACT_KILL
+    xor ecx, ecx
+    call add_bind
+    ; Alt+Shift+q / exit
+    mov edi, 0x71
+    mov esi, MOD_MOD1 | MOD_SHIFT
+    mov edx, ACT_EXIT
+    xor ecx, ecx
+    call add_bind
+    pop rbx
+    ret
+
+; rdi = keysym, esi = modifiers, edx = action_id, ecx = arg_off.
+; Appends a new bind entry. Silently drops if table is full.
+add_bind:
+    push rbx
+    mov ebx, [bind_count]
+    cmp ebx, MAX_BINDS
+    jge .ab_full
+    mov eax, ebx
+    imul eax, BIND_STRIDE
+    lea r8, [bind_table + rax]
+    mov [r8], edi                ; keysym
+    mov dword [r8 + 4], 0        ; keycode placeholder
+    mov [r8 + 8], si             ; modifiers
+    mov [r8 + 10], dl            ; action_id
+    mov byte [r8 + 11], 0
+    mov [r8 + 12], cx            ; arg_off
+    mov word [r8 + 14], 0
+    inc dword [bind_count]
+.ab_full:
+    pop rbx
+    ret
+
+; rdi = source string. Copy into arg_pool, return offset in eax (0 on
+; failure / empty). Includes trailing NUL.
+arg_pool_dup:
+    push rbx
+    push r12
+    mov r12, rdi
+    mov ebx, [arg_pool_pos]
+    mov rdi, r12
+    call .apd_strlen             ; rax = length
+    mov ecx, eax
+    inc ecx                      ; include NUL
+    mov edx, ebx
+    add edx, ecx
+    cmp edx, ARG_POOL_SIZE
+    jg .apd_full
+    lea rdi, [arg_pool + rbx]
+    mov rsi, r12
+.apd_copy:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    test al, al
+    jnz .apd_copy
+    mov eax, ebx                 ; return offset
+    add [arg_pool_pos], ecx
+    pop r12
+    pop rbx
+    ret
+.apd_full:
+    xor eax, eax
+    pop r12
+    pop rbx
+    ret
+.apd_strlen:
+    xor eax, eax
+.apd_sl:
+    cmp byte [rdi + rax], 0
+    je .apd_sl_done
+    inc eax
+    jmp .apd_sl
+.apd_sl_done:
+    ret
+
+; rdi = NUL-terminated line (LF already stripped). Parses one config
+; statement: "bind <chord> <action> [arg]" or "exec <cmd>" or "mod = X"
+; or comment / blank.
+parse_config_line:
+    push rbx
+    push r12
+    push r13
+    mov r12, rdi
+    ; Skip leading whitespace
+    call .pcl_skip_ws
+    mov al, [r12]
+    test al, al
+    je .pcl_done                 ; blank
+    cmp al, '#'
+    je .pcl_done                 ; comment
+    ; Tokenize: r13 = start of command word
+    mov r13, r12
+.pcl_cmd_end:
+    mov al, [r12]
+    test al, al
+    je .pcl_cmd_done
+    cmp al, ' '
+    je .pcl_cmd_done
+    cmp al, 9
+    je .pcl_cmd_done
+    inc r12
+    jmp .pcl_cmd_end
+.pcl_cmd_done:
+    ; If we hit a space/tab, NUL-terminate it so we can compare.
+    mov al, [r12]
+    test al, al
+    je .pcl_have_cmd
+    mov byte [r12], 0
+    inc r12
+.pcl_have_cmd:
+    ; Compare command against "bind", "exec", "mod"
+    mov rdi, r13
+    lea rsi, [.pcl_kw_bind]
+    call .pcl_streq
+    test eax, eax
+    jnz .pcl_handle_bind
+    mov rdi, r13
+    lea rsi, [.pcl_kw_exec]
+    call .pcl_streq
+    test eax, eax
+    jnz .pcl_handle_exec
+    ; Unknown keyword — silently ignore for now.
+    jmp .pcl_done
+
+.pcl_handle_bind:
+    ; r12 points just past "bind\0". Skip ws.
+    call .pcl_skip_ws
+    mov al, [r12]
+    test al, al
+    je .pcl_done
+    ; Parse chord (modifiers + key) terminated by ws or NUL.
+    mov rdi, r12
+    call parse_chord
+    test eax, eax
+    jz .pcl_done                 ; bad chord
+    mov rbx, rax                 ; rbx = keysym
+    push rdx                     ; modifiers
+    mov r12, rcx                 ; advance past chord
+    call .pcl_skip_ws
+    mov al, [r12]
+    test al, al
+    je .pcl_pop_mod_done
+    ; Read action keyword
+    mov r13, r12
+.pcl_act_end:
+    mov al, [r12]
+    test al, al
+    je .pcl_act_done
+    cmp al, ' '
+    je .pcl_act_done
+    cmp al, 9
+    je .pcl_act_done
+    inc r12
+    jmp .pcl_act_end
+.pcl_act_done:
+    mov al, [r12]
+    test al, al
+    je .pcl_act_have
+    mov byte [r12], 0
+    inc r12
+.pcl_act_have:
+    ; Lookup action in action_table
+    mov rdi, r13
+    call lookup_action
+    test eax, eax
+    jz .pcl_pop_mod_done         ; unknown action
+    mov ecx, eax                 ; action_id
+    ; If exec, the rest of the line is the command. Skip ws then dup.
+    cmp ecx, ACT_EXEC
+    jne .pcl_no_arg
+    call .pcl_skip_ws
+    mov al, [r12]
+    test al, al
+    je .pcl_pop_mod_done
+    mov rdi, r12
+    call arg_pool_dup
+    mov edx, eax                 ; arg_off
+    jmp .pcl_emit
+.pcl_no_arg:
+    xor edx, edx
+.pcl_emit:
+    pop r8                       ; modifiers
+    mov edi, ebx                 ; keysym
+    mov esi, r8d                 ; modifiers
+    mov r9, rdx                  ; arg_off
+    mov edx, ecx                 ; action_id
+    mov ecx, r9d
+    call add_bind
+    jmp .pcl_done
+.pcl_pop_mod_done:
+    pop rdx
+    jmp .pcl_done
+
+.pcl_handle_exec:
+    call .pcl_skip_ws
+    mov al, [r12]
+    test al, al
+    je .pcl_done
+    mov rdi, r12
+    call arg_pool_dup
+    test eax, eax
+    jz .pcl_done
+    mov edx, [exec_count]
+    cmp edx, MAX_EXECS
+    jge .pcl_done
+    mov [exec_list + rdx*2], ax
+    inc dword [exec_count]
+    jmp .pcl_done
+
+.pcl_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.pcl_skip_ws:
+    mov al, [r12]
+    cmp al, ' '
+    je .pcl_sw_inc
+    cmp al, 9
+    je .pcl_sw_inc
+    ret
+.pcl_sw_inc:
+    inc r12
+    jmp .pcl_skip_ws
+
+; rdi, rsi = NUL-terminated strings. Returns 1 in eax if equal, else 0.
+.pcl_streq:
+    push rbx
+.pcl_se_loop:
+    mov al, [rdi]
+    mov bl, [rsi]
+    cmp al, bl
+    jne .pcl_se_no
+    test al, al
+    je .pcl_se_yes
+    inc rdi
+    inc rsi
+    jmp .pcl_se_loop
+.pcl_se_yes:
+    mov eax, 1
+    pop rbx
+    ret
+.pcl_se_no:
+    xor eax, eax
+    pop rbx
+    ret
+
+.pcl_kw_bind: db "bind", 0
+.pcl_kw_exec: db "exec", 0
+
+; rdi = chord string, e.g. "Mod4+Shift+Return".
+; Tokens are split by '+'; the chord ends at the first whitespace or NUL.
+; Each non-final token is a modifier name; the final token is a key name.
+; Returns: rax = keysym (0 on failure)
+;          rdx = modifier mask
+;          rcx = pointer to char immediately after the chord
+;                (the terminating space/tab/NUL itself is left at *rcx-1
+;                 and turned into NUL)
+; Modifies the input string in place (writes NULs at separators).
+parse_chord:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12, rdi                 ; current token start
+    xor r13, r13                 ; modifier accumulator
+    mov r14, rdi                 ; scan pointer
+.pc_scan:
+    movzx eax, byte [r14]
+    test eax, eax
+    je .pc_final
+    cmp al, ' '
+    je .pc_final
+    cmp al, 9
+    je .pc_final
+    cmp al, '+'
+    je .pc_mod_token
+    inc r14
+    jmp .pc_scan
+.pc_mod_token:
+    mov byte [r14], 0
+    mov rdi, r12
+    call lookup_modifier
+    test eax, eax
+    jz .pc_fail
+    or r13, rax
+    inc r14
+    mov r12, r14
+    jmp .pc_scan
+.pc_final:
+    ; The terminator may be NUL, space, or tab. NUL-terminate the key
+    ; token and remember the position just past it for the caller.
+    movzx ebx, byte [r14]
+    mov byte [r14], 0
+    mov rdi, r12
+    call lookup_key
+    test eax, eax
+    jz .pc_fail
+    ; rcx = char after the chord. If the terminator was NUL, we stop
+    ; right at the NUL; otherwise step one past the (now-NUL) byte.
+    test ebx, ebx
+    je .pc_pos_at_nul
+    lea rcx, [r14 + 1]
+    jmp .pc_done
+.pc_pos_at_nul:
+    mov rcx, r14
+.pc_done:
+    mov edx, r13d                ; modifiers
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.pc_fail:
+    xor eax, eax
+    xor edx, edx
+    mov rcx, r14
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; rdi = NUL-terminated name. Returns mask in eax (0 if not found).
+lookup_modifier:
+    push rbx
+    lea rsi, [mod_table]
+.lm_loop:
+    mov al, [rsi]
+    test al, al
+    jz .lm_none
+    push rsi
+    push rdi
+    mov rbx, rdi
+.lm_cmp:
+    mov al, [rsi]
+    mov dl, [rbx]
+    cmp al, dl
+    jne .lm_neq
+    test al, al
+    je .lm_match
+    inc rsi
+    inc rbx
+    jmp .lm_cmp
+.lm_neq:
+    pop rdi
+    pop rsi
+.lm_skip_name:
+    mov al, [rsi]
+    inc rsi
+    test al, al
+    jnz .lm_skip_name
+    add rsi, 2                   ; skip 2-byte mask
+    jmp .lm_loop
+.lm_match:
+    pop rdi
+    pop rsi
+.lm_skip_to_mask:
+    mov al, [rsi]
+    inc rsi
+    test al, al
+    jnz .lm_skip_to_mask
+    movzx eax, word [rsi]
+    pop rbx
+    ret
+.lm_none:
+    xor eax, eax
+    pop rbx
+    ret
+
+; rdi = NUL-terminated name. Returns keysym in eax (0 if not found).
+; For single-character names a-z/A-Z/0-9, returns ASCII directly.
+lookup_key:
+    push rbx
+    ; Single char shortcut
+    mov al, [rdi]
+    test al, al
+    jz .lk_none
+    cmp byte [rdi + 1], 0
+    jne .lk_table                ; multi-char, search table
+    ; Single char: a-z / A-Z / 0-9 / printable ASCII
+    cmp al, 'a'
+    jb .lk_check_upper
+    cmp al, 'z'
+    ja .lk_check_upper
+    movzx eax, al
+    pop rbx
+    ret
+.lk_check_upper:
+    cmp al, 'A'
+    jb .lk_check_digit
+    cmp al, 'Z'
+    ja .lk_check_digit
+    movzx eax, al
+    pop rbx
+    ret
+.lk_check_digit:
+    cmp al, '0'
+    jb .lk_other
+    cmp al, '9'
+    ja .lk_other
+    movzx eax, al
+    pop rbx
+    ret
+.lk_other:
+    ; Other printable ASCII (! through ~) maps to its own keysym.
+    cmp al, 0x20
+    jb .lk_none
+    cmp al, 0x7e
+    ja .lk_none
+    movzx eax, al
+    pop rbx
+    ret
+.lk_table:
+    lea rsi, [key_table]
+.lk_t_loop:
+    mov al, [rsi]
+    test al, al
+    jz .lk_none
+    push rsi
+    push rdi
+    mov rbx, rdi
+.lk_t_cmp:
+    mov al, [rsi]
+    mov dl, [rbx]
+    cmp al, dl
+    jne .lk_t_neq
+    test al, al
+    je .lk_t_match
+    inc rsi
+    inc rbx
+    jmp .lk_t_cmp
+.lk_t_neq:
+    pop rdi
+    pop rsi
+.lk_t_skip:
+    mov al, [rsi]
+    inc rsi
+    test al, al
+    jnz .lk_t_skip
+    add rsi, 4                   ; skip 4-byte keysym
+    jmp .lk_t_loop
+.lk_t_match:
+    pop rdi
+    pop rsi
+.lk_t_to_ks:
+    mov al, [rsi]
+    inc rsi
+    test al, al
+    jnz .lk_t_to_ks
+    mov eax, [rsi]
+    pop rbx
+    ret
+.lk_none:
+    xor eax, eax
+    pop rbx
+    ret
+
+; rdi = NUL-terminated name. Returns action id in eax (0 if unknown).
+lookup_action:
+    push rbx
+    lea rsi, [action_table]
+.la_loop:
+    mov al, [rsi]
+    test al, al
+    jz .la_none
+    push rsi
+    push rdi
+    mov rbx, rdi
+.la_cmp:
+    mov al, [rsi]
+    mov dl, [rbx]
+    cmp al, dl
+    jne .la_neq
+    test al, al
+    je .la_match
+    inc rsi
+    inc rbx
+    jmp .la_cmp
+.la_neq:
+    pop rdi
+    pop rsi
+.la_skip:
+    mov al, [rsi]
+    inc rsi
+    test al, al
+    jnz .la_skip
+    add rsi, 2                   ; skip 2-byte action_id+pad
+    jmp .la_loop
+.la_match:
+    pop rdi
+    pop rsi
+.la_to_id:
+    mov al, [rsi]
+    inc rsi
+    test al, al
+    jnz .la_to_id
+    movzx eax, byte [rsi]
+    pop rbx
+    ret
+.la_none:
+    xor eax, eax
+    pop rbx
     ret
 
 ; ══════════════════════════════════════════════════════════════════════

@@ -60,17 +60,18 @@ the host window manager. The host WM's passive key grabs fire first —
 if your host i3 binds `Mod4+Return`, then `Mod4+Return` typed inside
 Xephyr is captured by i3, not delivered to tile.
 
-To stay out of the host's way during phase 1a development, tile uses
-Alt-based dev binds (Alt is essentially unused by typical i3 configs):
+For development under i3, bind tile to chords i3 doesn't grab. Alt is
+essentially unused by typical i3 configs, so the built-in defaults
+(when there is no `~/.tilerc`) are:
 
 | Key | Action |
 |-----|--------|
-| `Alt+Return`  | Spawn glass (or xterm fallback) |
-| `Alt+q`       | Kill the most-recently-mapped client |
-| `Alt+Shift+q` | Exit tile (Xephyr stays open, just unmanaged) |
+| `Alt+Return`  | Spawn glass |
+| `Alt+q`       | Close the focused window cleanly (WM_DELETE_WINDOW) |
+| `Alt+Shift+q` | Exit tile |
 
-These are hardcoded for now. Real `Mod4+`-style binds, fully
-configurable from `~/.tilerc`, arrive in phase 1b.
+Once you cold-switch from i3 to tile on real hardware, `Mod4+`-style
+binds work fine — see `tilerc.example` for the config syntax.
 
 To launch a test app inside the Xephyr session:
 
@@ -78,28 +79,28 @@ To launch a test app inside the Xephyr session:
 DISPLAY=:9 glass                        # or: DISPLAY=:9 xterm
 ```
 
-## Phase 1a current capabilities
-
-The MVP plumbing for a window manager.
+## Current capabilities (phases 1a + 1b.1)
 
 - Connects to X11 via Unix socket, MIT-MAGIC-COOKIE-1 authentication
-- Claims SubstructureRedirectMask on the root window (single WM
-  enforcement)
+- Claims SubstructureRedirectMask on the root window (single-WM enforcement)
 - Maps incoming MapRequest windows full-screen
 - Grants ConfigureRequest geometry (clamped to screen)
-- LIFO stack of clients (most recent on top); the top window has
-  keyboard focus and is raised
-- ICCCM WM_DELETE_WINDOW protocol — `Alt+q` asks the app to close
-  cleanly (save state, exit), rather than killing the connection
+- LIFO client stack with auto-focus on top
+- ICCCM `WM_DELETE_WINDOW` protocol — `kill` action asks the app to
+  close cleanly (save state, exit) rather than yanking its X11
+  connection
 - Closing the top window auto-focuses the next one in the stack
-- Hardcoded keybindings (Alt-based for windowed-Xephyr compatibility,
-  see "A subtlety about keybindings" above):
-  - `Alt+Return` → exec glass (or fall back to xterm)
-  - `Alt+q` → graceful close of the focused window (WM_DELETE_WINDOW)
-  - `Alt+Shift+q` → exit tile
+- **`~/.tilerc` config parser** — keybinds and autostart are no
+  longer hardcoded. Built-in defaults match the previous Alt+Return /
+  Alt+q / Alt+Shift+q behaviour if no config file is present.
 
-No config, no layouts, no workspaces, no bar. Those land in phases
-1b through 2c — see PLAN.md.
+See `tilerc.example` for the full config syntax. Recognised statements:
+`bind <chord> <action> [arg]`, `exec <cmdline>`, `# comments`.
+Modifiers: `Shift`, `Ctrl`/`Control`, `Alt`/`Mod1`, `Mod4`/`Win`/`Super`.
+Actions: `exec`, `kill`, `exit`.
+
+No layouts, no workspaces, no bar yet. Those land in phases 1b.2
+through 2c — see PLAN.md.
 
 ## License
 

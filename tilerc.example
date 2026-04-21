@@ -1,0 +1,39 @@
+# tile config — copy to ~/.tilerc and edit.
+#
+# Phase 1b.1 supports these statements:
+#   bind <chord> <action> [arg]    — keybinding
+#   exec <command line>            — autostart (run once at tile start)
+#   # ...                          — comment
+#
+# Chord syntax: modifiers and key joined by '+'. Modifier names are
+# case-sensitive. Recognised modifiers:
+#   Shift, Ctrl (or Control), Alt (or Mod1), Mod4 (or Win, Super)
+#
+# Key names: any single ASCII printable character (a-z, A-Z, 0-9, !,
+# `, ~, etc.) OR one of the named keys: Return, Escape, space, Tab,
+# BackSpace, Delete, Left, Right, Up, Down, Home, End, Page_Up,
+# Page_Down, F1-F12, plus, minus, underscore, equal, comma, period,
+# less, greater, slash, backslash, semicolon, apostrophe, bracketleft,
+# bracketright.
+#
+# Actions (phase 1b.1):
+#   exec <cmdline>   — fork+execve via /bin/sh -c (shell expansion ok)
+#   kill             — close the focused window cleanly (WM_DELETE_WINDOW)
+#   exit             — exit tile
+
+# === Spawn ===
+bind Mod4+Return        exec glass
+bind Mod4+x             exec glass
+bind Mod4+space         exec rofi -show run
+
+# === Window management ===
+bind Mod4+q             kill
+bind Mod4+Shift+q       exit
+
+# === Lock screen ===
+bind Mod4+Escape        exec i3lock -c 000000
+
+# === Autostart ===
+exec feh --bg-fill /home/geir/setup/wallpapers/blue.png
+exec picom --config /home/geir/.config/picom/picom.conf
+exec nm-applet
