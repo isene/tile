@@ -48,6 +48,7 @@
 %define X11_CREATE_PIXMAP       53
 %define X11_OPEN_FONT           45
 %define X11_CREATE_GC           55
+%define X11_CHANGE_GC           56
 %define X11_COPY_AREA           62
 %define X11_POLY_FILL_RECT      70
 %define X11_IMAGE_TEXT8         76
@@ -120,6 +121,28 @@ sh_dash_c:       db "-c", 0
 
 ; Empty placeholder for segments awaiting first run.
 empty_str:       db " ", 0
+
+; ANSI SGR → pixel colour lookup. Indexed by (code - 30) for 30..37
+; (standard 8), (code - 90 + 8) for 90..97 (bright 8). 16 entries.
+; All include opaque alpha. SGR 0 (reset) is handled specially →
+; falls back to cfg_fg.
+sgr_palette:
+    dd 0xFF000000        ; 30 black
+    dd 0xFFCC0000        ; 31 red
+    dd 0xFF00CC00        ; 32 green
+    dd 0xFFCCCC00        ; 33 yellow
+    dd 0xFF0000CC        ; 34 blue
+    dd 0xFFCC00CC        ; 35 magenta
+    dd 0xFF00CCCC        ; 36 cyan
+    dd 0xFFCCCCCC        ; 37 white
+    dd 0xFF555555        ; 90 bright black (dim grey)
+    dd 0xFFFF5555        ; 91 bright red
+    dd 0xFF55FF55        ; 92 bright green
+    dd 0xFFFFFF55        ; 93 bright yellow
+    dd 0xFF5555FF        ; 94 bright blue
+    dd 0xFFFF55FF        ; 95 bright magenta
+    dd 0xFF55FFFF        ; 96 bright cyan
+    dd 0xFFFFFFFF        ; 97 bright white
 
 ; ══════════════════════════════════════════════════════════════════════
 ; BSS
@@ -454,11 +477,15 @@ drain_segment_pipe:
     cmp ebx, SEG_OUT_LEN - 1
     jge .dsp_copied
     movzx edx, byte [pipe_scratch + rdi]
-    ; Drop newlines / control chars (keep space..~).
+    ; Keep ESC (0x1B) so SGR sequences reach the renderer. Drop other
+    ; control bytes. Keep printable 32..126.
+    cmp dl, 0x1B
+    je .dsp_keep
     cmp dl, 32
     jb .dsp_skip_byte
     cmp dl, 126
     ja .dsp_skip_byte
+.dsp_keep:
     mov [r12 + SEG_OFF_OUTPUT + rbx], dl
     inc ebx
 .dsp_skip_byte:
@@ -803,6 +830,231 @@ image_text8_pixmap:
     pop rcx
     ret
 
+; eax = pixel value. Sends ChangeGC to set the text GC's foreground.
+change_gc_fg:
+    push rbx
+    mov ebx, eax
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_GC
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4                   ; 3 hdr + 1 value = 4 words
+    mov eax, [gc_id]
+    mov [rdi+4], eax
+    mov dword [rdi+8], GC_FOREGROUND
+    mov [rdi+12], ebx
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    pop rbx
+    ret
+
+; edi = sgr code (1..2 digits parsed). Returns eax = pixel colour for
+; that code, or cfg_fg for code 0 / unrecognised. Handles 30..37 and
+; 90..97; everything else falls back to default fg.
+sgr_to_pixel:
+    cmp edi, 30
+    jl .stp_default
+    cmp edi, 37
+    jle .stp_30_37
+    cmp edi, 90
+    jl .stp_default
+    cmp edi, 97
+    jle .stp_90_97
+.stp_default:
+    mov eax, [cfg_fg]
+    ret
+.stp_30_37:
+    sub edi, 30
+    mov eax, [sgr_palette + rdi*4]
+    ret
+.stp_90_97:
+    sub edi, 90 - 8
+    mov eax, [sgr_palette + rdi*4]
+    ret
+
+; Render one segment with inline SGR colour switching.
+;   edi = start x (pixels)
+;   rsi = buffer ptr
+;   edx = buffer length (bytes)
+; Returns eax = display character count (excludes SGR escape bytes).
+;
+; Walks the buffer; when an ESC[...m sequence is found, the preceding
+; run is flushed via change_gc_fg + image_text8_pixmap, then the SGR
+; codes are parsed (semicolon-separated, last one wins for simplicity)
+; to update the current colour. Final run is flushed at end.
+render_segment_sgr:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    mov r12d, edi                         ; current x
+    mov r13, rsi                          ; buffer base
+    mov r14d, edx                         ; total byte length
+    xor r15d, r15d                        ; cursor index
+    xor ebp, ebp                          ; current run start
+    xor ebx, ebx                          ; total display chars
+    ; Initialise GC foreground.
+    mov eax, [cfg_fg]
+    call change_gc_fg
+.rss_loop:
+    cmp r15d, r14d
+    jge .rss_flush_final
+    movzx eax, byte [r13 + r15]
+    cmp al, 0x1B
+    je .rss_esc
+    inc r15d
+    jmp .rss_loop
+.rss_esc:
+    ; Flush the run preceding this ESC.
+    mov ecx, r15d
+    sub ecx, ebp
+    test ecx, ecx
+    jz .rss_no_flush
+    mov edi, r12d
+    mov esi, DEFAULT_FONT_BASELINE
+    lea rdx, [r13 + rbp]
+    call paint_text
+    mov ecx, r15d
+    sub ecx, ebp
+    add ebx, ecx
+    imul ecx, ecx, CHAR_WIDTH
+    add r12d, ecx
+.rss_no_flush:
+    ; Parse "ESC [ N [;N…] m". On the way, each ';' or final 'm'
+    ; commits the accumulated code via sgr_to_pixel + change_gc_fg.
+    inc r15d                              ; past ESC
+    cmp r15d, r14d
+    jge .rss_flush_final
+    cmp byte [r13 + r15], '['
+    jne .rss_resync
+    inc r15d
+    xor edi, edi
+.rss_sgr_chars:
+    cmp r15d, r14d
+    jge .rss_flush_final
+    movzx eax, byte [r13 + r15]
+    cmp al, 'm'
+    je .rss_sgr_end
+    cmp al, ';'
+    je .rss_sgr_sep
+    cmp al, '0'
+    jb .rss_resync
+    cmp al, '9'
+    ja .rss_resync
+    sub al, '0'
+    imul edi, edi, 10
+    movzx ecx, al
+    add edi, ecx
+    inc r15d
+    jmp .rss_sgr_chars
+.rss_sgr_sep:
+    push rdi
+    call sgr_to_pixel
+    call change_gc_fg
+    pop rdi
+    xor edi, edi
+    inc r15d
+    jmp .rss_sgr_chars
+.rss_sgr_end:
+    push rdi
+    call sgr_to_pixel
+    call change_gc_fg
+    pop rdi
+    inc r15d
+    mov ebp, r15d                         ; run starts after 'm'
+    jmp .rss_loop
+.rss_resync:
+    inc r15d
+    mov ebp, r15d
+    jmp .rss_loop
+.rss_flush_final:
+    mov ecx, r15d
+    sub ecx, ebp
+    test ecx, ecx
+    jz .rss_done
+    mov edi, r12d
+    mov esi, DEFAULT_FONT_BASELINE
+    lea rdx, [r13 + rbp]
+    call paint_text
+    mov ecx, r15d
+    sub ecx, ebp
+    add ebx, ecx
+    imul ecx, ecx, CHAR_WIDTH
+    add r12d, ecx
+.rss_done:
+    mov eax, ebx                          ; display chars drawn
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; paint_text(edi=x, esi=y, rdx=ptr, ecx=length).
+; ImageText8 onto the pixmap with explicit byte length. Caller is
+; responsible for not exceeding 255 bytes (X11 ImageText8 limit).
+paint_text:
+    test ecx, ecx
+    jz .pt_done
+    cmp ecx, 255
+    jle .pt_ok
+    mov ecx, 255
+.pt_ok:
+    push rbx
+    push r12
+    mov r12, rdx                          ; preserve text ptr
+    lea rbx, [tmp_buf]
+    mov byte [rbx], X11_IMAGE_TEXT8
+    mov byte [rbx+1], cl
+    mov eax, ecx
+    add eax, 3
+    shr eax, 2
+    add eax, 4
+    mov [rbx+2], ax
+    mov eax, [pixmap_id]
+    mov [rbx+4], eax
+    mov eax, [gc_id]
+    mov [rbx+8], eax
+    mov [rbx+12], di                      ; x
+    mov [rbx+14], si                      ; y
+    add rbx, 16
+    push rcx
+    xor edx, edx
+.pt_cp:
+    cmp edx, ecx
+    jge .pt_pad
+    mov al, [r12 + rdx]
+    mov [rbx], al
+    inc rbx
+    inc edx
+    jmp .pt_cp
+.pt_pad:
+    pop rcx
+    mov edx, ecx
+    and edx, 3
+    jz .pt_send
+    mov eax, 4
+    sub eax, edx
+.pt_pl:
+    mov byte [rbx], 0
+    inc rbx
+    dec eax
+    jnz .pt_pl
+.pt_send:
+    mov rdx, rbx
+    lea rsi, [tmp_buf]
+    sub rdx, rsi
+    call x11_buffer
+    inc dword [x11_seq]
+    pop r12
+    pop rbx
+.pt_done:
+    ret
+
 ; ══════════════════════════════════════════════════════════════════════
 ; Render: draw to off-screen Pixmap, then CopyArea Pixmap → Window in
 ; a single request. Skipped entirely when strip_dirty == 0.
@@ -837,7 +1089,7 @@ render_strip:
     call x11_buffer
     inc dword [x11_seq]
 
-    ; Walk segments: render text concatenated with single-space separator.
+    ; Walk segments: render each via SGR-aware run emitter.
     mov r12d, 4                           ; running x in pixels
     xor ebx, ebx
 .rs_loop:
@@ -849,15 +1101,16 @@ render_strip:
     movzx ecx, byte [r13 + SEG_OFF_OUT_LEN]
     test ecx, ecx
     jz .rs_next
-    mov edi, r12d
-    mov esi, DEFAULT_FONT_BASELINE
-    lea rdx, [r13 + SEG_OFF_OUTPUT]
-    call image_text8_pixmap
-    movzx eax, byte [r13 + SEG_OFF_OUT_LEN]
+    ; render_segment_sgr returns the number of display characters drawn.
+    mov edi, r12d                         ; start x
+    lea rsi, [r13 + SEG_OFF_OUTPUT]       ; buffer
+    mov edx, ecx                          ; byte length
+    call render_segment_sgr
+    ; rax = display chars drawn. Advance x by (chars + 1) * CHAR_WIDTH
+    ; (1 extra for a single-space separator).
     inc eax
     imul eax, CHAR_WIDTH
     add r12d, eax
-    ; Reset per-segment dirty bit (aggregate on strip_dirty already covers it).
     mov byte [r13 + SEG_OFF_FLAGS], 0
 .rs_next:
     inc ebx
