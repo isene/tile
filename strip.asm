@@ -205,6 +205,12 @@ poll_seg_idx:        resd MAX_POLL_FDS    ; segment index for each pollfd (-1 fo
 ; Read-from-pipe scratch.
 pipe_scratch:        resb 256
 
+; SGR sequence accumulator. Filled while parsing "ESC [ N (;N)* m";
+; processed at the closing 'm' so multi-token forms like "38;2;R;G;B"
+; (24-bit RGB foreground) work alongside the simple 30..37 / 90..97 codes.
+sgr_codes:           resd 8
+sgr_count:           resd 1
+
 ; Wait4 status output.
 wait_status:         resd 1
 
@@ -849,6 +855,55 @@ change_gc_fg:
     pop rbx
     ret
 
+; Walk sgr_codes[0 .. sgr_count) and apply to GC foreground.
+;   0                   → reset to cfg_fg
+;   30..37 / 90..97     → 8/16-colour palette entry
+;   38;2;R;G;B          → 24-bit RGB pixel = 0xFF000000 | (R<<16) | (G<<8) | B
+; Multiple codes in one sequence are processed in order; the LAST
+; foreground-affecting one wins for the run that follows.
+apply_sgr_array:
+    push rbx
+    push r12
+    mov r12d, [sgr_count]
+    test r12d, r12d
+    jz .asa_done
+    xor ebx, ebx                          ; cursor
+.asa_loop:
+    cmp ebx, r12d
+    jge .asa_done
+    mov edi, [sgr_codes + rbx*4]
+    cmp edi, 38
+    jne .asa_simple
+    ; Possible 24-bit form: 38;2;R;G;B → need ebx+4 in range and [ebx+1] == 2.
+    mov ecx, ebx
+    add ecx, 4
+    cmp ecx, r12d
+    jge .asa_simple                       ; not enough tokens, treat 38 as default
+    cmp dword [sgr_codes + (rbx+1)*4], 2
+    jne .asa_simple
+    mov edi, [sgr_codes + (rbx+2)*4]      ; R
+    shl edi, 16
+    mov ecx, [sgr_codes + (rbx+3)*4]      ; G
+    shl ecx, 8
+    or edi, ecx
+    mov ecx, [sgr_codes + (rbx+4)*4]      ; B
+    or edi, ecx
+    or edi, 0xFF000000                    ; opaque alpha
+    mov eax, edi
+    call change_gc_fg
+    add ebx, 5
+    jmp .asa_loop
+.asa_simple:
+    call sgr_to_pixel
+    call change_gc_fg
+    inc ebx
+    jmp .asa_loop
+.asa_done:
+    mov dword [sgr_count], 0
+    pop r12
+    pop rbx
+    ret
+
 ; edi = sgr code (1..2 digits parsed). Returns eax = pixel colour for
 ; that code, or cfg_fg for code 0 / unrecognised. Handles 30..37 and
 ; 90..97; everything else falls back to default fg.
@@ -923,15 +978,17 @@ render_segment_sgr:
     imul ecx, ecx, CHAR_WIDTH
     add r12d, ecx
 .rss_no_flush:
-    ; Parse "ESC [ N [;N…] m". On the way, each ';' or final 'm'
-    ; commits the accumulated code via sgr_to_pixel + change_gc_fg.
+    ; Parse "ESC [ N (;N)* m": collect every numeric token into
+    ; sgr_codes[], then process the array at 'm'. This lets 38;2;R;G;B
+    ; (24-bit RGB foreground) coexist with simple codes.
     inc r15d                              ; past ESC
     cmp r15d, r14d
     jge .rss_flush_final
     cmp byte [r13 + r15], '['
     jne .rss_resync
     inc r15d
-    xor edi, edi
+    xor edi, edi                          ; current accumulator
+    mov dword [sgr_count], 0
 .rss_sgr_chars:
     cmp r15d, r14d
     jge .rss_flush_final
@@ -951,21 +1008,25 @@ render_segment_sgr:
     inc r15d
     jmp .rss_sgr_chars
 .rss_sgr_sep:
-    push rdi
-    call sgr_to_pixel
-    call change_gc_fg
-    pop rdi
-    xor edi, edi
+    call .rss_push_code
     inc r15d
     jmp .rss_sgr_chars
 .rss_sgr_end:
-    push rdi
-    call sgr_to_pixel
-    call change_gc_fg
-    pop rdi
+    call .rss_push_code
+    call apply_sgr_array
     inc r15d
     mov ebp, r15d                         ; run starts after 'm'
     jmp .rss_loop
+
+.rss_push_code:
+    mov ecx, [sgr_count]
+    cmp ecx, 8
+    jge .rsspc_drop
+    mov [sgr_codes + rcx*4], edi
+    inc dword [sgr_count]
+.rsspc_drop:
+    xor edi, edi
+    ret
 .rss_resync:
     inc r15d
     mov ebp, r15d
