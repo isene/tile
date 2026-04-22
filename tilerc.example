@@ -19,6 +19,12 @@
 #
 # Actions:
 #   exec <cmdline>           fork+execve via /bin/sh -c
+#   exec-here <cmdline>      same as exec, but the child starts in the
+#                            cwd of the focused window's bare shell
+#                            (read from glass's _TILE_SHELL_PID
+#                            property + /proc/PID/cwd). Falls back to
+#                            plain exec if the focused window doesn't
+#                            advertise a shell PID.
 #   kill                     close the focused window cleanly (WM_DELETE_WINDOW)
 #   exit                     exit tile
 #   workspace N              switch to workspace N (1..9, 0 = workspace 10)
@@ -64,6 +70,8 @@
 # Mod4+Return: new glass; if workspace is in split mode, lands to the right
 #              (planned: phase 1b.3b.x split-aware exec).
 bind Mod4+Return        exec glass
+# Mod4+Shift+Return: new glass starting in the cwd of the focused glass's bare.
+bind Mod4+Shift+Return  exec-here glass
 
 # === Window management ===
 bind Mod4+q             kill

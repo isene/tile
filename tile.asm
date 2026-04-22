@@ -138,6 +138,7 @@
 %define ACT_UNSTASH     10
 %define ACT_LAYOUT      11
 %define ACT_SPAWN_SPLIT 12
+%define ACT_EXEC_HERE   13
 
 %define MAX_STASH       8
 
@@ -225,6 +226,8 @@ wm_protocols_str: db "WM_PROTOCOLS"
 wm_protocols_len  equ 12
 wm_delete_str:    db "WM_DELETE_WINDOW"
 wm_delete_len     equ 16
+tile_shell_pid_str: db "_TILE_SHELL_PID"
+tile_shell_pid_len equ 15
 
 ; XINERAMA extension name (uppercase per X11 convention).
 xinerama_name:    db "XINERAMA"
@@ -365,6 +368,8 @@ action_table:
     db ACT_LAYOUT, 0
     db "spawn-split", 0
     db ACT_SPAWN_SPLIT, 0
+    db "exec-here", 0
+    db ACT_EXEC_HERE, 0
     db 0                       ; terminator
 
 ; layout arg keyword table: `layout tabbed | split-h | split-v | toggle`.
@@ -588,6 +593,16 @@ ws_active_xid:           resd WS_COUNT
 ; ICCCM atoms (resolved at startup via InternAtom).
 wm_protocols_atom:   resd 1
 wm_delete_atom:      resd 1
+tile_shell_pid_atom: resd 1
+
+; Pending-event queue. Used when a synchronous X reply read (e.g. for
+; GetProperty during the exec-here action) accidentally drains an
+; event from the wire. event_loop drains the queue before reading the
+; socket, so no event is lost.
+%define PENDING_MAX 16
+pending_events:      resb 32 * PENDING_MAX
+pending_count:       resd 1
+pending_head:        resd 1
 
 ; Binding table.
 ; Per-entry layout (BIND_STRIDE = 16):
@@ -622,7 +637,7 @@ sockaddr_buf:        resb 112
 xauth_buf:           resb 4096
 xauth_data:          resb 16
 xauth_len:           resq 1
-tmp_buf:             resb 4096
+tmp_buf:             resb 16384
 x11_read_buf:        resb 65536
 x11_write_buf:       resb 65536
 x11_write_pos:       resq 1
@@ -1372,6 +1387,35 @@ event_loop:
     ; Always flush before sleeping so the server sees our requests.
     call x11_flush
 
+    ; Drain any events queued during a synchronous reply read (e.g.
+    ; GetProperty in action_exec_here). The queue holds at most
+    ; PENDING_MAX 32-byte events; we copy one into x11_read_buf and
+    ; jump straight to dispatch.
+    cmp dword [pending_count], 0
+    je .el_read_socket
+    mov ebx, [pending_head]
+    mov rax, rbx
+    shl rax, 5                   ; * 32
+    lea rsi, [pending_events + rax]
+    lea rdi, [x11_read_buf]
+    mov ecx, 4
+.el_drain_copy:
+    mov rax, [rsi]
+    mov [rdi], rax
+    add rsi, 8
+    add rdi, 8
+    dec ecx
+    jnz .el_drain_copy
+    inc ebx
+    cmp ebx, PENDING_MAX
+    jl .el_drain_no_wrap
+    xor ebx, ebx
+.el_drain_no_wrap:
+    mov [pending_head], ebx
+    dec dword [pending_count]
+    jmp .el_dispatch
+
+.el_read_socket:
     ; Read one 32-byte event (X11 always sends events as 32-byte units).
     ; A blocking read on a Unix socket sleeps the process; that's the
     ; only path we should ever take when at idle. If the X server has
@@ -1388,6 +1432,7 @@ event_loop:
     jle .x11_dead                ; 0 = EOF, negative = -errno (also fatal)
     cmp rax, 32
     jl event_loop                ; genuine short read — retry
+.el_dispatch:
 
     movzx eax, byte [x11_read_buf]
     and al, 0x7F                 ; strip SendEvent bit
@@ -2233,6 +2278,107 @@ intern_wm_atoms:
     syscall
     mov eax, [x11_read_buf + 8]
     mov [wm_delete_atom], eax
+
+    ; --- _TILE_SHELL_PID ---
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_INTERN_ATOM
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2 + (tile_shell_pid_len + 3) / 4
+    mov word [rdi+4], tile_shell_pid_len
+    mov word [rdi+6], 0
+    lea rsi, [tile_shell_pid_str]
+    lea rbx, [tmp_buf + 8]
+    xor ecx, ecx
+.iwa_cp3:
+    cmp ecx, tile_shell_pid_len
+    jge .iwa_pad3
+    movzx eax, byte [rsi + rcx]
+    mov [rbx + rcx], al
+    inc ecx
+    jmp .iwa_cp3
+.iwa_pad3:
+    mov eax, tile_shell_pid_len
+    add eax, 3
+    and eax, ~3
+    add eax, 8
+    mov rdx, rax
+    lea rsi, [tmp_buf]
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    inc dword [x11_seq]
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_read_buf]
+    mov rdx, 32
+    syscall
+    mov eax, [x11_read_buf + 8]
+    mov [tile_shell_pid_atom], eax
+    pop r12
+    pop rbx
+    ret
+
+; Read 32-byte chunks off x11_fd until a reply (byte 0 == 1) lands.
+; Stash any events that arrive in the meantime into pending_events so
+; event_loop processes them on its next tick. Errors (byte 0 == 0) are
+; dropped silently — a GetProperty against a window that doesn't have
+; the requested property simply replies with type=0 length=0.
+;
+; rdi = output buffer (must be ≥ 32 bytes). Returns rax = 1 on success
+; (reply written to [rdi]), 0 on failure (EOF / error reading).
+read_reply_or_queue:
+    push rbx
+    push r12
+    push r13
+    mov r12, rdi                          ; reply dest
+.rrq_loop:
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    mov rsi, r12
+    mov rdx, 32
+    syscall
+    test rax, rax
+    jle .rrq_fail
+    cmp rax, 32
+    jl .rrq_loop                          ; partial read — retry
+    mov al, [r12]
+    cmp al, 1
+    je .rrq_reply
+    cmp al, 0
+    je .rrq_loop                          ; X error — drop, keep waiting
+    ; Event — append to pending queue.
+    mov ecx, [pending_count]
+    cmp ecx, PENDING_MAX
+    jge .rrq_loop                         ; queue full — drop oldest by reading next
+    mov ebx, [pending_head]
+    add ebx, ecx
+    cmp ebx, PENDING_MAX
+    jl .rrq_no_wrap
+    sub ebx, PENDING_MAX
+.rrq_no_wrap:
+    mov rax, rbx
+    shl rax, 5
+    lea rdi, [pending_events + rax]
+    mov rsi, r12
+    mov ecx, 4
+.rrq_copy:
+    mov rax, [rsi]
+    mov [rdi], rax
+    add rsi, 8
+    add rdi, 8
+    dec ecx
+    jnz .rrq_copy
+    inc dword [pending_count]
+    jmp .rrq_loop
+.rrq_reply:
+    mov eax, 1
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.rrq_fail:
+    xor eax, eax
+    pop r13
     pop r12
     pop rbx
     ret
@@ -2632,6 +2778,8 @@ dispatch_keypress:
     je .dk_layout
     cmp eax, ACT_SPAWN_SPLIT
     je .dk_spawn_split
+    cmp eax, ACT_EXEC_HERE
+    je .dk_exec_here
     jmp .dk_done
 .dk_exec:
     test edx, edx
@@ -2723,6 +2871,12 @@ dispatch_keypress:
     mov edi, esi                          ; direction
     lea rsi, [arg_pool + rdx]             ; cmd
     call action_spawn_split
+    jmp .dk_done
+.dk_exec_here:
+    test edx, edx
+    jz .dk_done
+    lea rdi, [arg_pool + rdx]
+    call action_exec_here
     jmp .dk_done
 .dk_skip:
     inc ebx
@@ -3563,6 +3717,282 @@ action_spawn_split:
     pop rbx
     ret
 
+; rdi = NUL-terminated command line. Reads the focused window's
+; _TILE_SHELL_PID property (set by glass), resolves the bare child's
+; cwd via /proc/PID/cwd, then forks /bin/sh -c CMD with that cwd via
+; chdir() in the child. Falls back to plain fork_exec_string (no cwd
+; change) if the focused window has no shell-pid property or the
+; readlink fails — so the action is always at least as useful as
+; `exec`.
+action_exec_here:
+    push rbx
+    push r12
+    push r13
+    mov r12, rdi                          ; cmd ptr
+
+    movzx eax, byte [current_ws]
+    test eax, eax
+    jz .aeh_no_cwd
+    dec eax
+    mov r13d, [ws_active_xid + rax*4]
+    test r13d, r13d
+    jz .aeh_no_cwd
+    mov eax, [tile_shell_pid_atom]
+    test eax, eax
+    jz .aeh_no_cwd
+
+    ; Send GetProperty(window=r13, property=tile_shell_pid_atom,
+    ; type=AnyPropertyType, long_offset=0, long_length=1, delete=0).
+    call x11_flush
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_GET_PROPERTY
+    mov byte [rdi+1], 0                   ; delete = false
+    mov word [rdi+2], 6                   ; length = 6 words
+    mov [rdi+4], r13d                     ; window
+    mov [rdi+8], eax                      ; property
+    mov dword [rdi+12], 0                 ; type = AnyPropertyType
+    mov dword [rdi+16], 0                 ; long-offset
+    mov dword [rdi+20], 1                 ; long-length (1 CARD32)
+    mov rdx, 24
+    lea rsi, [tmp_buf]
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    inc dword [x11_seq]
+
+    ; Read 32-byte reply header (events get queued for event_loop).
+    lea rdi, [tmp_buf + 64]
+    call read_reply_or_queue
+    test eax, eax
+    jz .aeh_no_cwd
+    mov eax, [tmp_buf + 64 + 16]          ; value-length
+    test eax, eax
+    jz .aeh_no_cwd
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf + 96]
+    mov rdx, 4
+    syscall
+    cmp rax, 4
+    jl .aeh_no_cwd
+    mov ebx, [tmp_buf + 96]               ; bare PID
+
+    ; Resolve foreground process group via /proc/PID/stat field 8
+    ; (tpgid). When bare's child (e.g. pointer) is running in the
+    ; foreground, tpgid is that child's pgrp; otherwise it equals
+    ; bare's own pgrp. Falls back to the bare PID on any parse failure.
+    mov eax, ebx
+    call read_tpgid
+    test eax, eax
+    jle .aeh_use_bare_pid
+    mov ebx, eax
+.aeh_use_bare_pid:
+
+    ; Build "/proc/PID/cwd" into tmp_buf+128.
+    lea rdi, [tmp_buf + 128]
+    mov dword [rdi], "/pro"
+    mov word [rdi+4], "c/"
+    add rdi, 6
+    mov eax, ebx
+    call .aeh_itoa
+    mov dword [rax], "/cwd"
+    mov byte [rax+4], 0
+
+    ; Resolve via readlink into tmp_buf+256.
+    mov rax, 89                           ; SYS_READLINK
+    lea rdi, [tmp_buf + 128]
+    lea rsi, [tmp_buf + 256]
+    mov rdx, 4096
+    syscall
+    test rax, rax
+    jle .aeh_no_cwd
+    cmp rax, 4096
+    jge .aeh_no_cwd
+    mov byte [tmp_buf + 256 + rax], 0     ; readlink doesn't NUL-terminate
+
+    ; Fork; child chdir + exec /bin/sh -c CMD.
+    mov rax, SYS_FORK
+    syscall
+    test rax, rax
+    js .aeh_done
+    jnz .aeh_done                          ; parent — done
+    mov rax, 80                           ; SYS_CHDIR
+    lea rdi, [tmp_buf + 256]
+    syscall                               ; ignore failure
+    sub rsp, 32
+    lea rax, [.aeh_sh]
+    mov [rsp], rax
+    lea rax, [.aeh_dash_c]
+    mov [rsp+8], rax
+    mov [rsp+16], r12
+    mov qword [rsp+24], 0
+    lea rdi, [.aeh_sh]
+    mov rsi, rsp
+    mov rdx, [envp]
+    mov rax, SYS_EXECVE
+    syscall
+    mov rax, SYS_EXIT
+    mov edi, 1
+    syscall
+.aeh_no_cwd:
+    test r12, r12
+    jz .aeh_done
+    mov rdi, r12
+    call fork_exec_string
+.aeh_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; eax = number, rdi = output buffer. Writes decimal digits, returns
+; rax = pointer past the last digit. (Local helper for action_exec_here
+; only — keeps the global itoa untouched.)
+.aeh_itoa:
+    push rbx
+    mov rbx, rdi
+    mov ecx, 10
+    xor r8d, r8d
+.aeh_it_div:
+    xor edx, edx
+    div ecx
+    add edx, '0'
+    push rdx
+    inc r8d
+    test eax, eax
+    jnz .aeh_it_div
+.aeh_it_pop:
+    pop rdx
+    mov [rbx], dl
+    inc rbx
+    dec r8d
+    jnz .aeh_it_pop
+    mov rax, rbx
+    pop rbx
+    ret
+
+.aeh_sh:     db "/bin/sh", 0
+.aeh_dash_c: db "-c", 0
+
+; eax = process PID. Reads /proc/PID/stat, parses field 8 (tpgid =
+; foreground process group of the controlling terminal). Returns the
+; tpgid in eax, or 0 on any failure (process gone, parse error,
+; tpgid == -1 = no foreground). Uses tmp_buf+1024..+5120 as scratch.
+read_tpgid:
+    push rbx
+    push r12
+    push r13
+    mov r12d, eax                         ; pid
+
+    ; Build "/proc/PID/stat" into tmp_buf+1024.
+    lea rdi, [tmp_buf + 1024]
+    mov dword [rdi], "/pro"
+    mov word [rdi+4], "c/"
+    add rdi, 6
+    mov eax, r12d
+    call action_exec_here.aeh_itoa
+    mov dword [rax], "/sta"
+    mov word [rax+4], "t"
+    mov byte [rax+5], 0
+
+    ; Open + read the stat file.
+    mov rax, SYS_OPEN
+    lea rdi, [tmp_buf + 1024]
+    xor esi, esi                          ; O_RDONLY
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .rt_fail
+    mov r13, rax                          ; fd
+    mov rax, SYS_READ
+    mov rdi, r13
+    lea rsi, [tmp_buf + 2048]
+    mov rdx, 4096
+    syscall
+    push rax                              ; bytes read
+    mov rax, SYS_CLOSE
+    mov rdi, r13
+    syscall
+    pop rax
+    test rax, rax
+    jle .rt_fail
+    mov r13, rax                          ; bytes read
+
+    ; Find the LAST ')' in [tmp_buf+2048 .. tmp_buf+2048+r13).
+    ; The comm field is parenthesised and may itself contain '(' / ')'.
+    lea rbx, [tmp_buf + 2048]
+    mov rcx, r13
+    xor rdi, rdi                          ; rdi = position of last ')' or 0
+.rt_scan:
+    test rcx, rcx
+    jz .rt_after_scan
+    dec rcx
+    cmp byte [rbx + rcx], ')'
+    jne .rt_scan
+    lea rdi, [rbx + rcx]
+    jmp .rt_after_scan                    ; first hit going right-to-left wins
+.rt_after_scan:
+    test rdi, rdi
+    jz .rt_fail
+    inc rdi                               ; skip ')'
+    cmp byte [rdi], ' '
+    jne .rt_fail
+    inc rdi                               ; skip ' '
+
+    ; Skip 5 space-separated tokens: state, ppid, pgrp, session, tty_nr.
+    mov ecx, 5
+.rt_skip_field:
+    test ecx, ecx
+    jz .rt_have_tpgid
+.rt_eat_token:
+    mov al, [rdi]
+    test al, al
+    jz .rt_fail
+    cmp al, ' '
+    je .rt_eat_space
+    inc rdi
+    jmp .rt_eat_token
+.rt_eat_space:
+    inc rdi                               ; skip the ' '
+    dec ecx
+    jmp .rt_skip_field
+.rt_have_tpgid:
+    ; Parse signed decimal at [rdi].
+    xor eax, eax
+    xor ebx, ebx                          ; sign flag (1 = negative)
+    cmp byte [rdi], '-'
+    jne .rt_parse
+    mov ebx, 1
+    inc rdi
+.rt_parse:
+    movzx ecx, byte [rdi]
+    cmp cl, '0'
+    jb .rt_parse_done
+    cmp cl, '9'
+    ja .rt_parse_done
+    sub ecx, '0'
+    imul eax, eax, 10
+    add eax, ecx
+    inc rdi
+    jmp .rt_parse
+.rt_parse_done:
+    test ebx, ebx
+    jz .rt_done
+    neg eax
+.rt_done:
+    cmp eax, 0
+    jle .rt_fail                          ; -1 means no foreground process
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.rt_fail:
+    xor eax, eax
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 ; eax = workspace number, edx = visual index within ws (0-based).
 ; Returns XID at that index in eax, or 0 if out of range. Walks
 ; client_xids in order, counting only clients on the requested ws.
@@ -4170,6 +4600,8 @@ parse_config_line:
     ;   r8b = arg_int   (small numeric arg, or 0)
     ; before falling into .pcl_emit.
     cmp ecx, ACT_EXEC
+    je .pcl_arg_exec
+    cmp ecx, ACT_EXEC_HERE
     je .pcl_arg_exec
     cmp ecx, ACT_WORKSPACE
     je .pcl_arg_ws
