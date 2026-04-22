@@ -1526,7 +1526,9 @@ configure_client_for_workspace:
     pop rbx
     ret
 
-; eax = window XID
+; eax = window XID. Preserves rax across the x11_buffer call so a
+; subsequent call (e.g. set_input_focus) can reuse the XID without
+; reloading from memory.
 send_map_window:
     push rax
     lea rdi, [tmp_buf]
@@ -1537,7 +1539,9 @@ send_map_window:
     mov [rdi+4], eax
     lea rsi, [tmp_buf]
     mov rdx, 8
+    push rax
     call x11_buffer
+    pop rax
     inc dword [x11_seq]
     ret
 
@@ -1647,7 +1651,8 @@ find_client_index:
     pop rbx
     ret
 
-; eax = window XID. UnmapWindow request.
+; eax = window XID. UnmapWindow request. Preserves rax across the
+; x11_buffer call (see send_map_window comment).
 send_unmap_window:
     push rax
     lea rdi, [tmp_buf]
@@ -1658,7 +1663,9 @@ send_unmap_window:
     mov [rdi+4], eax
     lea rsi, [tmp_buf]
     mov rdx, 8
+    push rax
     call x11_buffer
+    pop rax
     inc dword [x11_seq]
     ret
 
@@ -2879,7 +2886,9 @@ configure_window_rect:
     mov [rdi+24], r8d                     ; h
     lea rsi, [tmp_buf]
     mov rdx, 28
-    call x11_buffer
+    push rax                              ; x11_buffer clobbers eax via its
+    call x11_buffer                       ; byte-read loop; preserve so
+    pop rax                               ; callers can rely on rax post-call
     inc dword [x11_seq]
     pop rbx
     ret
@@ -2973,6 +2982,10 @@ apply_workspace_layout:
     mov ecx, [rsp + 8]                    ; ws_w
     mov r8d, [rsp + 0]                    ; ws_h
     call configure_window_rect
+    ; Re-fetch the XID from memory before send_map_window — both
+    ; configure_window_rect and x11_buffer (which it calls) clobber
+    ; eax. Same pattern as the SPLIT_H/SPLIT_V branches below.
+    mov eax, [client_xids + rbx*4]
     call send_map_window
 .awl_t_next:
     inc ebx
