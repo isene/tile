@@ -161,7 +161,10 @@ section .bss
 %define SEG_OFF_PID       128      ; int32 (0 = none)
 %define SEG_OFF_PIPE_FD   132      ; int32 (-1 = none)
 %define SEG_OFF_FLAGS     136      ; uint8 (bit 0: dirty since last render)
-%define SEG_STRIDE_REAL   144
+%define SEG_OFF_DEFAULT_FG 140     ; uint32 (0 = use cfg_fg)
+%define SEG_OFF_INC_BUF   148      ; staging buffer for in-flight output (96B)
+%define SEG_OFF_INC_LEN   244      ; uint8 incoming length
+%define SEG_STRIDE_REAL   256
 
 envp:                resq 1
 display_num:         resq 1
@@ -503,8 +506,11 @@ drain_segment_pipe:
     cmp rax, 0
     jle .dsp_close                        ; 0 = EOF, <0 = error
 
-    ; Append (truncating to SEG_OUT_LEN-1) into segment output.
-    movzx ebx, byte [r12 + SEG_OFF_OUT_LEN]
+    ; Append (truncating to SEG_OUT_LEN-1) into INCOMING buffer.
+    ; Display buffer (OUTPUT) is untouched until the child closes
+    ; cleanly with non-empty output — that's how we keep the previous
+    ; reading visible during refresh and across transient failures.
+    movzx ebx, byte [r12 + SEG_OFF_INC_LEN]
     mov ecx, eax                          ; bytes read
     xor edi, edi
 .dsp_copy:
@@ -513,8 +519,6 @@ drain_segment_pipe:
     cmp ebx, SEG_OUT_LEN - 1
     jge .dsp_copied
     movzx edx, byte [pipe_scratch + rdi]
-    ; Keep ESC (0x1B) so SGR sequences reach the renderer. Drop other
-    ; control bytes. Keep printable 32..126.
     cmp dl, 0x1B
     je .dsp_keep
     cmp dl, 32
@@ -522,27 +526,38 @@ drain_segment_pipe:
     cmp dl, 126
     ja .dsp_skip_byte
 .dsp_keep:
-    mov [r12 + SEG_OFF_OUTPUT + rbx], dl
+    mov [r12 + SEG_OFF_INC_BUF + rbx], dl
     inc ebx
 .dsp_skip_byte:
     inc edi
     jmp .dsp_copy
 .dsp_copied:
-    mov [r12 + SEG_OFF_OUT_LEN], bl
-    mov byte [r12 + SEG_OFF_FLAGS], 1     ; dirty
-    mov byte [strip_dirty], 1
-    ; If revents indicated HUP/ERR alongside the data, close.
+    mov [r12 + SEG_OFF_INC_LEN], bl
     test r14d, POLLHUP | POLLERR
     jnz .dsp_close
     jmp .dsp_done
 
 .dsp_close:
-    ; Close the pipe; child reaping happens in reap_segment_children.
+    ; Close pipe + commit incoming → output if non-empty.
     mov rax, SYS_CLOSE
     mov edi, r13d
     syscall
     mov dword [r12 + SEG_OFF_PIPE_FD], -1
-    mov byte [r12 + SEG_OFF_FLAGS], 1     ; dirty regardless
+    movzx ebx, byte [r12 + SEG_OFF_INC_LEN]
+    test ebx, ebx
+    jz .dsp_done                          ; empty output — keep stale value
+    ; Copy INC_BUF → OUTPUT.
+    mov [r12 + SEG_OFF_OUT_LEN], bl
+    xor ecx, ecx
+.dsp_commit:
+    cmp ecx, ebx
+    jge .dsp_committed
+    mov al, [r12 + SEG_OFF_INC_BUF + rcx]
+    mov [r12 + SEG_OFF_OUTPUT + rcx], al
+    inc ecx
+    jmp .dsp_commit
+.dsp_committed:
+    mov byte [r12 + SEG_OFF_FLAGS], 1
     mov byte [strip_dirty], 1
 .dsp_done:
     pop r14
@@ -648,8 +663,9 @@ fork_segment:
     imul rax, SEG_STRIDE_REAL
     lea r13, [segments + rax]
 
-    ; Reset output buffer for fresh capture.
-    mov byte [r13 + SEG_OFF_OUT_LEN], 0
+    ; Reset INCOMING buffer; OUTPUT keeps the previous value so the
+    ; bar doesn't flash empty during refresh.
+    mov byte [r13 + SEG_OFF_INC_LEN], 0
 
     ; pipe(int fds[2])
     sub rsp, 16
@@ -968,6 +984,9 @@ sgr_to_pixel:
 ; run is flushed via change_gc_fg + image_text8_pixmap, then the SGR
 ; codes are parsed (semicolon-separated, last one wins for simplicity)
 ; to update the current colour. Final run is flushed at end.
+; edi = start x, rsi = buffer ptr, edx = byte length,
+; ecx = default fg pixel (0 → use cfg_fg).
+; Returns eax = display character count.
 render_segment_sgr:
     push rbx
     push r12
@@ -981,8 +1000,12 @@ render_segment_sgr:
     xor r15d, r15d                        ; cursor index
     xor ebp, ebp                          ; current run start
     xor ebx, ebx                          ; total display chars
-    ; Initialise GC foreground.
-    mov eax, [cfg_fg]
+    ; Initialise GC foreground: default fg if non-zero, else cfg_fg.
+    test ecx, ecx
+    jnz .rss_have_fg
+    mov ecx, [cfg_fg]
+.rss_have_fg:
+    mov eax, ecx
     call change_gc_fg
 .rss_loop:
     cmp r15d, r14d
@@ -1196,6 +1219,7 @@ render_strip:
     mov edi, r12d                         ; start x
     lea rsi, [r13 + SEG_OFF_OUTPUT]       ; buffer
     mov edx, ecx                          ; byte length
+    mov ecx, [r13 + SEG_OFF_DEFAULT_FG]   ; default fg (0 → cfg_fg)
     call render_segment_sgr
     ; rax = display chars drawn. Advance x by (chars + 1) * char_width
     ; (1 extra for a single-space separator).
@@ -1561,6 +1585,7 @@ register_segment:
     mov dword [r15 + SEG_OFF_INTERVAL], 0
     mov dword [r15 + SEG_OFF_NEXT_RUN], 0
     mov dword [r15 + SEG_OFF_PID], 0
+    mov dword [r15 + SEG_OFF_DEFAULT_FG], 0
     mov dword [r15 + SEG_OFF_PIPE_FD], -1
     mov byte [r15 + SEG_OFF_FLAGS], 0
     ; Copy name (truncate at SEG_NAME_LEN-1).
@@ -1589,6 +1614,60 @@ register_segment:
     test al, al
     jz .rseg_done
 
+    ; Optional default colour: if remainder starts with '#' followed by
+    ; 6 hex digits (and a space/tab/NUL), parse it into DEFAULT_FG and
+    ; advance r13 past it.
+    cmp byte [r13], '#'
+    jne .rseg_no_colour
+    mov rdi, r13
+    inc rdi                               ; past '#'
+    mov ecx, 6
+.rseg_chk_hex:
+    test ecx, ecx
+    jz .rseg_hex_ok
+    movzx eax, byte [rdi]
+    cmp al, '0'
+    jb .rseg_no_colour
+    cmp al, '9'
+    jbe .rseg_hex_dig
+    or al, 0x20
+    cmp al, 'a'
+    jb .rseg_no_colour
+    cmp al, 'f'
+    ja .rseg_no_colour
+.rseg_hex_dig:
+    inc rdi
+    dec ecx
+    jmp .rseg_chk_hex
+.rseg_hex_ok:
+    movzx eax, byte [rdi]
+    cmp al, ' '
+    je .rseg_hex_take
+    cmp al, 9
+    je .rseg_hex_take
+    cmp al, 0
+    je .rseg_hex_take
+    jmp .rseg_no_colour
+.rseg_hex_take:
+    push rdi
+    mov rdi, r13                          ; "#RRGGBB"
+    call parse_hex
+    pop rdi
+    mov [r15 + SEG_OFF_DEFAULT_FG], eax
+    mov r13, rdi                          ; advance remainder past colour
+    ; Skip whitespace.
+.rseg_hex_skip_ws:
+    movzx eax, byte [r13]
+    cmp al, ' '
+    je .rseg_hex_inc
+    cmp al, 9
+    je .rseg_hex_inc
+    jmp .rseg_no_colour
+.rseg_hex_inc:
+    inc r13
+    jmp .rseg_hex_skip_ws
+
+.rseg_no_colour:
     ; Detect optional trailing interval. Find end of remainder.
     mov rdi, r13
 .rseg_eol:
