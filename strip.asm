@@ -45,8 +45,10 @@
 ; ══════════════════════════════════════════════════════════════════════
 %define X11_CREATE_WINDOW       1
 %define X11_MAP_WINDOW          8
+%define X11_CREATE_PIXMAP       53
 %define X11_OPEN_FONT           45
 %define X11_CREATE_GC           55
+%define X11_COPY_AREA           62
 %define X11_POLY_FILL_RECT      70
 %define X11_IMAGE_TEXT8         76
 
@@ -148,12 +150,14 @@ x11_white_pixel:     resd 1
 x11_black_pixel:     resd 1
 
 window_id:           resd 1
+pixmap_id:           resd 1
 gc_id:               resd 1
 font_id:             resd 1
 strip_height:        resw 1
 strip_y:             resw 1
 cfg_bg:              resd 1
 cfg_fg:              resd 1
+strip_dirty:         resb 1            ; non-zero → re-render needed
 
 ; Segment storage.
 segments:            resb MAX_SEGMENTS * SEG_STRIDE_REAL
@@ -221,8 +225,10 @@ _start:
 
     call open_core_font
     call create_strip_window
+    call create_pixmap
     call create_gc
     call map_strip_window
+    mov byte [strip_dirty], 1
     call x11_flush
 
     ; Mark all segments due now.
@@ -396,7 +402,7 @@ drain_ready_fds:
     and al, 0x7F
     cmp al, EV_EXPOSE
     jne .drf_next
-    ; Expose — render handled at the bottom of main loop, no extra action.
+    mov byte [strip_dirty], 1
 .drf_next:
     inc ebx
     jmp .drf_loop
@@ -457,6 +463,7 @@ drain_segment_pipe:
 .dsp_copied:
     mov [r12 + SEG_OFF_OUT_LEN], bl
     mov byte [r12 + SEG_OFF_FLAGS], 1     ; dirty
+    mov byte [strip_dirty], 1
     ; If revents indicated HUP/ERR alongside the data, close.
     test r14d, POLLHUP | POLLERR
     jnz .dsp_close
@@ -469,6 +476,7 @@ drain_segment_pipe:
     syscall
     mov dword [r12 + SEG_OFF_PIPE_FD], -1
     mov byte [r12 + SEG_OFF_FLAGS], 1     ; dirty regardless
+    mov byte [strip_dirty], 1
 .dsp_done:
     pop r14
     pop r13
@@ -694,22 +702,123 @@ now_seconds:
     add rsp, 16
     ret
 
+; CreatePixmap matching the strip window dimensions. All rendering
+; happens to the pixmap; a single CopyArea at the end of render_strip
+; blits it to the window — eliminates flicker from multi-request draws.
+create_pixmap:
+    push rbx
+    call alloc_xid
+    mov [pixmap_id], eax
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CREATE_PIXMAP
+    movzx ebx, byte [x11_root_depth]
+    mov [rdi+1], bl                       ; depth
+    mov word [rdi+2], 4                   ; length
+    mov [rdi+4], eax                      ; pid
+    mov eax, [window_id]
+    mov [rdi+8], eax                      ; drawable (window)
+    movzx eax, word [x11_screen_width]
+    mov [rdi+12], ax                      ; width
+    movzx eax, word [strip_height]
+    mov [rdi+14], ax                      ; height
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    pop rbx
+    ret
+
+; Helper used by render_strip: render one segment's text on the pixmap
+; at (edi=x, esi=y), data at rdx (NUL-terminated, capped at SEG_OUT_LEN).
+; Mirrors image_text8 but targets pixmap_id instead of window_id.
+image_text8_pixmap:
+    push rcx
+    push rdx
+    xor ecx, ecx
+.it8p_len:
+    cmp ecx, SEG_OUT_LEN
+    jge .it8p_have
+    cmp byte [rdx + rcx], 0
+    je .it8p_have
+    inc ecx
+    jmp .it8p_len
+.it8p_have:
+    pop rdx
+    push rdx
+    cmp ecx, 255
+    jle .it8p_ok
+    mov ecx, 255
+.it8p_ok:
+    push rbx
+    lea rbx, [tmp_buf]
+    mov byte [rbx], X11_IMAGE_TEXT8
+    mov byte [rbx+1], cl
+    mov eax, ecx
+    add eax, 3
+    shr eax, 2
+    add eax, 4
+    mov [rbx+2], ax
+    mov eax, [pixmap_id]
+    mov [rbx+4], eax
+    mov eax, [gc_id]
+    mov [rbx+8], eax
+    mov [rbx+12], di
+    mov [rbx+14], si
+    add rbx, 16
+    mov rsi, rdx
+    push rcx
+    xor edx, edx
+.it8p_cp:
+    cmp edx, ecx
+    jge .it8p_pad
+    mov al, [rsi + rdx]
+    mov [rbx], al
+    inc rbx
+    inc edx
+    jmp .it8p_cp
+.it8p_pad:
+    pop rcx
+    mov edx, ecx
+    and edx, 3
+    jz .it8p_send
+    mov eax, 4
+    sub eax, edx
+.it8p_pl:
+    mov byte [rbx], 0
+    inc rbx
+    dec eax
+    jnz .it8p_pl
+.it8p_send:
+    mov rdx, rbx
+    lea rsi, [tmp_buf]
+    sub rdx, rsi
+    call x11_buffer
+    inc dword [x11_seq]
+    pop rbx
+    pop rdx
+    pop rcx
+    ret
+
 ; ══════════════════════════════════════════════════════════════════════
-; Render: clear bar with bg, then ImageText8 each segment left-to-right.
-; Uses fixed CHAR_WIDTH for placement; no measurement of glyph widths
-; (acceptable for the "fixed" font which is monospace-ish).
+; Render: draw to off-screen Pixmap, then CopyArea Pixmap → Window in
+; a single request. Skipped entirely when strip_dirty == 0.
+;
+; Any segment whose drain_segment_pipe flagged dirty also aggregates
+; into strip_dirty; Expose events set it; segment fork does too.
 ; ══════════════════════════════════════════════════════════════════════
 render_strip:
+    cmp byte [strip_dirty], 0
+    je .rs_skip
     push rbx
     push r12
     push r13
 
-    ; PolyFillRectangle(window, gc, [{0,0,W,H}]) to clear the bar.
+    ; PolyFillRectangle on pixmap to clear it.
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_POLY_FILL_RECT
     mov byte [rdi+1], 0
     mov word [rdi+2], 5
-    mov eax, [window_id]
+    mov eax, [pixmap_id]
     mov [rdi+4], eax
     mov eax, [gc_id]
     mov [rdi+8], eax
@@ -724,35 +833,63 @@ render_strip:
     call x11_buffer
     inc dword [x11_seq]
 
-    ; Walk segments: render text concatenated with single space sep.
+    ; Walk segments: render text concatenated with single-space separator.
     mov r12d, 4                           ; running x in pixels
     xor ebx, ebx
 .rs_loop:
     cmp ebx, [segment_count]
-    jge .rs_done
+    jge .rs_copy
     mov rax, rbx
     imul rax, SEG_STRIDE_REAL
     lea r13, [segments + rax]
     movzx ecx, byte [r13 + SEG_OFF_OUT_LEN]
     test ecx, ecx
-    jz .rs_next                           ; empty — skip
+    jz .rs_next
     mov edi, r12d
     mov esi, DEFAULT_FONT_BASELINE
     lea rdx, [r13 + SEG_OFF_OUTPUT]
-    call image_text8
-    ; Advance x by char_width * (output_len + 1) (1 for separator space)
+    call image_text8_pixmap
     movzx eax, byte [r13 + SEG_OFF_OUT_LEN]
     inc eax
     imul eax, CHAR_WIDTH
     add r12d, eax
+    ; Reset per-segment dirty bit (aggregate on strip_dirty already covers it).
+    mov byte [r13 + SEG_OFF_FLAGS], 0
 .rs_next:
     inc ebx
     jmp .rs_loop
-.rs_done:
+
+.rs_copy:
+    ; CopyArea(src=pixmap, dst=window, gc, src(0,0), dst(0,0), w, h).
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_COPY_AREA
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 7
+    mov eax, [pixmap_id]
+    mov [rdi+4], eax
+    mov eax, [window_id]
+    mov [rdi+8], eax
+    mov eax, [gc_id]
+    mov [rdi+12], eax
+    mov word [rdi+16], 0
+    mov word [rdi+18], 0
+    mov word [rdi+20], 0
+    mov word [rdi+22], 0
+    movzx eax, word [x11_screen_width]
+    mov [rdi+24], ax
+    movzx eax, word [strip_height]
+    mov [rdi+26], ax
+    lea rsi, [tmp_buf]
+    mov rdx, 28
+    call x11_buffer
+    inc dword [x11_seq]
     call x11_flush
+    mov byte [strip_dirty], 0
+
     pop r13
     pop r12
     pop rbx
+.rs_skip:
     ret
 
 ; edi = x, esi = y, rdx = ptr to text; assumes text terminates at NUL

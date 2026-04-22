@@ -182,5 +182,6 @@ master_ratio     = 50
 # pin 9 1                        # WS 9 also lives on external
 
 # === Autostart ===
+exec strip                                           # the status bar
 exec feh --bg-fill /home/geir/setup/wallpapers/blue.png
 exec nm-applet
