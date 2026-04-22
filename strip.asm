@@ -48,7 +48,8 @@
 ; ══════════════════════════════════════════════════════════════════════
 ; Defaults
 ; ══════════════════════════════════════════════════════════════════════
-%define DEFAULT_HEIGHT  20
+%define DEFAULT_HEIGHT  22
+%define DEFAULT_TOP_OFFSET 10        ; matches tile's default bar_height
 %define DEFAULT_BG      0x000000
 %define DEFAULT_FG      0xCCCCCC
 
@@ -130,11 +131,11 @@ _start:
     call x11_parse_setup
 
     ; Defaults — phase 2b will override via ~/.striprc.
+    ; Strip sits at the very top of output 0; tile reserves the same
+    ; height via its `strip_height` config so its own row-of-squares
+    ; bar lands immediately below us.
     mov word [strip_height], DEFAULT_HEIGHT
-    movzx eax, word [x11_screen_height]
-    movzx ecx, word [strip_height]
-    sub eax, ecx
-    mov [strip_y], ax
+    mov word [strip_y], 0
 
     call open_core_font
     call create_strip_window

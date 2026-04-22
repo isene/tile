@@ -496,6 +496,12 @@ cfg_ws_populated:        resd 1
 ; active client.
 cfg_gap_inner:           resw 1
 
+; Vertical pixels reserved at the top of output 0 for the strip status
+; bar (a separate binary). Tile's row-of-squares lands immediately
+; below this; managed-window geometry then reserves
+; (cfg_strip_height + bar_height) at the top. 0 = no strip running.
+cfg_strip_height:        resw 1
+
 ; Focus-border state. Every managed window gets a 1px border (width
 ; configurable). The currently-focused window's border is drawn in
 ; cfg_border_focused; everyone else gets cfg_border_unfocused. Border
@@ -698,6 +704,7 @@ _start:
     mov dword [cfg_ws_populated], 0x555555
     mov byte [cfg_tab_palette_count], 0
     mov word [cfg_gap_inner], 0
+    mov word [cfg_strip_height], 0
     mov byte [cfg_border_width], DEFAULT_BORDER_WIDTH
     mov dword [cfg_border_focused], DEFAULT_BORDER_FOCUSED
     mov dword [cfg_border_unfocused], DEFAULT_BORDER_UNFOCUSED
@@ -1638,14 +1645,15 @@ configure_client_for_workspace:
     movzx ecx, word [output_w + r13*2]     ; ow
     movzx edx, word [output_h + r13*2]     ; oh
 
-    ; Reserve bar height only on the bar's home output (output 0).
-    ; Other outputs use their full height. This keeps the bar from
-    ; eating pixels out of the external monitor's geometry.
+    ; Reserve (strip + bar) only on the bar's home output (output 0).
+    ; Other outputs use their full height.
     movzx eax, word [bar_height]
+    movzx edi, word [cfg_strip_height]
+    add eax, edi                           ; strip + bar
     test r13d, r13d
     jnz .ccfw_no_bar
-    add r15d, eax                          ; oy += bar
-    sub edx, eax                           ; oh -= bar
+    add r15d, eax                          ; oy += reserved
+    sub edx, eax                           ; oh -= reserved
 .ccfw_no_bar:
 
     ; Apply inner gap on all four sides.
@@ -2466,6 +2474,8 @@ resize_bar_to_output0:
     movzx eax, word [output_x]
     mov [rdi+12], eax
     movzx eax, word [output_y]
+    movzx ecx, word [cfg_strip_height]
+    add eax, ecx                          ; tile bar lands below strip
     mov [rdi+16], eax
     movzx eax, word [output_w]
     mov [rdi+20], eax
@@ -3599,6 +3609,8 @@ apply_workspace_layout:
     test r14d, r14d
     jnz .awl_no_bar
     movzx eax, word [bar_height]
+    movzx edi, word [cfg_strip_height]
+    add eax, edi                          ; reserve strip + bar
     add edx, eax
     sub r12d, eax
 .awl_no_bar:
@@ -5475,6 +5487,11 @@ apply_setting:
     call .as_streq
     test eax, eax
     jnz .as_master_ratio
+    mov rdi, r13
+    lea rsi, [.as_kw_strip_height]
+    call .as_streq
+    test eax, eax
+    jnz .as_strip_height
     jmp .as_done
 
 .as_bar_height:
@@ -5548,6 +5565,11 @@ apply_setting:
 .as_mr_ok:
     mov [cfg_master_ratio], al
     jmp .as_done
+.as_strip_height:
+    mov rdi, r12
+    call parse_decimal_byte
+    mov [cfg_strip_height], ax
+    jmp .as_done
 .as_done:
     pop r13
     pop rbx
@@ -5586,6 +5608,7 @@ apply_setting:
 .as_kw_border_focused:  db "border_focused", 0
 .as_kw_border_unfocused: db "border_unfocused", 0
 .as_kw_master_ratio:    db "master_ratio", 0
+.as_kw_strip_height:    db "strip_height", 0
 
 ; rdi = NUL-terminated string starting with optional '#' then 6 hex
 ; digits. Returns CARD32 0x00RRGGBB in eax. Garbage in → 0 in eax.
@@ -5767,7 +5790,9 @@ create_bar:
     movzx eax, word [output_x]
     mov [rdi+12], ax                      ; x = output_x[0]
     movzx eax, word [output_y]
-    mov [rdi+14], ax                      ; y = output_y[0]
+    movzx ecx, word [cfg_strip_height]
+    add eax, ecx                          ; tile bar lands below strip
+    mov [rdi+14], ax                      ; y
     movzx eax, word [output_w]
     mov [rdi+16], ax                      ; width = output_w[0]
     movzx eax, word [bar_height]
