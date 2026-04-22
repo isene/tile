@@ -36,6 +36,14 @@
 #                            scratchpad — pushes onto a small LIFO)
 #   unstash                  pop the most-recently-stashed window back
 #                            onto the current workspace
+#   layout tabbed            current workspace shows one window at a time
+#                            (the active tab); navigate with focus
+#                            next-tab / prev-tab
+#   layout split-h           current workspace shows ALL its windows
+#                            side-by-side in equal-width vertical strips
+#   layout split-v           current workspace shows ALL its windows
+#                            stacked in equal-height horizontal strips
+#   layout toggle            cycle TABBED → SPLIT_H → SPLIT_V → TABBED
 
 # === Spawn ===
 bind Mod4+Return        exec glass
@@ -88,6 +96,12 @@ bind Mod4+c             tab-color-cycle
 # === Stash (replaces i3's scratchpad) ===
 bind Mod4+i             stash
 bind Mod4+o             unstash
+
+# === Layout (tabbed / split) ===
+bind Mod4+Tab           layout toggle
+bind Mod4+t             layout tabbed
+bind Mod4+h             layout split-h
+bind Mod4+v             layout split-v
 
 # === Lock screen ===
 bind Mod4+Escape        exec i3lock -c 000000

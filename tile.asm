@@ -136,8 +136,23 @@
 %define ACT_TAB_COLOR   8
 %define ACT_STASH       9
 %define ACT_UNSTASH     10
+%define ACT_LAYOUT      11
 
 %define MAX_STASH       8
+
+; Per-workspace layouts. Phase 1b.3b uses a flat single-level model:
+; a workspace is in exactly one layout at a time, no nested containers.
+; Covers the user's 98%-tabbed / 2%-split workflow without dragging in
+; full container-tree complexity.
+%define LAYOUT_TABBED   0
+%define LAYOUT_SPLIT_H  1
+%define LAYOUT_SPLIT_V  2
+
+; ACT_LAYOUT arg_int sentinels — mirror the workspace pattern.
+%define LAY_SET_TABBED  1
+%define LAY_SET_SPLIT_H 2
+%define LAY_SET_SPLIT_V 3
+%define LAY_TOGGLE      0xff
 
 ; Bar (the row-of-squares strip at the top of the screen).
 %define DEFAULT_BAR_HEIGHT      10
@@ -325,7 +340,21 @@ action_table:
     db ACT_STASH, 0
     db "unstash", 0
     db ACT_UNSTASH, 0
+    db "layout", 0
+    db ACT_LAYOUT, 0
     db 0                       ; terminator
+
+; layout arg keyword table: `layout tabbed | split-h | split-v | toggle`.
+layout_arg_table:
+    db "tabbed", 0
+    db LAY_SET_TABBED, 0
+    db "split-h", 0
+    db LAY_SET_SPLIT_H, 0
+    db "split-v", 0
+    db LAY_SET_SPLIT_V, 0
+    db "toggle", 0
+    db LAY_TOGGLE, 0
+    db 0
 
 ; Focus arg keyword table for `focus <direction>`.
 focus_arg_table:
@@ -447,6 +476,10 @@ ws_pinned_output:        resb WS_COUNT
 ; workspace (used for "what does kill act on", "where does a new
 ; client land", etc.).
 output_current_ws:       resb MAX_OUTPUTS
+
+; Per-workspace layout (LAYOUT_TABBED / LAYOUT_SPLIT_H / LAYOUT_SPLIT_V).
+; Default 0 = TABBED.
+ws_layout:               resb WS_COUNT
 
 ; Stash: a small LIFO of "hidden" client XIDs. `stash` unmaps the
 ; currently focused tab and pushes its XID; `unstash` pops and
@@ -2041,10 +2074,12 @@ find_top_of_workspace:
     ret
 
 ; eax = new XID. Make it the active tab on the current workspace.
-; Unmaps the previously-active XID and maps the new one ON THE
-; OUTPUT this workspace is pinned to. Does not touch any other
-; output — so a different workspace currently visible on a different
-; output (e.g. WS 10 on the external) is left alone.
+; In TABBED layout only the active is visible, so we unmap the
+; previous active and map the new one (only if the workspace is
+; currently shown on its output). In SPLIT layouts every client on
+; the workspace is mapped simultaneously, so we just update state
+; and re-apply the layout to slot the (possibly-new) client into
+; the side-by-side strip arrangement.
 ;
 ; Idempotent if eax already equals the workspace's active XID.
 set_active_tab:
@@ -2060,33 +2095,45 @@ set_active_tab:
     mov ebx, [ws_active_xid + rcx*4]
     cmp ebx, r12d
     je .sat_done
-    ; Update workspace state.
     mov [ws_active_xid + rcx*4], r12d
-    ; If this workspace is currently visible on its output, swap the
-    ; visible window. Otherwise (workspace is not on-screen anywhere),
-    ; just record the new active and don't touch X.
+
+    ; Find the workspace's pinned output and check visibility.
     mov eax, r13d
     dec eax
     movzx edi, byte [ws_pinned_output + rax]
+    cmp dil, byte [output_count]
+    jge .sat_render
     movzx eax, byte [output_current_ws + rdi]
     cmp eax, r13d
-    jne .sat_no_swap
-    ; Unmap old visible.
+    jne .sat_render             ; workspace not on screen — record only
+
+    ; Branch on workspace layout.
+    movzx eax, byte [ws_layout + r13 - 1]
+    test eax, eax
+    jnz .sat_split
+    ; ----- TABBED: unmap old, map new, focus new -----
     test ebx, ebx
-    jz .sat_skip_unmap
+    jz .sat_t_map
     mov eax, ebx
     call find_client_index
     cmp eax, -1
-    je .sat_skip_unmap
+    je .sat_t_map
     mov byte [client_unmap_expected + rax], 1
     mov eax, ebx
     call send_unmap_window
-.sat_skip_unmap:
+.sat_t_map:
     mov eax, r12d
     call send_map_window
     mov eax, r12d
     call set_input_focus
-.sat_no_swap:
+    jmp .sat_render
+.sat_split:
+    ; ----- SPLIT: re-apply layout (handles new client + re-slice) -----
+    mov eax, r13d
+    call apply_workspace_layout
+    mov eax, r12d
+    call set_input_focus
+.sat_render:
     call render_bar
     call x11_flush
 .sat_done:
@@ -2095,13 +2142,46 @@ set_active_tab:
     pop rbx
     ret
 
+; eax = workspace number. Unmaps every client mapped on the workspace.
+; In TABBED only the active was mapped; in SPLIT all clients were.
+; Always safe to call — UnmapWindow on an already-unmapped window
+; is a no-op on the wire and the resulting UnmapNotify is filtered
+; out via client_unmap_expected.
+hide_workspace_clients:
+    push rbx
+    push r12
+    test eax, eax
+    jz .hwc_done
+    mov r12d, eax                       ; ws number
+    xor ebx, ebx
+.hwc_loop:
+    cmp ebx, [client_count]
+    jge .hwc_done
+    movzx eax, byte [client_ws + rbx]
+    cmp eax, r12d
+    jne .hwc_next
+    mov byte [client_unmap_expected + rbx], 1
+    mov eax, [client_xids + rbx*4]
+    call send_unmap_window
+.hwc_next:
+    inc ebx
+    jmp .hwc_loop
+.hwc_done:
+    pop r12
+    pop rbx
+    ret
+
 ; eax = XID that has been destroyed or unmapped client-initiated.
 ; Untracks it, then for any workspace whose active tab pointed at the
-; dying XID, elects a new top. If that workspace is currently visible
-; on its output, map+focus the new top.
+; dying XID, elects a new top and (if that workspace is visible on
+; its pinned output) re-applies the workspace's layout. In TABBED
+; mode the new active becomes mapped; in SPLIT modes the remaining
+; clients re-slice to fill the freed strip. Steals keyboard focus
+; only if the dying window's workspace matches the global current_ws.
 client_closed:
     push rbx
     push r12
+    push r13
     mov r12d, eax                ; the dying XID
     mov eax, r12d
     call untrack_client
@@ -2109,16 +2189,30 @@ client_closed:
 .cc_loop:
     cmp ebx, WS_COUNT
     jge .cc_done
+    mov r13d, 0                  ; r13 = "this ws was affected"
     cmp [ws_active_xid + rbx*4], r12d
-    jne .cc_next
-    ; Stale — re-elect on this workspace (ebx+1 is the workspace number).
+    jne .cc_check_split
+    ; Active was the dying XID — re-elect.
     mov eax, ebx
     inc eax
     call find_top_of_workspace
     mov [ws_active_xid + rbx*4], eax
+    mov r13d, 1
+.cc_check_split:
+    ; If workspace is in SPLIT mode, ANY client departure changes the
+    ; layout (remaining strips need to expand).
+    movzx eax, byte [ws_layout + rbx]
     test eax, eax
-    jz .cc_next                  ; workspace now empty
-    ; Is this workspace currently visible on its pinned output?
+    jz .cc_decide
+    ; Was the dying client on this ws? workspace_populated already
+    ; decremented in untrack_client; if any client of this ws still
+    ; lives, we should re-slice. Heuristic: if populated > 0 OR ws
+    ; was just emptied, mark affected.
+    mov r13d, 1
+.cc_decide:
+    test r13d, r13d
+    jz .cc_next
+    ; Is this workspace visible on its pinned output?
     movzx edx, byte [ws_pinned_output + rbx]
     cmp dl, byte [output_count]
     jge .cc_next
@@ -2126,16 +2220,16 @@ client_closed:
     mov edx, ebx
     inc edx                      ; ws number
     cmp ecx, edx
-    jne .cc_next                 ; not visible — stays hidden
-    push rax
-    call send_map_window
-    pop rax
-    ; Only steal keyboard focus if this is the GLOBAL current_ws —
-    ; don't yank focus away from the laptop just because a window
-    ; closed on the external.
+    jne .cc_next                 ; not visible
+    mov eax, edx
+    call apply_workspace_layout
+    ; Re-focus the new active if this is the global current_ws.
     movzx ecx, byte [current_ws]
     cmp ecx, edx
     jne .cc_next
+    mov eax, [ws_active_xid + rbx*4]
+    test eax, eax
+    jz .cc_next
     call set_input_focus
 .cc_next:
     inc ebx
@@ -2143,6 +2237,7 @@ client_closed:
 .cc_done:
     call render_bar
     call x11_flush
+    pop r13
     pop r12
     pop rbx
     ret
@@ -2302,6 +2397,8 @@ dispatch_keypress:
     je .dk_stash
     cmp eax, ACT_UNSTASH
     je .dk_unstash
+    cmp eax, ACT_LAYOUT
+    je .dk_layout
     jmp .dk_done
 .dk_exec:
     test edx, edx
@@ -2374,6 +2471,10 @@ dispatch_keypress:
     jmp .dk_done
 .dk_unstash:
     call action_unstash
+    jmp .dk_done
+.dk_layout:
+    mov edi, esi                          ; sentinel/value in arg_int
+    call action_layout
     jmp .dk_done
 .dk_skip:
     inc ebx
@@ -2490,45 +2591,26 @@ switch_workspace:
     xor r14d, r14d
 .sw_have_output:
 
-    ; If target ws is already shown on its output, skip the swap.
+    ; If target ws is already shown on its output, skip the visibility
+    ; swap and just refocus.
     movzx eax, byte [output_current_ws + r14]
     cmp eax, r12d
     je .sw_just_focus
 
-    ; Compute old visible XID on the target's output.
-    movzx ecx, byte [output_current_ws + r14]
-    test ecx, ecx
-    jz .sw_no_old_visible
-    dec ecx
-    mov ebx, [ws_active_xid + rcx*4]
-    jmp .sw_have_old
-.sw_no_old_visible:
-    xor ebx, ebx
-.sw_have_old:
-    ; Compute new visible XID.
-    mov ecx, r12d
-    dec ecx
-    mov r15d, [ws_active_xid + rcx*4]
-    cmp ebx, r15d
-    je .sw_update_state
-    ; Unmap old.
-    test ebx, ebx
-    jz .sw_skip_unmap
-    mov eax, ebx
-    call find_client_index
-    cmp eax, -1
-    je .sw_skip_unmap
-    mov byte [client_unmap_expected + rax], 1
-    mov eax, ebx
-    call send_unmap_window
-.sw_skip_unmap:
-    ; Map new.
-    test r15d, r15d
-    jz .sw_update_state
-    mov eax, r15d
-    call send_map_window
-.sw_update_state:
+    ; Hide everything on the workspace currently visible on this
+    ; output (could be a tabbed single window or a split-mode set).
+    movzx eax, byte [output_current_ws + r14]
+    test eax, eax
+    jz .sw_no_old_hide
+    call hide_workspace_clients
+.sw_no_old_hide:
+
+    ; Make the target workspace visible: update output state then
+    ; apply the target's layout (which configures and maps every
+    ; client that should be on screen).
     mov [output_current_ws + r14], r12b
+    mov eax, r12d
+    call apply_workspace_layout
 .sw_just_focus:
     ; Focus the target workspace's active tab if any.
     mov ecx, r12d
@@ -2726,6 +2808,322 @@ move_focused_to_workspace:
     pop r14
     pop r13
     pop r12
+    pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Layouts (phase 1b.3b)
+;
+; Each workspace has a single layout: TABBED, SPLIT_H, or SPLIT_V.
+; In TABBED mode only the workspace's active tab is mapped — the rest
+; are unmapped and the bar's tab squares serve as the navigation UI.
+; In SPLIT_H / SPLIT_V mode every client on the workspace is mapped
+; simultaneously, sliced into equal-width or equal-height strips of
+; the workspace's pinned output's rectangle (minus bar reservation
+; on output 0 and minus inner gap all around).
+;
+; apply_workspace_layout(ws) is the single source of truth for "what
+; should be mapped where" on a given workspace. Call it whenever the
+; workspace's window set, layout, active tab, or visibility changes.
+; The function is a no-op if the workspace isn't currently visible
+; on its pinned output.
+; ══════════════════════════════════════════════════════════════════════
+
+; rdi = window XID, esi = x, edx = y, ecx = w, r8d = h.
+; Sends a single ConfigureWindow with all four geometry values.
+configure_window_rect:
+    push rbx
+    mov rbx, rdi                          ; preserve XID across x11_buffer
+    push rax
+    push rsi
+    push rdx
+    push rcx
+    push r8
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CONFIGURE_WINDOW
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 7
+    mov [rdi+4], ebx
+    mov word [rdi+8], CFG_X | CFG_Y | CFG_WIDTH | CFG_HEIGHT
+    mov word [rdi+10], 0
+    pop r8
+    pop rcx
+    pop rdx
+    pop rsi
+    pop rax
+    mov [rdi+12], esi                     ; x
+    mov [rdi+16], edx                     ; y
+    mov [rdi+20], ecx                     ; w
+    mov [rdi+24], r8d                     ; h
+    lea rsi, [tmp_buf]
+    mov rdx, 28
+    call x11_buffer
+    inc dword [x11_seq]
+    pop rbx
+    ret
+
+; eax = workspace number (1..WS_COUNT). Reapplies the workspace's
+; layout: configures and maps every client that should be visible,
+; unmaps any that shouldn't. No-op if the workspace isn't currently
+; on any output. Safe to call repeatedly.
+apply_workspace_layout:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    test eax, eax
+    jz .awl_done
+    cmp eax, WS_COUNT
+    jg .awl_done
+    mov r13d, eax                         ; r13 = ws number
+
+    ; Find the output this workspace is pinned to and check whether
+    ; the workspace is currently visible there.
+    mov ecx, r13d
+    dec ecx
+    movzx r14d, byte [ws_pinned_output + rcx]
+    cmp r14b, byte [output_count]
+    jge .awl_done
+    movzx eax, byte [output_current_ws + r14]
+    cmp eax, r13d
+    jne .awl_done                         ; not visible — nothing to do
+
+    ; Compute the workspace area on its output: full output rect
+    ; minus bar reservation (only on output 0) minus inner gap on
+    ; all four sides.
+    movzx esi, word [output_x + r14*2]    ; ax_x
+    movzx edx, word [output_y + r14*2]    ; ax_y
+    movzx ecx, word [output_w + r14*2]    ; ax_w
+    movzx r12d, word [output_h + r14*2]   ; ax_h
+    test r14d, r14d
+    jnz .awl_no_bar
+    movzx eax, word [bar_height]
+    add edx, eax
+    sub r12d, eax
+.awl_no_bar:
+    movzx eax, word [cfg_gap_inner]
+    add esi, eax
+    add edx, eax
+    mov edi, eax
+    shl edi, 1
+    sub ecx, edi
+    sub r12d, edi
+    ; r15 layout: pack into 4 dwords on stack — easier as locals via the registers above.
+    ; Save: ws_x = esi, ws_y = edx, ws_w = ecx, ws_h = r12d.
+
+    ; Branch on layout.
+    movzx eax, byte [ws_layout + r13 - 1]
+    cmp eax, LAYOUT_SPLIT_H
+    je .awl_split_h
+    cmp eax, LAYOUT_SPLIT_V
+    je .awl_split_v
+
+    ; ----------- TABBED layout: single visible window ------------
+    ; Walk all clients on ws. Configure & map the active one;
+    ; unmap any others that are still mapped.
+    push rsi                              ; ws_x
+    push rdx                              ; ws_y
+    push rcx                              ; ws_w
+    push r12                              ; ws_h
+    mov ecx, r13d
+    dec ecx
+    mov r15d, [ws_active_xid + rcx*4]     ; r15 = active XID (may be 0)
+    xor ebx, ebx
+.awl_t_loop:
+    cmp ebx, [client_count]
+    jge .awl_t_done
+    movzx eax, byte [client_ws + rbx]
+    cmp eax, r13d
+    jne .awl_t_next
+    mov eax, [client_xids + rbx*4]
+    cmp eax, r15d
+    je .awl_t_show
+    ; Hide non-active client (it might have been visible if we just
+    ; switched out of split mode).
+    mov byte [client_unmap_expected + rbx], 1
+    call send_unmap_window
+    jmp .awl_t_next
+.awl_t_show:
+    mov rdi, rax
+    mov esi, [rsp + 24]                   ; ws_x  (after 4 pushes)
+    mov edx, [rsp + 16]                   ; ws_y
+    mov ecx, [rsp + 8]                    ; ws_w
+    mov r8d, [rsp + 0]                    ; ws_h
+    call configure_window_rect
+    call send_map_window
+.awl_t_next:
+    inc ebx
+    jmp .awl_t_loop
+.awl_t_done:
+    pop r12
+    pop rcx
+    pop rdx
+    pop rsi
+    jmp .awl_render
+
+    ; ----------- SPLIT_H layout: equal-width vertical strips ------------
+.awl_split_h:
+    push rsi                              ; ws_x
+    push rdx                              ; ws_y
+    push rcx                              ; ws_w
+    push r12                              ; ws_h
+    movzx eax, byte [workspace_populated + r13 - 1]
+    test eax, eax
+    jz .awl_sh_done
+    mov r15d, eax                         ; r15 = N
+    xor ebx, ebx                          ; client iterator
+    xor ebp, ebp                          ; visible-index in ws
+.awl_sh_loop:
+    cmp ebx, [client_count]
+    jge .awl_sh_done
+    movzx eax, byte [client_ws + rbx]
+    cmp eax, r13d
+    jne .awl_sh_next
+    ; Compute strip rect: x = ws_x + idx * (ws_w / N); w = ws_w / N
+    ; Round to keep strips uniform; final strip absorbs remainder.
+    mov eax, [rsp + 8]                    ; ws_w
+    xor edx, edx
+    div r15d
+    mov ecx, eax                          ; strip_w = ws_w / N
+    mov eax, ebp
+    imul eax, ecx                         ; idx * strip_w
+    add eax, [rsp + 24]                   ; + ws_x
+    mov esi, eax                          ; rect.x
+    ; Last strip absorbs remainder (so right edge meets ws_x + ws_w).
+    mov edi, ebp
+    inc edi
+    cmp edi, r15d
+    jne .awl_sh_have_w
+    ; Last: w = ws_x + ws_w - rect.x
+    mov ecx, [rsp + 24]
+    add ecx, [rsp + 8]
+    sub ecx, esi
+.awl_sh_have_w:
+    mov edx, [rsp + 16]                   ; rect.y = ws_y
+    mov r8d, [rsp + 0]                    ; rect.h = ws_h
+    mov edi, [client_xids + rbx*4]
+    call configure_window_rect
+    mov eax, [client_xids + rbx*4]
+    call send_map_window
+    inc ebp
+.awl_sh_next:
+    inc ebx
+    jmp .awl_sh_loop
+.awl_sh_done:
+    pop r12
+    pop rcx
+    pop rdx
+    pop rsi
+    jmp .awl_render
+
+    ; ----------- SPLIT_V layout: equal-height horizontal strips ----------
+.awl_split_v:
+    push rsi                              ; ws_x
+    push rdx                              ; ws_y
+    push rcx                              ; ws_w
+    push r12                              ; ws_h
+    movzx eax, byte [workspace_populated + r13 - 1]
+    test eax, eax
+    jz .awl_sv_done
+    mov r15d, eax                         ; N
+    xor ebx, ebx
+    xor ebp, ebp
+.awl_sv_loop:
+    cmp ebx, [client_count]
+    jge .awl_sv_done
+    movzx eax, byte [client_ws + rbx]
+    cmp eax, r13d
+    jne .awl_sv_next
+    mov eax, [rsp + 0]                    ; ws_h
+    xor edx, edx
+    div r15d
+    mov r8d, eax                          ; strip_h
+    mov eax, ebp
+    imul eax, r8d                         ; idx * strip_h
+    add eax, [rsp + 16]                   ; + ws_y
+    mov edx, eax                          ; rect.y
+    mov edi, ebp
+    inc edi
+    cmp edi, r15d
+    jne .awl_sv_have_h
+    mov r8d, [rsp + 16]
+    add r8d, [rsp + 0]
+    sub r8d, edx
+.awl_sv_have_h:
+    mov esi, [rsp + 24]                   ; rect.x = ws_x
+    mov ecx, [rsp + 8]                    ; rect.w = ws_w
+    mov edi, [client_xids + rbx*4]
+    call configure_window_rect
+    mov eax, [client_xids + rbx*4]
+    call send_map_window
+    inc ebp
+.awl_sv_next:
+    inc ebx
+    jmp .awl_sv_loop
+.awl_sv_done:
+    pop r12
+    pop rcx
+    pop rdx
+    pop rsi
+
+.awl_render:
+    call render_bar
+    call x11_flush
+.awl_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; edi = layout sentinel (LAY_SET_TABBED / SPLIT_H / SPLIT_V / TOGGLE).
+; Sets the current workspace's layout and reapplies. TOGGLE cycles
+; TABBED → SPLIT_H → SPLIT_V → TABBED.
+action_layout:
+    push rbx
+    movzx eax, byte [current_ws]
+    test eax, eax
+    jz .al_done
+    mov ebx, eax                          ; ws number
+
+    cmp edi, LAY_TOGGLE
+    jne .al_set
+    movzx eax, byte [ws_layout + rbx - 1]
+    inc eax
+    cmp eax, 3
+    jl .al_store
+    xor eax, eax
+    jmp .al_store
+.al_set:
+    cmp edi, LAY_SET_TABBED
+    je .al_have
+    cmp edi, LAY_SET_SPLIT_H
+    je .al_have
+    cmp edi, LAY_SET_SPLIT_V
+    je .al_have
+    jmp .al_done
+.al_have:
+    mov eax, edi
+    dec eax                               ; sentinel - 1 → enum
+.al_store:
+    mov [ws_layout + rbx - 1], al
+    mov eax, ebx
+    call apply_workspace_layout
+    ; If we just switched OUT of a split (back to tabbed), focus the
+    ; active tab so the keyboard goes to the visible window.
+    movzx eax, byte [ws_layout + rbx - 1]
+    test eax, eax
+    jnz .al_done
+    mov ecx, ebx
+    dec ecx
+    mov eax, [ws_active_xid + rcx*4]
+    test eax, eax
+    jz .al_done
+    call set_input_focus
+    call x11_flush
+.al_done:
     pop rbx
     ret
 
@@ -3146,6 +3544,8 @@ parse_config_line:
     je .pcl_arg_focus
     cmp ecx, ACT_MOVE_TAB
     je .pcl_arg_mtab
+    cmp ecx, ACT_LAYOUT
+    je .pcl_arg_layout
     ; kill / exit / unknown — no arg.
     xor edx, edx
     xor r8b, r8b
@@ -3211,6 +3611,19 @@ parse_config_line:
     je .pcl_pop_mod_done
     mov rdi, r12
     lea rdx, [mtab_arg_table]
+    call lookup_packed_byte
+    test eax, eax
+    jz .pcl_pop_mod_done
+    mov r8b, al
+    xor edx, edx
+    jmp .pcl_emit
+.pcl_arg_layout:
+    call .pcl_skip_ws
+    mov al, [r12]
+    test al, al
+    je .pcl_pop_mod_done
+    mov rdi, r12
+    lea rdx, [layout_arg_table]
     call lookup_packed_byte
     test eax, eax
     jz .pcl_pop_mod_done
