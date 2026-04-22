@@ -1363,16 +1363,38 @@ event_loop:
     jmp event_loop
 
 .ev_configure_request:
-    ; A managed client is asking to resize. Look up its workspace and
-    ; force the fullscreen geometry of THAT workspace's pinned output
-    ; — we don't honour the requested size, but we do honour the
-    ; correct screen for the client's workspace.
+    ; A managed client is asking to resize. Behaviour depends on the
+    ; client's workspace layout:
+    ;   TABBED  → re-confirm fullscreen-of-output (the same geometry
+    ;             we already gave it; clients sometimes ask for it
+    ;             after their own internal events).
+    ;   SPLIT_* → re-apply the workspace's split layout so the
+    ;             requesting client doesn't get its self-requested
+    ;             "go full screen" wish granted on top of our slice.
+    ; Unknown clients (untracked) get TABBED-style fullscreen on the
+    ; current workspace as a sane default.
     mov eax, [x11_read_buf + 8]
     push rax
     call find_client_index
     cmp eax, -1
     je .ev_cr_default_ws
     movzx esi, byte [client_ws + rax]
+    pop rax
+    push rax
+    push rsi
+    mov ecx, esi
+    dec ecx
+    movzx ecx, byte [ws_layout + rcx]
+    test ecx, ecx
+    jz .ev_cr_tabbed
+    ; SPLIT_*: re-apply workspace layout, ignore the request's geometry.
+    pop rsi
+    pop rax
+    mov eax, esi
+    call apply_workspace_layout
+    jmp event_loop
+.ev_cr_tabbed:
+    pop rsi
     pop rax
     mov edi, eax
     call configure_client_for_workspace
@@ -2964,6 +2986,7 @@ apply_workspace_layout:
 
     ; ----------- SPLIT_H layout: equal-width vertical strips ------------
 .awl_split_h:
+    push rbp                              ; rbp is callee-saved
     push rsi                              ; ws_x
     push rdx                              ; ws_y
     push rcx                              ; ws_w
@@ -3015,10 +3038,12 @@ apply_workspace_layout:
     pop rcx
     pop rdx
     pop rsi
+    pop rbp
     jmp .awl_render
 
     ; ----------- SPLIT_V layout: equal-height horizontal strips ----------
 .awl_split_v:
+    push rbp                              ; rbp is callee-saved
     push rsi                              ; ws_x
     push rdx                              ; ws_y
     push rcx                              ; ws_w
@@ -3066,6 +3091,7 @@ apply_workspace_layout:
     pop rcx
     pop rdx
     pop rsi
+    pop rbp
 
 .awl_render:
     call render_bar
