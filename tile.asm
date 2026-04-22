@@ -232,6 +232,8 @@ tile_shell_pid_len equ 15
 ; XINERAMA extension name (uppercase per X11 convention).
 xinerama_name:    db "XINERAMA"
 xinerama_name_len equ 8
+randr_name:       db "RANDR"
+randr_name_len    equ 5
 
 ; Path suffixes
 tilerc_suffix:    db "/.tilerc", 0
@@ -524,12 +526,27 @@ cfg_master_ratio:        resb 1
 ; startup based on the user's wishes (default: WS 1..9 → output 0,
 ; WS 10 → output 1 if a secondary exists, else also output 0).
 xinerama_major:          resb 1
+
+; RandR is queried alongside Xinerama. We don't use RandR for output
+; discovery (Xinerama already gives us the right rectangles); RandR's
+; only job here is to deliver RRScreenChangeNotify events when monitors
+; come or go, so we can re-run discover_outputs without restarting tile.
+randr_major:             resb 1
+randr_event_base:        resb 1
+randr_present:           resb 1
 output_count:            resb 1
 output_x:                resw MAX_OUTPUTS
 output_y:                resw MAX_OUTPUTS
 output_w:                resw MAX_OUTPUTS
 output_h:                resw MAX_OUTPUTS
 ws_pinned_output:        resb WS_COUNT
+
+; User-supplied per-workspace output overrides from `pin N M` lines in
+; ~/.tilerc. 0xFF = no override (fall back to discover_outputs default);
+; any other value is the desired output index (clamped to output_count
+; after discovery). Filled during parse_config_line; applied in
+; apply_pin_overrides right after discover_outputs.
+ws_pin_override:         resb WS_COUNT
 
 ; Per-output state: which workspace is currently visible on each
 ; output. Allows the external monitor to keep showing WS 10 even
@@ -686,6 +703,11 @@ _start:
     mov dword [cfg_border_unfocused], DEFAULT_BORDER_UNFOCUSED
     mov dword [focused_xid], 0
     mov byte [cfg_master_ratio], DEFAULT_MASTER_RATIO
+    ; Initialise pin override table to "unset" (0xFF). load_config
+    ; will populate any explicit `pin N M` lines.
+    mov rax, 0xFFFFFFFFFFFFFFFF
+    mov [ws_pin_override], rax
+    mov word [ws_pin_override + 8], 0xFFFF
     call load_config
 
     ; Become the WM by selecting substructure-redirect on root.
@@ -703,6 +725,8 @@ _start:
     ; extension isn't present. After this returns, output_count is at
     ; least 1 and ws_pinned_output[] is initialised.
     call discover_outputs
+    call apply_pin_overrides
+    call randr_setup
 
     ; Resolve every bind's keysym to a keycode and grab them on root.
     call resolve_and_grab_binds
@@ -1448,7 +1472,18 @@ event_loop:
     je .ev_destroy_notify
     cmp al, EV_EXPOSE
     je .ev_expose
+    ; RandR ScreenChangeNotify? Only check if RandR was successfully set
+    ; up at startup (otherwise randr_event_base could collide with 0).
+    cmp byte [randr_present], 0
+    je .el_unknown
+    cmp al, byte [randr_event_base]
+    je .ev_rr_screen_change
+.el_unknown:
     ; Ignore anything else (MapNotify, ConfigureNotify, errors, replies).
+    jmp event_loop
+
+.ev_rr_screen_change:
+    call rediscover_outputs
     jmp event_loop
 
 .ev_expose:
@@ -2197,6 +2232,250 @@ discover_outputs:
     jl .do_pin_done
     mov byte [output_current_ws + 1], 10
 .do_pin_done:
+    pop rbx
+    ret
+
+; Walk ws_pin_override and overlay each set entry onto ws_pinned_output.
+; Indices >= output_count are clamped to 0 so a `pin N M` line with M
+; pointing at a not-yet-attached monitor still leaves the workspace
+; reachable on the laptop. Also recomputes output_current_ws so each
+; output's "currently visible" workspace stays consistent with the
+; override.
+apply_pin_overrides:
+    push rbx
+    push r12
+    movzx r12d, byte [output_count]
+    xor ebx, ebx
+.apo_loop:
+    cmp ebx, WS_COUNT
+    jge .apo_recompute
+    movzx eax, byte [ws_pin_override + rbx]
+    cmp eax, 0xFF
+    je .apo_next
+    cmp eax, r12d
+    jl .apo_set
+    xor eax, eax                          ; clamp to output 0
+.apo_set:
+    mov [ws_pinned_output + rbx], al
+.apo_next:
+    inc ebx
+    jmp .apo_loop
+.apo_recompute:
+    ; For each output, pick the lowest-numbered workspace pinned there
+    ; as the initial visible workspace. Output 0 always defaults to
+    ; WS 1 if nothing else is pinned (matches discover_outputs).
+    xor ebx, ebx
+.apo_out_loop:
+    cmp ebx, r12d
+    jge .apo_done
+    xor edx, edx                          ; running visible-ws (0 = none yet)
+    xor ecx, ecx
+.apo_scan:
+    cmp ecx, WS_COUNT
+    jge .apo_out_pick
+    movzx eax, byte [ws_pinned_output + rcx]
+    cmp eax, ebx
+    jne .apo_scan_next
+    test edx, edx
+    jnz .apo_scan_next
+    mov edx, ecx
+    inc edx                               ; ws number is 1-based
+.apo_scan_next:
+    inc ecx
+    jmp .apo_scan
+.apo_out_pick:
+    test edx, edx
+    jnz .apo_store
+    test ebx, ebx
+    jnz .apo_store_blank
+    mov edx, 1                            ; output 0 default = WS 1
+    jmp .apo_store
+.apo_store_blank:
+    xor edx, edx                          ; output >0 with nothing pinned: blank
+.apo_store:
+    mov [output_current_ws + rbx], dl
+    inc ebx
+    jmp .apo_out_loop
+.apo_done:
+    pop r12
+    pop rbx
+    ret
+
+; Query the RANDR extension and select RRScreenChangeNotify events on
+; root. After this returns, randr_present = 1 if randr is available;
+; randr_event_base is the base byte for randr events. event_loop
+; dispatches RR events to rediscover_outputs.
+randr_setup:
+    push rbx
+    lea rdi, [randr_name]
+    mov esi, randr_name_len
+    call query_extension
+    test eax, eax
+    jz .rrs_done
+    mov [randr_major], al
+    movzx eax, byte [x11_read_buf + 10]   ; first_event byte (set by query_extension's reply)
+    mov [randr_event_base], al
+    mov byte [randr_present], 1
+    ; RRSelectInput(window=root, mask=RRScreenChangeNotifyMask=1)
+    lea rdi, [tmp_buf]
+    movzx eax, byte [randr_major]
+    mov [rdi], al
+    mov byte [rdi+1], 4                   ; RRSelectInput sub-opcode
+    mov word [rdi+2], 3                   ; length = 3 words
+    mov eax, [x11_root_window]
+    mov [rdi+4], eax
+    mov word [rdi+8], 1                   ; mask = ScreenChangeNotify
+    mov word [rdi+10], 0
+    lea rsi, [tmp_buf]
+    mov rdx, 12
+    call x11_buffer
+    inc dword [x11_seq]
+    call x11_flush
+.rrs_done:
+    pop rbx
+    ret
+
+; Re-run Xinerama QueryScreens after a hot-plug, re-apply pin
+; overrides, resize the bar to output 0's new geometry, and re-apply
+; every visible workspace's layout. Uses read_reply_or_queue so events
+; arriving on the wire while we wait for the reply aren't lost.
+; Safe to call from inside event_loop dispatch.
+rediscover_outputs:
+    push rbx
+    push r12
+    push r13
+    push r14
+    cmp byte [xinerama_major], 0
+    je .rdo_done                          ; no Xinerama, can't refresh
+
+    ; Send Xinerama QueryScreens (sub-opcode 5).
+    call x11_flush
+    lea rdi, [tmp_buf]
+    movzx eax, byte [xinerama_major]
+    mov [rdi], al
+    mov byte [rdi+1], XIN_QUERY_SCREENS
+    mov word [rdi+2], 1
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 4
+    syscall
+    inc dword [x11_seq]
+
+    ; Reply header read via the event-safe path.
+    lea rdi, [tmp_buf + 1024]
+    call read_reply_or_queue
+    test eax, eax
+    jz .rdo_done
+
+    mov ebx, [tmp_buf + 1024 + 8]         ; n_screens
+    cmp ebx, MAX_OUTPUTS
+    jle .rdo_count_ok
+    mov ebx, MAX_OUTPUTS
+.rdo_count_ok:
+    test ebx, ebx
+    jz .rdo_done
+    mov edx, [tmp_buf + 1024 + 4]         ; reply additional length (4-byte words)
+    shl edx, 2
+    test edx, edx
+    jz .rdo_done
+
+    ; Drain the reply data (no events interleave inside a reply payload).
+    xor r14, r14
+.rdo_read:
+    cmp r14, rdx
+    jge .rdo_parse
+    push rdx
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf + 2048]
+    add rsi, r14
+    mov rcx, rdx
+    sub rcx, r14
+    mov rdx, rcx
+    syscall
+    pop rdx
+    test rax, rax
+    jle .rdo_done
+    add r14, rax
+    jmp .rdo_read
+
+.rdo_parse:
+    mov [output_count], bl
+    xor r13d, r13d
+.rdo_loop:
+    cmp r13d, ebx
+    jge .rdo_after_parse
+    mov rax, r13
+    shl rax, 3
+    lea rsi, [tmp_buf + 2048]
+    add rsi, rax
+    movzx eax, word [rsi]
+    mov [output_x + r13*2], ax
+    movzx eax, word [rsi + 2]
+    mov [output_y + r13*2], ax
+    movzx eax, word [rsi + 4]
+    mov [output_w + r13*2], ax
+    movzx eax, word [rsi + 6]
+    mov [output_h + r13*2], ax
+    inc r13
+    jmp .rdo_loop
+
+.rdo_after_parse:
+    ; Re-apply pin overrides + recompute output_current_ws.
+    call apply_pin_overrides
+    ; Resize the bar to output 0's (possibly new) width.
+    call resize_bar_to_output0
+    ; Re-apply layout for every visible workspace.
+    xor r12d, r12d
+.rdo_apply_loop:
+    movzx eax, byte [output_count]
+    cmp r12d, eax
+    jge .rdo_render
+    movzx eax, byte [output_current_ws + r12]
+    test eax, eax
+    jz .rdo_apply_next
+    call apply_workspace_layout
+.rdo_apply_next:
+    inc r12d
+    jmp .rdo_apply_loop
+.rdo_render:
+    call render_bar
+    call x11_flush
+.rdo_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ConfigureWindow on the bar to match output 0's current geometry.
+; No-op if the bar hasn't been created yet.
+resize_bar_to_output0:
+    push rbx
+    cmp dword [bar_window_id], 0
+    je .rbo_done
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CONFIGURE_WINDOW
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 7
+    mov eax, [bar_window_id]
+    mov [rdi+4], eax
+    mov word [rdi+8], CFG_X | CFG_Y | CFG_WIDTH | CFG_HEIGHT
+    mov word [rdi+10], 0
+    movzx eax, word [output_x]
+    mov [rdi+12], eax
+    movzx eax, word [output_y]
+    mov [rdi+16], eax
+    movzx eax, word [output_w]
+    mov [rdi+20], eax
+    movzx eax, word [bar_height]
+    mov [rdi+24], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 28
+    call x11_buffer
+    inc dword [x11_seq]
+.rbo_done:
     pop rbx
     ret
 
@@ -4541,6 +4820,11 @@ parse_config_line:
     call .pcl_streq
     test eax, eax
     jnz .pcl_handle_exec
+    mov rdi, r13
+    lea rsi, [.pcl_kw_pin]
+    call .pcl_streq
+    test eax, eax
+    jnz .pcl_handle_pin
     ; bar / palette settings (key = value)
     call .pcl_skip_ws
     cmp byte [r12], '='
@@ -4783,6 +5067,30 @@ parse_config_line:
     inc dword [exec_count]
     jmp .pcl_done
 
+.pcl_handle_pin:
+    ; "pin <ws> <output_index>"
+    ; ws is 1..9 (digit) or 0 (= WS 10), output_index is decimal byte.
+    call .pcl_skip_ws
+    mov rdi, r12
+    call parse_workspace_number
+    test eax, eax
+    jz .pcl_done
+    mov ebx, eax                          ; ws number 1..10
+    ; Skip past the digit (single-char in our parser).
+    inc r12
+    call .pcl_skip_ws
+    mov al, [r12]
+    test al, al
+    je .pcl_done
+    mov rdi, r12
+    call parse_decimal_byte
+    cmp eax, 0
+    jl .pcl_done
+    cmp eax, MAX_OUTPUTS
+    jge .pcl_done
+    mov [ws_pin_override + rbx - 1], al
+    jmp .pcl_done
+
 .pcl_done:
     pop r13
     pop r12
@@ -4824,6 +5132,7 @@ parse_config_line:
 
 .pcl_kw_bind: db "bind", 0
 .pcl_kw_exec: db "exec", 0
+.pcl_kw_pin:  db "pin", 0
 
 ; rdi = chord string, e.g. "Mod4+Shift+Return".
 ; Tokens are split by '+'; the chord ends at the first whitespace or NUL.

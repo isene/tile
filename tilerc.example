@@ -169,6 +169,18 @@ border_unfocused = #222222
 # (clamped 10..90). Stack pane gets the rest.
 master_ratio     = 50
 
+# === Workspace pinning ===
+# pin <ws> <output_index>
+#   Pin workspace <ws> (0 = WS 10) to output index <output_index>
+#   (0 = primary / laptop, 1+ = additional outputs in Xinerama order).
+#   Without any `pin` lines, all workspaces default to output 0 except
+#   WS 10 which is auto-pinned to output 1 when a second monitor exists.
+#   Indices beyond output_count are clamped to output 0 so a `pin` line
+#   for an unplugged monitor still leaves the workspace reachable.
+#
+# pin 0 1                        # WS 10 → external (default)
+# pin 9 1                        # WS 9 also lives on external
+
 # === Autostart ===
 exec feh --bg-fill /home/geir/setup/wallpapers/blue.png
 exec nm-applet
