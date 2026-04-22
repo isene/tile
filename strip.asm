@@ -2287,6 +2287,11 @@ intern_atom_sync:
     mov rdi, [x11_fd]
     syscall
     inc dword [x11_seq]
+    ; Loop reading 32-byte chunks until we get a reply (type=1).
+    ; Events (e.g. Expose from the just-mapped strip window) are
+    ; discarded — at startup the only events that matter to strip
+    ; will fire again when the main loop selects them.
+.ias_read:
     mov rax, SYS_READ
     mov rdi, [x11_fd]
     lea rsi, [x11_read_buf]
@@ -2294,8 +2299,12 @@ intern_atom_sync:
     syscall
     cmp rax, 32
     jl .ias_zero
-    cmp byte [x11_read_buf], 1            ; reply type
-    jne .ias_zero
+    cmp byte [x11_read_buf], 1
+    je .ias_have_reply
+    cmp byte [x11_read_buf], 0            ; X error
+    je .ias_zero
+    jmp .ias_read                          ; event — skip
+.ias_have_reply:
     mov eax, [x11_read_buf + 8]
     pop r13
     pop r12
@@ -2473,16 +2482,18 @@ tray_dock_icon:
     inc dword [x11_seq]
 
     ; ConfigureWindow: resize to icon_size × icon_size.
+    ; Mask 0x0C = W|H → 2 CARD32 values. Total = 4 (header) + 4 (wid)
+    ; + 4 (mask+pad) + 8 (values) = 20 bytes = 5 words.
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_CONFIGURE_WINDOW
     mov byte [rdi+1], 0
     mov word [rdi+2], 5
     mov [rdi+4], r12d
-    mov word [rdi+8], 0x000C              ; CWWidth | CWHeight
+    mov word [rdi+8], 0x000C
     mov word [rdi+10], 0
     mov eax, [tray_icon_size]
-    mov [rdi+12], ax
-    mov [rdi+14], ax
+    mov [rdi+12], eax                     ; W
+    mov [rdi+16], eax                     ; H
     lea rsi, [tmp_buf]
     mov rdx, 20
     call x11_buffer
@@ -2597,14 +2608,16 @@ tray_layout:
     push rdx
     push rdi
     ; Send ConfigureWindow to set x,y for this icon.
+    ; Mask 0x03 = X|Y → 2 CARD32 values → length 5 words = 20 bytes.
+    ; Stack at this point: [rsp]=rdi (iterator), [rsp+8]=rdx, [rsp+16]=rcx.
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_CONFIGURE_WINDOW
     mov byte [rdi+1], 0
     mov word [rdi+2], 5
-    mov ecx, [rsp + 8]                    ; iterator
+    mov ecx, [rsp]                        ; iterator (just-pushed rdi)
     mov eax, [tray_icons + rcx*4]
     mov [rdi+4], eax
-    mov word [rdi+8], 0x0003              ; CWX | CWY
+    mov word [rdi+8], 0x0003
     mov word [rdi+10], 0
     mov [rdi+12], esi                     ; x
     mov [rdi+16], edx                     ; y
