@@ -1,8 +1,9 @@
 # tile config — copy to ~/.tilerc and edit.
 #
-# Phase 1b.2 supports these statements:
+# Phase 1b.3b.1 supports these statements:
 #   bind <chord> <action> [arg]    keybinding
 #   exec <command line>            autostart (run once at tile start)
+#   key = value                    bar / palette settings
 #   # ...                          comment
 #
 # Chord syntax: modifiers and key joined by '+'. Modifier names are
@@ -44,20 +45,25 @@
 #   layout split-v           current workspace shows ALL its windows
 #                            stacked in equal-height horizontal strips
 #   layout toggle            cycle TABBED → SPLIT_H → SPLIT_V → TABBED
+#   spawn-split DIR CMD      switch the workspace to a split layout and
+#                            spawn CMD into the slot just next to the
+#                            focused window. DIR is one of right, left,
+#                            (→ split-h) up, down (→ split-v).
 
 # === Spawn ===
+# Mod4+Return: new glass; if workspace is in split mode, lands to the right
+#              (planned: phase 1b.3b.x split-aware exec).
 bind Mod4+Return        exec glass
-bind Mod4+space         exec rofi -show run
 
 # === Window management ===
 bind Mod4+q             kill
 bind Mod4+Shift+q       exit
 
 # === Tabs (within a workspace) ===
-bind Mod4+Page_Down     focus next-tab
-bind Mod4+Page_Up       focus prev-tab
-bind Mod4+Shift+Page_Down  move-tab right
-bind Mod4+Shift+Page_Up    move-tab left
+bind Mod4+Up            focus prev-tab
+bind Mod4+Down          focus next-tab
+bind Mod4+Shift+Page_Up   move-tab left
+bind Mod4+Shift+Page_Down move-tab right
 
 # === Workspaces (Mod4 + 1..0) ===
 bind Mod4+1             workspace 1
@@ -71,12 +77,9 @@ bind Mod4+8             workspace 8
 bind Mod4+9             workspace 9
 bind Mod4+0             workspace 10
 
-# Smart cycling: only walks workspaces that have at least one window.
+# Cycle workspaces.
 bind Mod4+Right         workspace next-populated
 bind Mod4+Left          workspace prev-populated
-
-# Toggle to the previously-active workspace.
-bind Mod4+Tab           workspace back-and-forth
 
 # === Move focused window to workspace ===
 bind Mod4+Shift+1       move-to 1
@@ -90,18 +93,21 @@ bind Mod4+Shift+8       move-to 8
 bind Mod4+Shift+9       move-to 9
 bind Mod4+Shift+0       move-to 10
 
+# === Layout ===
+bind Mod4+Tab           layout toggle
+
+# === Spawn into split (phase 1b.3b.1) ===
+bind Mod4+r             spawn-split right glass
+bind Mod4+l             spawn-split left  glass
+bind Mod4+u             spawn-split up    glass
+bind Mod4+d             spawn-split down  glass
+
 # === Tab colors (the row-of-squares bar at the top) ===
 bind Mod4+c             tab-color-cycle
 
 # === Stash (replaces i3's scratchpad) ===
 bind Mod4+i             stash
 bind Mod4+o             unstash
-
-# === Layout (tabbed / split) ===
-bind Mod4+Tab           layout toggle
-bind Mod4+t             layout tabbed
-bind Mod4+h             layout split-h
-bind Mod4+v             layout split-v
 
 # === Lock screen ===
 bind Mod4+Escape        exec i3lock -c 000000
@@ -124,6 +130,15 @@ tab_dim_factor   = 40
 tab_palette      = #ff5555,#50fa7b,#bd93f9,#ffb86c,#8be9fd,#f1fa8c,#ff79c6,#9aedfe
 ws_active        = #ffffff
 ws_populated     = #555555
+
+# === Focus border ===
+# A thin border around every managed window. The focused one shows
+# border_focused; everyone else shows border_unfocused. Useful in split
+# layouts to see at a glance which window has keyboard focus.
+# border_width = 0 disables the feature entirely.
+border_width     = 1
+border_focused   = #ffffff
+border_unfocused = #222222
 
 # === Autostart ===
 exec feh --bg-fill /home/geir/setup/wallpapers/blue.png

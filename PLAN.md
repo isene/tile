@@ -21,7 +21,7 @@ This document is the build plan agreed before implementation starts.
 - Tabbed layout as the default (matches author's 98%-of-the-time
   workflow).
 - Smart workspace cycling: Win+Right/Left walks only populated
-  workspaces; Win+N jumps direct (improvement over i3).
+  workspaces; Win+N jumps direct.
 - Workspace-pinned-to-output, so the external monitor always shows a
   designated workspace.
 - A real bar (`strip`) with system tray (XEMBED), so nm-applet,
@@ -29,7 +29,7 @@ This document is the build plan agreed before implementation starts.
 - Fits the CHasm aesthetic: pure asm, no libc, no toolkit, no font
   engine, single static binary per component.
 
-## Non-goals (out of scope, ever)
+## Non-goals (out of scope)
 
 - Floating windows
 - Stacking layout (only tabbed + split-h + split-v)

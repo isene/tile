@@ -137,6 +137,7 @@
 %define ACT_STASH       9
 %define ACT_UNSTASH     10
 %define ACT_LAYOUT      11
+%define ACT_SPAWN_SPLIT 12
 
 %define MAX_STASH       8
 
@@ -157,6 +158,9 @@
 ; Bar (the row-of-squares strip at the top of the screen).
 %define DEFAULT_BAR_HEIGHT      10
 %define DEFAULT_TAB_DIM_FACTOR  40    ; inactive tab brightness, 0..100
+%define DEFAULT_BORDER_WIDTH    1     ; pixels of focus border around managed windows
+%define DEFAULT_BORDER_FOCUSED   0xffffff
+%define DEFAULT_BORDER_UNFOCUSED 0x222222
 %define MAX_PALETTE             16
 %define WS_TAB_GAP              8     ; pixels of gap between WS and tab squares (legacy; kept for clarity)
 %define SQUARE_GAP              2     ; pixels of gap between adjacent squares
@@ -175,6 +179,15 @@
 %define FOC_PREV_TAB    2
 %define MTAB_LEFT       1
 %define MTAB_RIGHT      2
+
+; ACT_SPAWN_SPLIT direction sentinels. The spawn-split action takes a
+; direction keyword and a command string; the direction implies both
+; the layout (right/left → SPLIT_H, up/down → SPLIT_V) and where the
+; new client lands relative to the focused one.
+%define SPAWN_RIGHT     1
+%define SPAWN_LEFT      2
+%define SPAWN_UP        3
+%define SPAWN_DOWN      4
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Data
@@ -342,6 +355,8 @@ action_table:
     db ACT_UNSTASH, 0
     db "layout", 0
     db ACT_LAYOUT, 0
+    db "spawn-split", 0
+    db ACT_SPAWN_SPLIT, 0
     db 0                       ; terminator
 
 ; layout arg keyword table: `layout tabbed | split-h | split-v | toggle`.
@@ -370,6 +385,18 @@ mtab_arg_table:
     db MTAB_LEFT, 0
     db "right", 0
     db MTAB_RIGHT, 0
+    db 0
+
+; spawn-split direction keyword table.
+spawn_split_arg_table:
+    db "right", 0
+    db SPAWN_RIGHT, 0
+    db "left", 0
+    db SPAWN_LEFT, 0
+    db "up", 0
+    db SPAWN_UP, 0
+    db "down", 0
+    db SPAWN_DOWN, 0
     db 0
 
 ; Workspace argument keyword table for `workspace <name>`. Same packed
@@ -444,6 +471,15 @@ cfg_ws_populated:        resd 1
 ; active client.
 cfg_gap_inner:           resw 1
 
+; Focus-border state. Every managed window gets a 1px border (width
+; configurable). The currently-focused window's border is drawn in
+; cfg_border_focused; everyone else gets cfg_border_unfocused. Border
+; width 0 disables the feature entirely.
+cfg_border_width:        resb 1
+cfg_border_focused:      resd 1
+cfg_border_unfocused:    resd 1
+focused_xid:             resd 1
+
 ; Xinerama / multi-monitor state (phase 1c).
 ;
 ; xinerama_major = the major opcode the X server assigned to the
@@ -487,6 +523,15 @@ ws_layout:               resb WS_COUNT
 ; i3's scratchpad for the user's ff-marionette workflow.
 stash_xids:              resd MAX_STASH
 stash_count:             resd 1
+
+; Pending spawn-split state. When a spawn-split action fires, it
+; records the focused window's XID here as the "anchor". The next
+; MapRequest's track_client will reorder the appended client into
+; position relative to this anchor (just before or just after) so it
+; lands where the user asked, instead of at the end of client_xids.
+; pending_spawn_xid == 0 means no pending spawn.
+pending_spawn_xid:       resd 1
+pending_spawn_after:     resb 1
 
 ; Tracked top-level clients (most recent / focused at the end of the
 ; stack — kill action acts on the top entry of the current workspace).
@@ -597,6 +642,10 @@ _start:
     mov dword [cfg_ws_populated], 0x555555
     mov byte [cfg_tab_palette_count], 0
     mov word [cfg_gap_inner], 0
+    mov byte [cfg_border_width], DEFAULT_BORDER_WIDTH
+    mov dword [cfg_border_focused], DEFAULT_BORDER_FOCUSED
+    mov dword [cfg_border_unfocused], DEFAULT_BORDER_UNFOCUSED
+    mov dword [focused_xid], 0
     call load_config
 
     ; Become the WM by selecting substructure-redirect on root.
@@ -1546,28 +1595,88 @@ send_map_window:
     ret
 
 ; eax = window XID. SetInputFocus(window, RevertToParent=2, time=0).
-set_input_focus:
+; eax = window XID, edx = pixel value. Sends ChangeWindowAttributes
+; setting the BorderPixel attribute. Cheap (~16-byte request); safe to
+; call on any tracked client. Skipped when cfg_border_width == 0.
+set_window_border:
     push rax
+    cmp byte [cfg_border_width], 0
+    je .swb_done
+    push rdx
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_WINDOW_ATTRS
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    pop rdx
+    mov [rdi+4], eax             ; window
+    mov dword [rdi+8], CW_BORDER_PIXEL
+    mov [rdi+12], edx            ; border pixel
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+.swb_done:
+    pop rax
+    ret
+
+; eax = window XID. Updates focus borders so the previously-focused
+; window dims and the new one brightens, then sends X SetInputFocus.
+; Idempotent if eax == focused_xid. eax == 0 just dims the previous
+; without focusing anything new (used when a workspace empties out).
+set_input_focus:
+    push rbx
+    mov ebx, eax                          ; new XID (may be 0)
+    cmp ebx, [focused_xid]
+    je .sif_x                             ; same window — only re-issue X focus
+    ; Dim previous if any, brighten new if any.
+    mov eax, [focused_xid]
+    test eax, eax
+    jz .sif_brighten
+    mov edx, [cfg_border_unfocused]
+    call set_window_border
+.sif_brighten:
+    test ebx, ebx
+    jz .sif_clear
+    mov eax, ebx
+    mov edx, [cfg_border_focused]
+    call set_window_border
+    mov [focused_xid], ebx
+    jmp .sif_x
+.sif_clear:
+    mov dword [focused_xid], 0
+    pop rbx
+    ret
+.sif_x:
+    test ebx, ebx
+    jz .sif_done                          ; nothing to focus
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_SET_INPUT_FOCUS
     mov byte [rdi+1], 2          ; revert-to = Parent
     mov word [rdi+2], 3
-    pop rax
-    mov [rdi+4], eax
+    mov [rdi+4], ebx
     mov dword [rdi+8], 0         ; time = CurrentTime
     lea rsi, [tmp_buf]
     mov rdx, 12
     call x11_buffer
     inc dword [x11_seq]
+.sif_done:
+    pop rbx
     ret
 
 ; eax = window XID. Append to client_xids on the current workspace.
+; If a spawn-split action set pending_spawn_xid, the new client is
+; rotated into position immediately before/after the anchor (depending
+; on pending_spawn_after) so it lands where the user asked rather than
+; at the end. The pending state is cleared either way.
 track_client:
     push rbx
+    push r12
+    push r13
+    mov r12d, eax                         ; new XID
     mov ebx, [client_count]
     cmp ebx, MAX_CLIENTS
     jge .tc_full
-    mov [client_xids + rbx*4], eax
+    mov [client_xids + rbx*4], r12d
     movzx ecx, byte [current_ws]
     mov [client_ws + rbx], cl
     mov byte [client_unmap_expected + rbx], 0
@@ -1577,7 +1686,71 @@ track_client:
     movzx ecx, byte [current_ws]
     dec ecx
     inc byte [workspace_populated + rcx]
+
+    ; Paint the new client's border with the unfocused colour. If it
+    ; ends up focused (typical case for a fresh map), set_input_focus
+    ; will overwrite this with the focused colour.
+    mov eax, r12d
+    mov edx, [cfg_border_unfocused]
+    call set_window_border
+
+    ; Pending spawn-split reorder?
+    mov r13d, [pending_spawn_xid]
+    test r13d, r13d
+    jz .tc_full
+    mov dword [pending_spawn_xid], 0      ; consume — fire-once
+
+    ; Find anchor index. If anchor is gone or appears at/after the new
+    ; client, just leave the new client at the end (already correct).
+    mov eax, r13d
+    call find_client_index
+    cmp eax, -1
+    je .tc_full
+    cmp eax, ebx
+    jge .tc_full                          ; anchor is already at/after new
+
+    ; Compute target index: anchor + 1 if "after", else anchor.
+    mov ecx, eax                          ; anchor index
+    movzx edx, byte [pending_spawn_after]
+    test edx, edx
+    jz .tc_have_target
+    inc ecx
+.tc_have_target:
+    cmp ecx, ebx
+    jge .tc_full                          ; target already == new index
+
+    ; Rotate slot ebx to slot ecx by walking down. ecx..ebx-1 each get
+    ; their successor's data; ebx itself becomes the saved new client.
+    ; Save new client's parallel data into r8/r9/r10/r11 first.
+    mov r8d, [client_xids + rbx*4]
+    movzx r9d, byte [client_ws + rbx]
+    movzx r10d, byte [client_unmap_expected + rbx]
+    movzx r11d, byte [client_color + rbx]
+    mov edi, ebx                          ; cursor = ebx, walking down to ecx+1
+.tc_rotate:
+    cmp edi, ecx
+    jle .tc_rotate_done
+    mov esi, edi
+    dec esi                               ; src = cursor - 1
+    mov eax, [client_xids + rsi*4]
+    mov [client_xids + rdi*4], eax
+    mov al, [client_ws + rsi]
+    mov [client_ws + rdi], al
+    mov al, [client_unmap_expected + rsi]
+    mov [client_unmap_expected + rdi], al
+    mov al, [client_color + rsi]
+    mov [client_color + rdi], al
+    dec edi
+    jmp .tc_rotate
+.tc_rotate_done:
+    ; Drop the saved new-client data into slot ecx.
+    mov [client_xids + rcx*4], r8d
+    mov [client_ws + rcx], r9b
+    mov [client_unmap_expected + rcx], r10b
+    mov [client_color + rcx], r11b
 .tc_full:
+    pop r13
+    pop r12
     pop rbx
     ret
 
@@ -2212,6 +2385,10 @@ client_closed:
     push r12
     push r13
     mov r12d, eax                ; the dying XID
+    cmp r12d, [focused_xid]
+    jne .cc_no_focus_clear
+    mov dword [focused_xid], 0   ; X has already moved focus away
+.cc_no_focus_clear:
     mov eax, r12d
     call untrack_client
     xor ebx, ebx                 ; ws index 0..9
@@ -2428,6 +2605,8 @@ dispatch_keypress:
     je .dk_unstash
     cmp eax, ACT_LAYOUT
     je .dk_layout
+    cmp eax, ACT_SPAWN_SPLIT
+    je .dk_spawn_split
     jmp .dk_done
 .dk_exec:
     test edx, edx
@@ -2504,6 +2683,14 @@ dispatch_keypress:
 .dk_layout:
     mov edi, esi                          ; sentinel/value in arg_int
     call action_layout
+    jmp .dk_done
+.dk_spawn_split:
+    ; arg_int = direction (esi), arg_off = command offset (edx).
+    test edx, edx
+    jz .dk_done                           ; need a command
+    mov edi, esi                          ; direction
+    lea rsi, [arg_pool + rdx]             ; cmd
+    call action_spawn_split
     jmp .dk_done
 .dk_skip:
     inc ebx
@@ -2860,10 +3047,26 @@ move_focused_to_workspace:
 
 ; rdi = window XID, esi = x, edx = y, ecx = w, r8d = h.
 ; Sends a single ConfigureWindow with all four geometry values.
+; Configure a managed window into a slot rect (esi=x, edx=y, ecx=w,
+; r8d=h). Folds in the focus border: shifts the inner content by
+; cfg_border_width on each side and shrinks W/H by 2 * border so the
+; border (drawn outside the window geometry by X) fits inside the slot.
+; Sends a single ConfigureWindow with X|Y|W|H|BORDER values.
 configure_window_rect:
     push rbx
     mov rbx, rdi                          ; preserve XID across x11_buffer
-    push rax
+    ; Apply border inset: shift x,y by border, shrink w,h by 2*border.
+    movzx eax, byte [cfg_border_width]
+    test eax, eax
+    jz .cwr_skip_inset
+    add esi, eax
+    add edx, eax
+    sub ecx, eax
+    sub ecx, eax
+    sub r8d, eax
+    sub r8d, eax
+.cwr_skip_inset:
+    push rax                              ; border width
     push rsi
     push rdx
     push rcx
@@ -2871,21 +3074,22 @@ configure_window_rect:
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_CONFIGURE_WINDOW
     mov byte [rdi+1], 0
-    mov word [rdi+2], 7
+    mov word [rdi+2], 8                   ; 7 base + 1 extra value (BORDER)
     mov [rdi+4], ebx
-    mov word [rdi+8], CFG_X | CFG_Y | CFG_WIDTH | CFG_HEIGHT
+    mov word [rdi+8], CFG_X | CFG_Y | CFG_WIDTH | CFG_HEIGHT | CFG_BORDER
     mov word [rdi+10], 0
     pop r8
     pop rcx
     pop rdx
     pop rsi
-    pop rax
+    pop rax                               ; border width
     mov [rdi+12], esi                     ; x
     mov [rdi+16], edx                     ; y
     mov [rdi+20], ecx                     ; w
     mov [rdi+24], r8d                     ; h
+    mov [rdi+28], eax                     ; border-width
     lea rsi, [tmp_buf]
-    mov rdx, 28
+    mov rdx, 32
     push rax                              ; x11_buffer clobbers eax via its
     call x11_buffer                       ; byte-read loop; preserve so
     pop rax                               ; callers can rely on rax post-call
@@ -3163,6 +3367,71 @@ action_layout:
     call set_input_focus
     call x11_flush
 .al_done:
+    pop rbx
+    ret
+
+; edi = direction sentinel (SPAWN_RIGHT/LEFT/UP/DOWN)
+; rsi = NUL-terminated command string (in arg_pool)
+;
+; Sets the workspace's layout (split-h for right/left, split-v for
+; up/down), records the focused window as the spawn anchor and the
+; insert direction, applies the new layout, then forks /bin/sh -c CMD.
+; When the new client's MapRequest fires, track_client rotates it into
+; place next to the anchor.
+;
+; If there's no focused client (empty workspace), the action still
+; forks the command and switches the layout, but no reorder happens
+; (the new client will simply become the workspace's only window).
+action_spawn_split:
+    push rbx
+    push r12
+    push r13
+    mov r12d, edi                         ; direction
+    mov r13, rsi                          ; cmd ptr
+
+    movzx eax, byte [current_ws]
+    test eax, eax
+    jz .ass_done
+    mov ebx, eax                          ; ws number
+
+    ; Record anchor (focused) XID and after/before flag.
+    mov ecx, ebx
+    dec ecx
+    mov eax, [ws_active_xid + rcx*4]
+    mov [pending_spawn_xid], eax
+    xor eax, eax
+    cmp r12d, SPAWN_RIGHT
+    je .ass_after
+    cmp r12d, SPAWN_DOWN
+    je .ass_after
+    jmp .ass_set_after
+.ass_after:
+    mov eax, 1
+.ass_set_after:
+    mov [pending_spawn_after], al
+
+    ; Choose target layout from direction.
+    mov eax, LAYOUT_SPLIT_H
+    cmp r12d, SPAWN_UP
+    je .ass_lay_v
+    cmp r12d, SPAWN_DOWN
+    je .ass_lay_v
+    jmp .ass_lay_set
+.ass_lay_v:
+    mov eax, LAYOUT_SPLIT_V
+.ass_lay_set:
+    mov [ws_layout + rbx - 1], al
+    mov eax, ebx
+    call apply_workspace_layout
+
+    ; Fire the command.
+    test r13, r13
+    jz .ass_done
+    mov rdi, r13
+    call fork_exec_string
+.ass_done:
+    pop r13
+    pop r12
     pop rbx
     ret
 
@@ -3585,6 +3854,8 @@ parse_config_line:
     je .pcl_arg_mtab
     cmp ecx, ACT_LAYOUT
     je .pcl_arg_layout
+    cmp ecx, ACT_SPAWN_SPLIT
+    je .pcl_arg_spawn_split
     ; kill / exit / unknown — no arg.
     xor edx, edx
     xor r8b, r8b
@@ -3669,6 +3940,56 @@ parse_config_line:
     mov r8b, al
     xor edx, edx
     jmp .pcl_emit
+.pcl_arg_spawn_split:
+    ; "spawn-split <direction> <command...>"
+    ; First read the direction word, NUL-terminate, look it up. Then
+    ; the rest of the line (after ws skip) is the command for arg_pool.
+    call .pcl_skip_ws
+    mov al, [r12]
+    test al, al
+    je .pcl_pop_mod_done
+    mov r13, r12                          ; start of direction word
+.pcl_ssp_dir_end:
+    mov al, [r12]
+    test al, al
+    je .pcl_ssp_dir_done
+    cmp al, ' '
+    je .pcl_ssp_dir_done
+    cmp al, 9
+    je .pcl_ssp_dir_done
+    inc r12
+    jmp .pcl_ssp_dir_end
+.pcl_ssp_dir_done:
+    mov al, [r12]
+    test al, al
+    je .pcl_pop_mod_done                  ; need a command after direction
+    mov byte [r12], 0
+    inc r12
+    push rcx                              ; save action_id across lookups
+    mov rdi, r13
+    lea rdx, [spawn_split_arg_table]
+    call lookup_packed_byte
+    test eax, eax
+    jz .pcl_ssp_bad
+    push rax                              ; save direction sentinel
+    call .pcl_skip_ws
+    mov al, [r12]
+    test al, al
+    je .pcl_ssp_pop_bad
+    mov rdi, r12
+    call arg_pool_dup
+    test eax, eax
+    jz .pcl_ssp_pop_bad
+    mov edx, eax                          ; arg_off = command
+    pop r9                                ; direction sentinel
+    pop rcx                               ; action_id
+    mov r8b, r9b                          ; arg_int = direction
+    jmp .pcl_emit
+.pcl_ssp_pop_bad:
+    add rsp, 8                            ; drop direction sentinel
+.pcl_ssp_bad:
+    pop rcx                               ; restore action_id (to keep stack balanced)
+    jmp .pcl_pop_mod_done
 .pcl_emit:
     pop r9                       ; modifiers (was push rdx earlier)
     push rcx                     ; preserve action_id
@@ -4066,6 +4387,21 @@ apply_setting:
     call .as_streq
     test eax, eax
     jnz .as_gap_inner
+    mov rdi, r13
+    lea rsi, [.as_kw_border_width]
+    call .as_streq
+    test eax, eax
+    jnz .as_border_width
+    mov rdi, r13
+    lea rsi, [.as_kw_border_focused]
+    call .as_streq
+    test eax, eax
+    jnz .as_border_focused
+    mov rdi, r13
+    lea rsi, [.as_kw_border_unfocused]
+    call .as_streq
+    test eax, eax
+    jnz .as_border_unfocused
     jmp .as_done
 
 .as_bar_height:
@@ -4111,6 +4447,21 @@ apply_setting:
     call parse_decimal_byte
     mov [cfg_gap_inner], ax
     jmp .as_done
+.as_border_width:
+    mov rdi, r12
+    call parse_decimal_byte
+    mov [cfg_border_width], al
+    jmp .as_done
+.as_border_focused:
+    mov rdi, r12
+    call parse_hex_color
+    mov [cfg_border_focused], eax
+    jmp .as_done
+.as_border_unfocused:
+    mov rdi, r12
+    call parse_hex_color
+    mov [cfg_border_unfocused], eax
+    jmp .as_done
 .as_done:
     pop r13
     pop rbx
@@ -4145,6 +4496,9 @@ apply_setting:
 .as_kw_ws_active:     db "ws_active", 0
 .as_kw_ws_populated:  db "ws_populated", 0
 .as_kw_gap_inner:     db "gap_inner", 0
+.as_kw_border_width:    db "border_width", 0
+.as_kw_border_focused:  db "border_focused", 0
+.as_kw_border_unfocused: db "border_unfocused", 0
 
 ; rdi = NUL-terminated string starting with optional '#' then 6 hex
 ; digits. Returns CARD32 0x00RRGGBB in eax. Garbage in → 0 in eax.
