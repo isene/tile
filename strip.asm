@@ -73,8 +73,8 @@
 ; just padding — harmless.
 %define DEFAULT_BG          0xFF000000
 %define DEFAULT_FG          0xFFCCCCCC
-%define DEFAULT_FONT_BASELINE 14
-%define CHAR_WIDTH          7        ; "fixed" 6x13 char advance (rough)
+%define DEFAULT_FONT_BASELINE 16        ; terminus 16 baseline ≈ 14
+%define CHAR_WIDTH          8           ; terminus 16 char advance
 
 %define MAX_SEGMENTS        32
 %define SEG_STRIDE          128
@@ -110,8 +110,11 @@ x11_sock_pre:    db "/tmp/.X11-unix/X", 0
 auth_name:       db "MIT-MAGIC-COOKIE-1"
 auth_name_len    equ 18
 
-font_name:       db "fixed"
-font_name_len    equ 5
+; Default X core font XLFD (overridable via `font = <xlfd>` in
+; ~/.striprc). Matches i3bar's default so segments visually match
+; conky-via-i3bar for free. Available via xfonts-terminus on Debian/Ubuntu.
+default_font_name: db "-*-terminus-*-*-*-*-16-*-*-*-*-*-iso10646-1", 0
+default_font_name_len equ $ - default_font_name - 1
 
 striprc_suffix:  db "/.striprc", 0
 
@@ -186,6 +189,15 @@ cfg_bg:              resd 1
 cfg_fg:              resd 1
 strip_dirty:         resb 1            ; non-zero → re-render needed
 
+; Font config. font_name buffer stores either the default XLFD or a
+; user-supplied override from striprc; font_name_len reflects the
+; current contents. CHAR_WIDTH likewise becomes runtime-configurable.
+%define FONT_NAME_MAX  256
+font_name_buf:       resb FONT_NAME_MAX
+font_name_len_var:   resd 1
+char_width_var:      resd 1
+font_baseline_var:   resd 1
+
 ; Segment storage.
 segments:            resb MAX_SEGMENTS * SEG_STRIDE_REAL
 segment_count:       resd 1
@@ -253,6 +265,24 @@ _start:
     mov dword [arg_pool_pos], 1
     mov byte [arg_pool], 0
     mov dword [segment_count], 0
+
+    ; Seed font config from defaults; striprc may override.
+    lea rsi, [default_font_name]
+    lea rdi, [font_name_buf]
+    mov ecx, default_font_name_len
+.cp_default_font:
+    test ecx, ecx
+    jz .font_default_done
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec ecx
+    jmp .cp_default_font
+.font_default_done:
+    mov dword [font_name_len_var], default_font_name_len
+    mov dword [char_width_var], CHAR_WIDTH
+    mov dword [font_baseline_var], DEFAULT_FONT_BASELINE
 
     call load_striprc
 
@@ -969,13 +999,13 @@ render_segment_sgr:
     test ecx, ecx
     jz .rss_no_flush
     mov edi, r12d
-    mov esi, DEFAULT_FONT_BASELINE
+    mov esi, [font_baseline_var]
     lea rdx, [r13 + rbp]
     call paint_text
     mov ecx, r15d
     sub ecx, ebp
     add ebx, ecx
-    imul ecx, ecx, CHAR_WIDTH
+    imul ecx, [char_width_var]
     add r12d, ecx
 .rss_no_flush:
     ; Parse "ESC [ N (;N)* m": collect every numeric token into
@@ -1037,13 +1067,13 @@ render_segment_sgr:
     test ecx, ecx
     jz .rss_done
     mov edi, r12d
-    mov esi, DEFAULT_FONT_BASELINE
+    mov esi, [font_baseline_var]
     lea rdx, [r13 + rbp]
     call paint_text
     mov ecx, r15d
     sub ecx, ebp
     add ebx, ecx
-    imul ecx, ecx, CHAR_WIDTH
+    imul ecx, [char_width_var]
     add r12d, ecx
 .rss_done:
     mov eax, ebx                          ; display chars drawn
@@ -1167,10 +1197,10 @@ render_strip:
     lea rsi, [r13 + SEG_OFF_OUTPUT]       ; buffer
     mov edx, ecx                          ; byte length
     call render_segment_sgr
-    ; rax = display chars drawn. Advance x by (chars + 1) * CHAR_WIDTH
+    ; rax = display chars drawn. Advance x by (chars + 1) * char_width
     ; (1 extra for a single-space separator).
     inc eax
-    imul eax, CHAR_WIDTH
+    imul eax, [char_width_var]
     add r12d, eax
     mov byte [r13 + SEG_OFF_FLAGS], 0
 .rs_next:
@@ -1670,6 +1700,21 @@ apply_setting:
     call .as_streq
     test eax, eax
     jnz .as_fg
+    mov rsi, rbx
+    lea rsi, [.k_font]
+    call .as_streq
+    test eax, eax
+    jnz .as_font
+    mov rsi, rbx
+    lea rsi, [.k_char_width]
+    call .as_streq
+    test eax, eax
+    jnz .as_char_width
+    mov rsi, rbx
+    lea rsi, [.k_baseline]
+    call .as_streq
+    test eax, eax
+    jnz .as_baseline
     pop rbx
     ret
 .as_height:
@@ -1696,6 +1741,45 @@ apply_setting:
     mov [cfg_fg], eax
     pop rbx
     ret
+.as_font:
+    ; Copy rbx (the value string) into font_name_buf, capped at
+    ; FONT_NAME_MAX-1, and store its length.
+    mov rsi, rbx
+    lea rdi, [font_name_buf]
+    xor ecx, ecx
+.as_font_cp:
+    cmp ecx, FONT_NAME_MAX - 1
+    jge .as_font_done
+    mov al, [rsi + rcx]
+    test al, al
+    jz .as_font_done
+    mov [rdi + rcx], al
+    inc ecx
+    jmp .as_font_cp
+.as_font_done:
+    mov [font_name_len_var], ecx
+    pop rbx
+    ret
+.as_char_width:
+    mov rdi, rbx
+    call parse_dec
+    test eax, eax
+    jnz .as_cw_ok
+    mov eax, CHAR_WIDTH                   ; reject 0
+.as_cw_ok:
+    mov [char_width_var], eax
+    pop rbx
+    ret
+.as_baseline:
+    mov rdi, rbx
+    call parse_dec
+    test eax, eax
+    jnz .as_bl_ok
+    mov eax, DEFAULT_FONT_BASELINE
+.as_bl_ok:
+    mov [font_baseline_var], eax
+    pop rbx
+    ret
 
 .as_streq:
     push rbx
@@ -1718,10 +1802,13 @@ apply_setting:
     pop rbx
     ret
 
-.k_height: db "height", 0
-.k_top:    db "top_offset", 0
-.k_bg:     db "bg", 0
-.k_fg:     db "fg", 0
+.k_height:     db "height", 0
+.k_top:        db "top_offset", 0
+.k_bg:         db "bg", 0
+.k_fg:         db "fg", 0
+.k_font:       db "font", 0
+.k_char_width: db "char_width", 0
+.k_baseline:   db "baseline", 0
 
 ; rdi = source NUL-terminated string. Copy into arg_pool, return offset
 ; in eax (0 on failure / empty).
@@ -1828,18 +1915,24 @@ parse_hex:
 ; ──────────────────────────────────────────────────────────────────────
 open_core_font:
     push rbx
+    push r12
     call alloc_xid
     mov [font_id], eax
+    mov r12d, [font_name_len_var]
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_OPEN_FONT
     mov byte [rdi+1], 0
-    mov word [rdi+2], 3 + (font_name_len + 3) / 4
-    mov [rdi+4], eax
-    mov word [rdi+8], font_name_len
+    mov ecx, r12d
+    add ecx, 3
+    shr ecx, 2
+    add ecx, 3                            ; req length in 4-byte words
+    mov [rdi+2], cx
+    mov [rdi+4], eax                      ; fid
+    mov [rdi+8], r12w                     ; name length
     mov word [rdi+10], 0
-    lea rsi, [font_name]
+    lea rsi, [font_name_buf]
     lea rbx, [tmp_buf + 12]
-    mov ecx, font_name_len
+    mov ecx, r12d
 .ocf_cp:
     test ecx, ecx
     jz .ocf_pad
@@ -1850,7 +1943,7 @@ open_core_font:
     dec ecx
     jmp .ocf_cp
 .ocf_pad:
-    mov ecx, font_name_len
+    mov ecx, r12d
     and ecx, 3
     jz .ocf_send
     mov edx, 4
@@ -1866,6 +1959,7 @@ open_core_font:
     sub rdx, rsi
     call x11_buffer
     inc dword [x11_seq]
+    pop r12
     pop rbx
     ret
 
