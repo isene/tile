@@ -163,6 +163,7 @@ section .bss
 %define SEG_OFF_PIPE_FD   132      ; int32 (-1 = none)
 %define SEG_OFF_FLAGS     136      ; uint8 (bit 0: dirty since last render)
 %define SEG_OFF_DEFAULT_FG 140     ; uint32 (0 = use cfg_fg)
+%define SEG_OFF_GAP_OVR   144      ; uint32 extra pixels before this segment
 %define SEG_OFF_INC_BUF   148      ; staging buffer for in-flight output (96B)
 %define SEG_OFF_INC_LEN   244      ; uint8 incoming length
 %define SEG_STRIDE_REAL   256
@@ -192,6 +193,7 @@ strip_y:             resw 1
 cfg_bg:              resd 1
 cfg_fg:              resd 1
 strip_dirty:         resb 1            ; non-zero → re-render needed
+cfg_gap:             resd 1            ; pixels of padding between segments
 
 ; Font config. font_name buffer stores either the default XLFD or a
 ; user-supplied override from striprc; font_name_len reflects the
@@ -287,6 +289,7 @@ _start:
     mov dword [font_name_len_var], default_font_name_len
     mov dword [char_width_var], CHAR_WIDTH
     mov dword [font_baseline_var], DEFAULT_FONT_BASELINE
+    mov dword [cfg_gap], CHAR_WIDTH                ; default = one char_width
 
     call load_striprc
 
@@ -1313,17 +1316,17 @@ render_strip:
     movzx ecx, byte [r13 + SEG_OFF_OUT_LEN]
     test ecx, ecx
     jz .rs_next
-    ; render_segment_sgr returns the number of display characters drawn.
+    ; Apply per-segment leading gap override BEFORE drawing.
+    add r12d, [r13 + SEG_OFF_GAP_OVR]
     mov edi, r12d                         ; start x
     lea rsi, [r13 + SEG_OFF_OUTPUT]       ; buffer
     mov edx, ecx                          ; byte length
     mov ecx, [r13 + SEG_OFF_DEFAULT_FG]   ; default fg (0 → cfg_fg)
     call render_segment_sgr
-    ; rax = display chars drawn. Advance x by (chars + 1) * char_width
-    ; (1 extra for a single-space separator).
-    inc eax
+    ; rax = display chars drawn. Advance x by chars*char_width + cfg_gap.
     imul eax, [char_width_var]
     add r12d, eax
+    add r12d, [cfg_gap]
     mov byte [r13 + SEG_OFF_FLAGS], 0
 .rs_next:
     inc ebx
@@ -1684,6 +1687,7 @@ register_segment:
     mov dword [r15 + SEG_OFF_NEXT_RUN], 0
     mov dword [r15 + SEG_OFF_PID], 0
     mov dword [r15 + SEG_OFF_DEFAULT_FG], 0
+    mov dword [r15 + SEG_OFF_GAP_OVR], 0
     mov dword [r15 + SEG_OFF_PIPE_FD], -1
     mov byte [r15 + SEG_OFF_FLAGS], 0
     ; Copy name (truncate at SEG_NAME_LEN-1).
@@ -1712,6 +1716,53 @@ register_segment:
     test al, al
     jz .rseg_done
 
+    ; Optional gap override: if remainder starts with '+digits' followed
+    ; by whitespace, parse the integer pixel count into GAP_OVR.
+    cmp byte [r13], '+'
+    jne .rseg_no_gap
+    mov rdi, r13
+    inc rdi
+    xor eax, eax
+.rseg_gap_dig:
+    movzx ecx, byte [rdi]
+    cmp cl, '0'
+    jb .rseg_gap_check
+    cmp cl, '9'
+    ja .rseg_gap_check
+    sub ecx, '0'
+    imul eax, eax, 10
+    add eax, ecx
+    inc rdi
+    jmp .rseg_gap_dig
+.rseg_gap_check:
+    ; Require at least one digit AND trailing whitespace/NUL.
+    mov rsi, r13
+    inc rsi
+    cmp rdi, rsi
+    je .rseg_no_gap
+    movzx ecx, byte [rdi]
+    cmp cl, ' '
+    je .rseg_gap_take
+    cmp cl, 9
+    je .rseg_gap_take
+    cmp cl, 0
+    je .rseg_gap_take
+    jmp .rseg_no_gap
+.rseg_gap_take:
+    mov [r15 + SEG_OFF_GAP_OVR], eax
+    mov r13, rdi
+.rseg_gap_skip_ws:
+    movzx eax, byte [r13]
+    cmp al, ' '
+    je .rseg_gap_inc
+    cmp al, 9
+    je .rseg_gap_inc
+    jmp .rseg_no_gap
+.rseg_gap_inc:
+    inc r13
+    jmp .rseg_gap_skip_ws
+
+.rseg_no_gap:
     ; Optional default colour: if remainder starts with '#' followed by
     ; 6 hex digits (and a space/tab/NUL), parse it into DEFAULT_FG and
     ; advance r13 past it.
@@ -1892,6 +1943,11 @@ apply_setting:
     call .as_streq
     test eax, eax
     jnz .as_baseline
+    mov rsi, rbx
+    lea rsi, [.k_gap]
+    call .as_streq
+    test eax, eax
+    jnz .as_gap
     pop rbx
     ret
 .as_height:
@@ -1957,6 +2013,12 @@ apply_setting:
     mov [font_baseline_var], eax
     pop rbx
     ret
+.as_gap:
+    mov rdi, rbx
+    call parse_dec
+    mov [cfg_gap], eax
+    pop rbx
+    ret
 
 .as_streq:
     push rbx
@@ -1986,6 +2048,7 @@ apply_setting:
 .k_font:       db "font", 0
 .k_char_width: db "char_width", 0
 .k_baseline:   db "baseline", 0
+.k_gap:        db "gap", 0
 
 ; rdi = source NUL-terminated string. Copy into arg_pool, return offset
 ; in eax (0 on failure / empty).
