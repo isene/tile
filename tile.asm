@@ -164,8 +164,8 @@
 %define DEFAULT_BAR_HEIGHT      10
 %define DEFAULT_TAB_DIM_FACTOR  40    ; inactive tab brightness, 0..100
 %define DEFAULT_BORDER_WIDTH    1     ; pixels of focus border around managed windows
-%define DEFAULT_BORDER_FOCUSED   0xffffff
-%define DEFAULT_BORDER_UNFOCUSED 0x222222
+%define DEFAULT_BORDER_FOCUSED   0xFFffffff
+%define DEFAULT_BORDER_UNFOCUSED 0xFF222222
 %define MAX_PALETTE             16
 %define WS_TAB_GAP              8     ; pixels of gap between WS and tab squares (legacy; kept for clarity)
 %define SQUARE_GAP              2     ; pixels of gap between adjacent squares
@@ -697,11 +697,11 @@ _start:
     mov byte [prev_ws], 0
     ; Bar defaults (~/.tilerc may override).
     mov word [bar_height], DEFAULT_BAR_HEIGHT
-    mov dword [cfg_bar_bg], 0x000000
-    mov dword [cfg_tab_default], 0x555555
+    mov dword [cfg_bar_bg], 0xFF000000
+    mov dword [cfg_tab_default], 0xFF555555
     mov byte [cfg_tab_dim_factor], DEFAULT_TAB_DIM_FACTOR
-    mov dword [cfg_ws_active], 0xffffff
-    mov dword [cfg_ws_populated], 0x555555
+    mov dword [cfg_ws_active], 0xFFffffff
+    mov dword [cfg_ws_populated], 0xFF555555
     mov byte [cfg_tab_palette_count], 0
     mov word [cfg_gap_inner], 0
     mov word [cfg_strip_height], 0
@@ -5646,6 +5646,7 @@ parse_hex_color:
     jnz .phc_loop
 .phc_done:
     mov eax, r12d
+    or eax, 0xFF000000                    ; opaque alpha for depth-32 visuals
     pop r12
     pop rbx
     ret

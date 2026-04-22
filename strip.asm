@@ -67,8 +67,11 @@
 ; Defaults / limits
 ; ══════════════════════════════════════════════════════════════════════
 %define DEFAULT_HEIGHT      22
-%define DEFAULT_BG          0x000000
-%define DEFAULT_FG          0xCCCCCC
+; Pixel values include the alpha byte (high 8 bits = 0xFF) so they
+; render opaque on depth-32 ARGB visuals. On depth-24 the high byte is
+; just padding — harmless.
+%define DEFAULT_BG          0xFF000000
+%define DEFAULT_FG          0xFFCCCCCC
 %define DEFAULT_FONT_BASELINE 14
 %define CHAR_WIDTH          7        ; "fixed" 6x13 char advance (rough)
 
@@ -151,7 +154,8 @@ x11_black_pixel:     resd 1
 
 window_id:           resd 1
 pixmap_id:           resd 1
-gc_id:               resd 1
+gc_id:               resd 1            ; text GC: fg=cfg_fg, bg=cfg_bg
+fill_gc_id:          resd 1            ; fill GC: fg=cfg_bg (used to clear)
 font_id:             resd 1
 strip_height:        resw 1
 strip_y:             resw 1
@@ -813,14 +817,14 @@ render_strip:
     push r12
     push r13
 
-    ; PolyFillRectangle on pixmap to clear it.
+    ; PolyFillRectangle on pixmap to clear it (using bg-coloured GC).
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_POLY_FILL_RECT
     mov byte [rdi+1], 0
     mov word [rdi+2], 5
     mov eax, [pixmap_id]
     mov [rdi+4], eax
-    mov eax, [gc_id]
+    mov eax, [fill_gc_id]
     mov [rdi+8], eax
     mov word [rdi+12], 0
     mov word [rdi+14], 0
@@ -1466,7 +1470,8 @@ parse_dec:
 .pd_done:
     ret
 
-; rdi = "#RRGGBB" or "RRGGBB" → eax = 0x00RRGGBB
+; rdi = "#RRGGBB" or "RRGGBB" → eax = 0xFFRRGGBB (opaque alpha for
+; depth-32 visuals; harmless padding on depth-24).
 parse_hex:
     push rbx
     cmp byte [rdi], '#'
@@ -1500,6 +1505,7 @@ parse_hex:
     dec ecx
     jmp .ph_loop
 .ph_done:
+    or eax, 0xFF000000
     pop rbx
     ret
 
@@ -1589,13 +1595,16 @@ create_strip_window:
 
 create_gc:
     push rbx
+    push r12
+    ; Text GC: foreground = cfg_fg, background = cfg_bg, font = font_id.
     call alloc_xid
     mov [gc_id], eax
+    mov r12d, eax
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_CREATE_GC
     mov byte [rdi+1], 0
     mov word [rdi+2], 7
-    mov [rdi+4], eax
+    mov [rdi+4], r12d
     mov ebx, [window_id]
     mov [rdi+8], ebx
     mov dword [rdi+12], GC_FOREGROUND | GC_BACKGROUND | GC_FONT
@@ -1609,6 +1618,25 @@ create_gc:
     mov rdx, 28
     call x11_buffer
     inc dword [x11_seq]
+
+    ; Fill GC: foreground = cfg_bg (used by PolyFillRectangle to clear).
+    call alloc_xid
+    mov [fill_gc_id], eax
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CREATE_GC
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 5
+    mov [rdi+4], eax
+    mov ebx, [window_id]
+    mov [rdi+8], ebx
+    mov dword [rdi+12], GC_FOREGROUND
+    mov eax, [cfg_bg]
+    mov [rdi+16], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 20
+    call x11_buffer
+    inc dword [x11_seq]
+    pop r12
     pop rbx
     ret
 
