@@ -1,20 +1,23 @@
 PREFIX ?= /usr/local
 BINDIR = $(PREFIX)/bin
 
-all: tile
+all: tile strip
 
 tile: tile.asm
 	nasm -f elf64 tile.asm -o tile.o
 	ld tile.o -o tile
 	rm -f tile.o
 
-# strip (the bar) lands in phase 2a — placeholder rule for now.
-strip:
-	@echo "strip not yet implemented (phase 2a)"
+# strip — the status bar binary (phase 2a skeleton: window + render).
+strip: strip.asm
+	nasm -f elf64 strip.asm -o strip.o
+	ld strip.o -o strip
+	rm -f strip.o
 
-install: tile
+install: tile strip
 	install -Dm755 tile $(DESTDIR)$(BINDIR)/tile
-	@echo "Installed tile to $(BINDIR)/tile"
+	install -Dm755 strip $(DESTDIR)$(BINDIR)/strip
+	@echo "Installed tile and strip to $(BINDIR)/"
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/tile $(DESTDIR)$(BINDIR)/strip
