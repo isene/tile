@@ -148,12 +148,16 @@
 %define LAYOUT_TABBED   0
 %define LAYOUT_SPLIT_H  1
 %define LAYOUT_SPLIT_V  2
+%define LAYOUT_MASTER   3
 
 ; ACT_LAYOUT arg_int sentinels — mirror the workspace pattern.
 %define LAY_SET_TABBED  1
 %define LAY_SET_SPLIT_H 2
 %define LAY_SET_SPLIT_V 3
+%define LAY_SET_MASTER  4
 %define LAY_TOGGLE      0xff
+
+%define DEFAULT_MASTER_RATIO 50      ; percent of workspace width given to master
 
 ; Bar (the row-of-squares strip at the top of the screen).
 %define DEFAULT_BAR_HEIGHT      10
@@ -177,6 +181,10 @@
 ; Focus and move-tab arg_int sentinels (single byte, also stored in arg_int).
 %define FOC_NEXT_TAB    1
 %define FOC_PREV_TAB    2
+%define FOC_RIGHT       3
+%define FOC_LEFT        4
+%define FOC_UP          5
+%define FOC_DOWN        6
 %define MTAB_LEFT       1
 %define MTAB_RIGHT      2
 
@@ -367,6 +375,8 @@ layout_arg_table:
     db LAY_SET_SPLIT_H, 0
     db "split-v", 0
     db LAY_SET_SPLIT_V, 0
+    db "master", 0
+    db LAY_SET_MASTER, 0
     db "toggle", 0
     db LAY_TOGGLE, 0
     db 0
@@ -377,6 +387,14 @@ focus_arg_table:
     db FOC_NEXT_TAB, 0
     db "prev-tab", 0
     db FOC_PREV_TAB, 0
+    db "right", 0
+    db FOC_RIGHT, 0
+    db "left", 0
+    db FOC_LEFT, 0
+    db "up", 0
+    db FOC_UP, 0
+    db "down", 0
+    db FOC_DOWN, 0
     db 0
 
 ; move-tab arg keyword table.
@@ -479,6 +497,12 @@ cfg_border_width:        resb 1
 cfg_border_focused:      resd 1
 cfg_border_unfocused:    resd 1
 focused_xid:             resd 1
+
+; Master/stack layout: master takes cfg_master_ratio percent of the
+; workspace's width on the left; the remaining clients stack as equal-
+; height vertical strips on the right. The "master" is the first
+; client (in client_xids order) whose client_ws matches.
+cfg_master_ratio:        resb 1
 
 ; Xinerama / multi-monitor state (phase 1c).
 ;
@@ -646,6 +670,7 @@ _start:
     mov dword [cfg_border_focused], DEFAULT_BORDER_FOCUSED
     mov dword [cfg_border_unfocused], DEFAULT_BORDER_UNFOCUSED
     mov dword [focused_xid], 0
+    mov byte [cfg_master_ratio], DEFAULT_MASTER_RATIO
     call load_config
 
     ; Become the WM by selecting substructure-redirect on root.
@@ -2655,9 +2680,16 @@ dispatch_keypress:
     jmp .dk_done
 .dk_focus_prev:
     cmp esi, FOC_PREV_TAB
-    jne .dk_done
+    jne .dk_focus_dir
     mov edi, -1
     call focus_cycle_tab
+    jmp .dk_done
+.dk_focus_dir:
+    ; right/left/up/down: in TABBED any direction cycles sequentially;
+    ; in SPLIT_H only right/left act (up/down are no-ops); in SPLIT_V
+    ; only up/down act. Maps right/down → +1, left/up → -1.
+    mov edi, esi
+    call action_focus_dir
     jmp .dk_done
 .dk_move_tab:
     cmp esi, MTAB_LEFT
@@ -3153,6 +3185,8 @@ apply_workspace_layout:
     je .awl_split_h
     cmp eax, LAYOUT_SPLIT_V
     je .awl_split_v
+    cmp eax, LAYOUT_MASTER
+    je .awl_master
 
     ; ----------- TABBED layout: single visible window ------------
     ; Walk all clients on ws. Configure & map the active one;
@@ -3309,6 +3343,98 @@ apply_workspace_layout:
     pop rdx
     pop rsi
     pop rbp
+    jmp .awl_render
+
+    ; ----------- MASTER layout: master on left + vertical stack on right ---
+    ; First ws-client in client_xids order is the master, takes
+    ; cfg_master_ratio percent of ws_w on the left. Rest stack as
+    ; equal-height strips on the right. With one client, master fills
+    ; the whole workspace (no stack).
+.awl_master:
+    push rbp
+    push rsi                              ; ws_x
+    push rdx                              ; ws_y
+    push rcx                              ; ws_w
+    push r12                              ; ws_h
+    movzx eax, byte [workspace_populated + r13 - 1]
+    test eax, eax
+    jz .awl_m_done
+    mov r15d, eax                         ; r15 = N
+
+    ; master_w = ws_w * ratio / 100. With N == 1, give master the
+    ; whole ws (no stack to make room for).
+    mov eax, [rsp + 8]                    ; ws_w
+    cmp r15d, 1
+    je .awl_m_master_full
+    movzx ecx, byte [cfg_master_ratio]
+    imul eax, ecx
+    mov ecx, 100
+    xor edx, edx
+    div ecx
+    jmp .awl_m_have_master_w
+.awl_m_master_full:
+    ; eax already = ws_w
+.awl_m_have_master_w:
+    mov ebp, eax                          ; ebp = master_w (also stack_x offset)
+
+    xor ebx, ebx                          ; client iterator
+    xor r14d, r14d                        ; visible-index in ws (0 = master)
+.awl_m_loop:
+    cmp ebx, [client_count]
+    jge .awl_m_done
+    movzx eax, byte [client_ws + rbx]
+    cmp eax, r13d
+    jne .awl_m_next
+    test r14d, r14d
+    jnz .awl_m_stack
+    ; ----- master rect -----
+    mov esi, [rsp + 24]                   ; ws_x
+    mov edx, [rsp + 16]                   ; ws_y
+    mov ecx, ebp                          ; master_w
+    mov r8d, [rsp + 0]                    ; ws_h
+    jmp .awl_m_emit
+.awl_m_stack:
+    ; ----- stack item rect -----
+    ; stack_x = ws_x + master_w; stack_w = ws_w - master_w.
+    ; stack_h slot = ws_h / (N - 1); idx within stack = r14 - 1.
+    mov esi, [rsp + 24]
+    add esi, ebp                          ; stack_x
+    mov ecx, [rsp + 8]
+    sub ecx, ebp                          ; stack_w
+    mov eax, r15d
+    dec eax                               ; (N - 1) stack items
+    mov edi, eax                          ; save stack count for last-item check
+    mov eax, [rsp + 0]                    ; ws_h
+    xor edx, edx
+    div edi                               ; eax = strip_h
+    mov r8d, eax                          ; rect.h
+    mov eax, r14d
+    dec eax                               ; idx in stack (0-based)
+    imul eax, r8d                         ; idx * strip_h
+    add eax, [rsp + 16]                   ; + ws_y
+    mov edx, eax                          ; rect.y
+    ; Last stack item absorbs remainder so bottom edge meets ws_y + ws_h.
+    mov eax, r14d
+    cmp eax, r15d
+    jne .awl_m_emit                       ; (r14 == N → last stack item)
+    mov r8d, [rsp + 16]
+    add r8d, [rsp + 0]
+    sub r8d, edx
+.awl_m_emit:
+    mov edi, [client_xids + rbx*4]
+    call configure_window_rect
+    mov eax, [client_xids + rbx*4]
+    call send_map_window
+    inc r14d
+.awl_m_next:
+    inc ebx
+    jmp .awl_m_loop
+.awl_m_done:
+    pop r12
+    pop rcx
+    pop rdx
+    pop rsi
+    pop rbp
 
 .awl_render:
     call render_bar
@@ -3335,7 +3461,7 @@ action_layout:
     jne .al_set
     movzx eax, byte [ws_layout + rbx - 1]
     inc eax
-    cmp eax, 3
+    cmp eax, 4
     jl .al_store
     xor eax, eax
     jmp .al_store
@@ -3345,6 +3471,8 @@ action_layout:
     cmp edi, LAY_SET_SPLIT_H
     je .al_have
     cmp edi, LAY_SET_SPLIT_V
+    je .al_have
+    cmp edi, LAY_SET_MASTER
     je .al_have
     jmp .al_done
 .al_have:
@@ -3431,6 +3559,205 @@ action_spawn_split:
     call fork_exec_string
 .ass_done:
     pop r13
+    pop r12
+    pop rbx
+    ret
+
+; eax = workspace number, edx = visual index within ws (0-based).
+; Returns XID at that index in eax, or 0 if out of range. Walks
+; client_xids in order, counting only clients on the requested ws.
+xid_at_ws_index:
+    push rbx
+    push r12
+    push r13
+    mov r12d, eax                         ; ws
+    mov r13d, edx                         ; target index
+    xor ebx, ebx
+    xor ecx, ecx                          ; running count
+.xawi_loop:
+    cmp ebx, [client_count]
+    jge .xawi_none
+    movzx eax, byte [client_ws + rbx]
+    cmp eax, r12d
+    jne .xawi_next
+    cmp ecx, r13d
+    je .xawi_hit
+    inc ecx
+.xawi_next:
+    inc ebx
+    jmp .xawi_loop
+.xawi_hit:
+    mov eax, [client_xids + rbx*4]
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.xawi_none:
+    xor eax, eax
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; eax = XID, edx = workspace number. Returns the visual index (0-based)
+; of that XID within the workspace's clients in eax, or -1 if not on ws.
+ws_index_of_xid:
+    push rbx
+    push r12
+    push r13
+    mov r12d, eax                         ; XID
+    mov r13d, edx                         ; ws
+    xor ebx, ebx
+    xor ecx, ecx
+.wiox_loop:
+    cmp ebx, [client_count]
+    jge .wiox_none
+    movzx eax, byte [client_ws + rbx]
+    cmp eax, r13d
+    jne .wiox_next
+    mov eax, [client_xids + rbx*4]
+    cmp eax, r12d
+    je .wiox_hit
+    inc ecx
+.wiox_next:
+    inc ebx
+    jmp .wiox_loop
+.wiox_hit:
+    mov eax, ecx
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.wiox_none:
+    mov eax, -1
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; edi = direction sentinel (FOC_RIGHT/LEFT/UP/DOWN). Routes to
+; focus_cycle_tab(±1) when the direction is meaningful for the current
+; workspace's layout, no-op otherwise:
+;   TABBED  : all 4 directions cycle (right/down = +1, left/up = -1)
+;   SPLIT_H : right/left only act (up/down are no-ops)
+;   SPLIT_V : up/down only act (left/right are no-ops)
+;   MASTER  : from master, right → first stack item; from a stack item,
+;             left → master, up/down walk the stack; off-axis = no-op
+action_focus_dir:
+    push rbx
+    push r12
+    movzx eax, byte [current_ws]
+    test eax, eax
+    jz .afd_done
+    mov r12d, eax                       ; ws number
+    dec eax
+    movzx ebx, byte [ws_layout + rax]   ; layout enum
+
+    cmp ebx, LAYOUT_SPLIT_H
+    je .afd_split_h
+    cmp ebx, LAYOUT_SPLIT_V
+    je .afd_split_v
+    cmp ebx, LAYOUT_MASTER
+    je .afd_master
+    jmp .afd_pick                       ; TABBED — all dirs cycle
+.afd_split_h:
+    cmp edi, FOC_UP
+    je .afd_done
+    cmp edi, FOC_DOWN
+    je .afd_done
+    jmp .afd_pick
+.afd_split_v:
+    cmp edi, FOC_LEFT
+    je .afd_done
+    cmp edi, FOC_RIGHT
+    je .afd_done
+    jmp .afd_pick
+.afd_pick:
+    ; Direction → step. right/down advance; left/up retreat.
+    mov ecx, 1
+    cmp edi, FOC_LEFT
+    je .afd_neg
+    cmp edi, FOC_UP
+    je .afd_neg
+    jmp .afd_have_step
+.afd_neg:
+    mov ecx, -1
+.afd_have_step:
+    mov edi, ecx
+    call focus_cycle_tab
+    jmp .afd_done
+
+    ; ---- MASTER navigation ----
+    ; Find focused window's ws-index. 0 = master, 1..N-1 = stack items.
+    ;   right + master       → index 1 (first stack item)
+    ;   left  + stack(any)   → 0       (master)
+    ;   up    + stack(idx>1) → idx - 1
+    ;   down  + stack(<last) → idx + 1
+    ;   anything else        → no-op
+.afd_master:
+    push rdi                              ; preserve direction
+    mov ecx, r12d
+    dec ecx
+    mov eax, [ws_active_xid + rcx*4]
+    test eax, eax
+    pop rdi
+    jz .afd_done
+    push rdi
+    mov edx, r12d
+    call ws_index_of_xid                  ; eax = focused index in ws
+    pop rdi
+    cmp eax, -1
+    je .afd_done
+    mov ebx, eax                          ; ebx = focused ws-index
+    movzx ecx, byte [workspace_populated + r12 - 1]   ; ecx = N
+    test ebx, ebx
+    jnz .afd_m_in_stack
+    ; Master: only "right" does anything (jump to first stack item).
+    cmp edi, FOC_RIGHT
+    jne .afd_done
+    cmp ecx, 1
+    jle .afd_done                         ; no stack
+    mov eax, r12d
+    mov edx, 1
+    jmp .afd_m_focus
+.afd_m_in_stack:
+    cmp edi, FOC_LEFT
+    je .afd_m_to_master
+    cmp edi, FOC_UP
+    je .afd_m_up
+    cmp edi, FOC_DOWN
+    je .afd_m_down
+    jmp .afd_done                         ; right in stack = no-op
+.afd_m_to_master:
+    mov eax, r12d
+    xor edx, edx
+    jmp .afd_m_focus
+.afd_m_up:
+    cmp ebx, 1
+    jle .afd_done                         ; already first stack item
+    mov eax, r12d
+    mov edx, ebx
+    dec edx
+    jmp .afd_m_focus
+.afd_m_down:
+    mov eax, ebx
+    inc eax
+    cmp eax, ecx
+    jge .afd_done                         ; already last stack item
+    mov edx, eax
+    mov eax, r12d
+.afd_m_focus:
+    call xid_at_ws_index
+    test eax, eax
+    jz .afd_done
+    push rax
+    mov ecx, r12d
+    dec ecx
+    mov [ws_active_xid + rcx*4], eax
+    call set_input_focus
+    call x11_flush
+    pop rax
+.afd_done:
     pop r12
     pop rbx
     ret
@@ -4402,6 +4729,11 @@ apply_setting:
     call .as_streq
     test eax, eax
     jnz .as_border_unfocused
+    mov rdi, r13
+    lea rsi, [.as_kw_master_ratio]
+    call .as_streq
+    test eax, eax
+    jnz .as_master_ratio
     jmp .as_done
 
 .as_bar_height:
@@ -4462,6 +4794,19 @@ apply_setting:
     call parse_hex_color
     mov [cfg_border_unfocused], eax
     jmp .as_done
+.as_master_ratio:
+    mov rdi, r12
+    call parse_decimal_byte
+    cmp eax, 10
+    jge .as_mr_check_hi
+    mov eax, 10
+.as_mr_check_hi:
+    cmp eax, 90
+    jle .as_mr_ok
+    mov eax, 90
+.as_mr_ok:
+    mov [cfg_master_ratio], al
+    jmp .as_done
 .as_done:
     pop r13
     pop rbx
@@ -4499,6 +4844,7 @@ apply_setting:
 .as_kw_border_width:    db "border_width", 0
 .as_kw_border_focused:  db "border_focused", 0
 .as_kw_border_unfocused: db "border_unfocused", 0
+.as_kw_master_ratio:    db "master_ratio", 0
 
 ; rdi = NUL-terminated string starting with optional '#' then 6 hex
 ; digits. Returns CARD32 0x00RRGGBB in eax. Garbage in → 0 in eax.

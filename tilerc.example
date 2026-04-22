@@ -28,6 +28,12 @@
 #   move-to N                move the focused window to workspace N
 #   focus next-tab           cycle to the next tab on the current workspace
 #   focus prev-tab           cycle to the previous tab
+#   focus right|left|up|down move focus geometrically. In TABBED any
+#                            direction cycles sequentially (right/down
+#                            go forward, left/up go back). In SPLIT_H
+#                            only right/left act; in SPLIT_V only
+#                            up/down act. The off-axis direction is a
+#                            silent no-op.
 #   move-tab left            reorder the focused tab one slot to the left
 #   move-tab right           reorder the focused tab one slot to the right
 #   tab-color-cycle          bump the focused tab's colour to the next
@@ -44,7 +50,11 @@
 #                            side-by-side in equal-width vertical strips
 #   layout split-v           current workspace shows ALL its windows
 #                            stacked in equal-height horizontal strips
-#   layout toggle            cycle TABBED → SPLIT_H → SPLIT_V → TABBED
+#   layout master            first window on the left as "master" (50%
+#                            of width by default), the rest stacked as
+#                            equal-height strips on the right. Set
+#                            master_ratio = N (10..90) to tweak.
+#   layout toggle            cycle TABBED → SPLIT_H → SPLIT_V → MASTER → TABBED
 #   spawn-split DIR CMD      switch the workspace to a split layout and
 #                            spawn CMD into the slot just next to the
 #                            focused window. DIR is one of right, left,
@@ -96,6 +106,12 @@ bind Mod4+Shift+0       move-to 10
 # === Layout ===
 bind Mod4+Tab           layout toggle
 
+# === Focus direction ===
+bind Mod4+Shift+Right   focus right
+bind Mod4+Shift+Left    focus left
+bind Mod4+Shift+Up      focus up
+bind Mod4+Shift+Down    focus down
+
 # === Spawn into split (phase 1b.3b.1) ===
 bind Mod4+r             spawn-split right glass
 bind Mod4+l             spawn-split left  glass
@@ -139,6 +155,11 @@ ws_populated     = #555555
 border_width     = 1
 border_focused   = #ffffff
 border_unfocused = #222222
+
+# === Master/stack layout ===
+# master_ratio = percent of workspace width given to the master pane
+# (clamped 10..90). Stack pane gets the rest.
+master_ratio     = 50
 
 # === Autostart ===
 exec feh --bg-fill /home/geir/setup/wallpapers/blue.png
