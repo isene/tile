@@ -45,6 +45,14 @@
 %define X11_UNGRAB_KEY          34
 %define X11_GET_KEYBOARD_MAPPING 101
 %define X11_KILL_CLIENT         113
+%define X11_QUERY_EXTENSION     98
+
+; Xinerama sub-opcodes (sent with major = xinerama_major).
+%define XIN_QUERY_VERSION       0
+%define XIN_GET_STATE           1
+%define XIN_QUERY_SCREENS       5
+
+%define MAX_OUTPUTS             4
 %define X11_SET_INPUT_FOCUS     42
 %define X11_SEND_EVENT          25
 %define X11_CREATE_GC           55
@@ -181,6 +189,10 @@ wm_protocols_str: db "WM_PROTOCOLS"
 wm_protocols_len  equ 12
 wm_delete_str:    db "WM_DELETE_WINDOW"
 wm_delete_len     equ 16
+
+; XINERAMA extension name (uppercase per X11 convention).
+xinerama_name:    db "XINERAMA"
+xinerama_name_len equ 8
 
 ; Path suffixes
 tilerc_suffix:    db "/.tilerc", 0
@@ -403,6 +415,28 @@ cfg_ws_populated:        resd 1
 ; active client.
 cfg_gap_inner:           resw 1
 
+; Xinerama / multi-monitor state (phase 1c).
+;
+; xinerama_major = the major opcode the X server assigned to the
+; XINERAMA extension (0 if the extension isn't present — fall back to
+; single-screen mode using x11_screen_width/x11_screen_height).
+;
+; output_count = number of physical screens reported by Xinerama.
+; output_x / output_y / output_w / output_h = each output's geometry
+; in root coordinates. Output 0 is the primary; non-zero indices are
+; secondaries, ordered as Xinerama returned them.
+;
+; ws_pinned_output[w-1] = which output workspace w lives on. Set at
+; startup based on the user's wishes (default: WS 1..9 → output 0,
+; WS 10 → output 1 if a secondary exists, else also output 0).
+xinerama_major:          resb 1
+output_count:            resb 1
+output_x:                resw MAX_OUTPUTS
+output_y:                resw MAX_OUTPUTS
+output_w:                resw MAX_OUTPUTS
+output_h:                resw MAX_OUTPUTS
+ws_pinned_output:        resb WS_COUNT
+
 ; Stash: a small LIFO of "hidden" client XIDs. `stash` unmaps the
 ; currently focused tab and pushes its XID; `unstash` pops and
 ; re-tracks it on the current workspace as the active tab. Replaces
@@ -530,6 +564,12 @@ _start:
 
     ; Resolve the ICCCM atoms used for WM_DELETE_WINDOW.
     call intern_wm_atoms
+
+    ; Discover physical outputs via the XINERAMA extension. Falls back
+    ; to a single-output table covering the whole root window if the
+    ; extension isn't present. After this returns, output_count is at
+    ; least 1 and ws_pinned_output[] is initialised.
+    call discover_outputs
 
     ; Resolve every bind's keysym to a keycode and grab them on root.
     call resolve_and_grab_binds
@@ -1264,12 +1304,14 @@ event_loop:
     syscall
 
 .ev_map_request:
-    ; Pre-size to fullscreen, then track, then make this the active
-    ; tab on the current workspace (set_active_tab unmaps whatever
-    ; was previously visible and maps the new client).
+    ; New client lands on the current workspace; size it to that
+    ; workspace's pinned output before mapping. set_active_tab then
+    ; unmaps the previously-visible tab on the same workspace and
+    ; maps this one.
     mov eax, [x11_read_buf + 8]
     mov edi, eax
-    call configure_client_fullscreen
+    movzx esi, byte [current_ws]
+    call configure_client_for_workspace
     mov eax, [x11_read_buf + 8]
     call track_client
     mov eax, [x11_read_buf + 8]
@@ -1277,24 +1319,25 @@ event_loop:
     jmp event_loop
 
 .ev_configure_request:
-    ; Honor the request but clamp width/height to screen.
-    ; ConfigureRequest layout (32 bytes):
-    ;   0: type (23)
-    ;   1: stack-mode
-    ;   2-3: sequence
-    ;   4-7: parent
-    ;   8-11: window
-    ;   12-15: sibling
-    ;   16-17: x
-    ;   18-19: y
-    ;   20-21: width
-    ;   22-23: height
-    ;   24-25: border-width
-    ;   26-27: value-mask
-    ; For phase 1a, we ignore the requested geometry and force fullscreen.
+    ; A managed client is asking to resize. Look up its workspace and
+    ; force the fullscreen geometry of THAT workspace's pinned output
+    ; — we don't honour the requested size, but we do honour the
+    ; correct screen for the client's workspace.
     mov eax, [x11_read_buf + 8]
+    push rax
+    call find_client_index
+    cmp eax, -1
+    je .ev_cr_default_ws
+    movzx esi, byte [client_ws + rax]
+    pop rax
     mov edi, eax
-    call configure_client_fullscreen
+    call configure_client_for_workspace
+    jmp event_loop
+.ev_cr_default_ws:
+    pop rax
+    mov edi, eax
+    movzx esi, byte [current_ws]
+    call configure_client_for_workspace
     jmp event_loop
 
 .ev_unmap_notify:
@@ -1333,42 +1376,85 @@ event_loop:
 ; ══════════════════════════════════════════════════════════════════════
 
 ; rdi = window XID. Configure to (0, bar_height, screen_w, screen_h-bar_height)
+; Old single-output entry point — defaults to current_ws so existing
+; callers (and any caller without explicit workspace context) keep
+; working. New per-workspace logic delegates to
+; configure_client_for_workspace.
 configure_client_fullscreen:
+    push rdi
+    movzx esi, byte [current_ws]
+    pop rdi
+    jmp configure_client_for_workspace
+
+; edi = window XID, esi = workspace number (1..WS_COUNT). Configures
+; the window to fill the workspace's pinned output's rectangle, minus
+; the bar reservation on output 0 and minus the inner gap on every
+; side. With Xinerama, each output has its own (x, y, w, h) in root
+; coordinates — that's where the bar reservation also goes.
+configure_client_for_workspace:
     push rbx
     push r12
     push r13
-    mov r12d, edi
-    movzx ebx, word [bar_height]      ; bar_height
-    movzx r13d, word [cfg_gap_inner]  ; gap
+    push r14
+    push r15
+    mov r12d, edi                       ; window XID
+    ; Resolve workspace → output index. Defaults to 0 if ws is out of
+    ; range (e.g. a freshly-mapped client during init).
+    movzx eax, sil
+    test eax, eax
+    jz .ccfw_use_primary
+    cmp eax, WS_COUNT
+    jg .ccfw_use_primary
+    movzx ebx, byte [ws_pinned_output + rax - 1]
+    cmp bl, byte [output_count]
+    jl .ccfw_have_output
+.ccfw_use_primary:
+    xor ebx, ebx
+.ccfw_have_output:
+    ; r13 = output index, fetch its rectangle.
+    mov r13d, ebx
+    movzx r14d, word [output_x + r13*2]    ; ox
+    movzx r15d, word [output_y + r13*2]    ; oy
+    movzx ecx, word [output_w + r13*2]     ; ow
+    movzx edx, word [output_h + r13*2]     ; oh
 
+    ; Reserve bar height only on the bar's home output (output 0).
+    ; Other outputs use their full height. This keeps the bar from
+    ; eating pixels out of the external monitor's geometry.
+    movzx eax, word [bar_height]
+    test r13d, r13d
+    jnz .ccfw_no_bar
+    add r15d, eax                          ; oy += bar
+    sub edx, eax                           ; oh -= bar
+.ccfw_no_bar:
+
+    ; Apply inner gap on all four sides.
+    movzx eax, word [cfg_gap_inner]
+    add r14d, eax                          ; ox += gap
+    add r15d, eax                          ; oy += gap
+    mov edi, eax
+    shl edi, 1                             ; 2*gap
+    sub ecx, edi                           ; ow -= 2*gap
+    sub edx, edi                           ; oh -= 2*gap
+
+    ; Build ConfigureWindow request: x, y, w, h.
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_CONFIGURE_WINDOW
     mov byte [rdi+1], 0
-    mov word [rdi+2], 7          ; length = 3 header + 4 values = 7 words
-    mov [rdi+4], r12d            ; window
+    mov word [rdi+2], 7                    ; 3 header + 4 values = 7 words
+    mov [rdi+4], r12d                      ; window
     mov word [rdi+8], CFG_X | CFG_Y | CFG_WIDTH | CFG_HEIGHT
-    mov word [rdi+10], 0         ; pad
-    ; x = gap
-    mov dword [rdi+12], r13d
-    ; y = bar_height + gap
-    mov eax, ebx
-    add eax, r13d
-    mov dword [rdi+16], eax
-    ; w = screen_w - 2*gap
-    movzx eax, word [x11_screen_width]
-    mov ecx, r13d
-    shl ecx, 1
-    sub eax, ecx
-    mov dword [rdi+20], eax
-    ; h = screen_h - bar_height - 2*gap
-    movzx eax, word [x11_screen_height]
-    sub eax, ebx
-    sub eax, ecx
-    mov dword [rdi+24], eax
+    mov word [rdi+10], 0
+    mov dword [rdi+12], r14d               ; x
+    mov dword [rdi+16], r15d               ; y
+    mov dword [rdi+20], ecx                ; w
+    mov dword [rdi+24], edx                ; h
     lea rsi, [tmp_buf]
     mov rdx, 28
     call x11_buffer
     inc dword [x11_seq]
+    pop r15
+    pop r14
     pop r13
     pop r12
     pop rbx
@@ -1552,6 +1638,242 @@ action_kill_focused:
 ; ══════════════════════════════════════════════════════════════════════
 
 ; Intern WM_PROTOCOLS and WM_DELETE_WINDOW atoms.
+; ══════════════════════════════════════════════════════════════════════
+; Multi-monitor discovery (XINERAMA)
+;
+; The X server's XINERAMA extension exposes the geometry of each
+; physical output as a flat list of rectangles in root coordinates.
+; We use it (rather than RandR) because it answers our exact question
+; — "what are the screen rectangles?" — in a single round-trip with a
+; trivial reply, and it works on every reasonable X server config the
+; user is likely to encounter (laptop alone, laptop + extended HDMI).
+; If the extension isn't present, we fall back to a single output
+; covering the whole root window, which collapses behaviour to the
+; single-screen case.
+; ══════════════════════════════════════════════════════════════════════
+
+; rdi = extension name (data ptr), rsi = name length.
+; Returns eax = major opcode (1..255) if the extension is present,
+; or 0 if not. Synchronous: must be called before the event loop or
+; while no async events are queued.
+query_extension:
+    push rbx
+    push r12
+    push r13
+    mov r12, rdi
+    mov r13d, esi
+    call x11_flush
+
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_QUERY_EXTENSION
+    mov byte [rdi+1], 0
+    ; Length = 2 + ceil(name_len / 4)
+    mov ecx, r13d
+    add ecx, 3
+    shr ecx, 2
+    add ecx, 2
+    mov word [rdi+2], cx
+    mov word [rdi+4], r13w           ; name length
+    mov word [rdi+6], 0
+    ; Copy name bytes
+    lea rdi, [tmp_buf + 8]
+    mov rsi, r12
+    mov ecx, r13d
+.qe_cp:
+    test ecx, ecx
+    jz .qe_pad
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec ecx
+    jmp .qe_cp
+.qe_pad:
+    ; Pad to 4-byte boundary
+    mov ecx, r13d
+    and ecx, 3
+    jz .qe_send
+    mov edx, 4
+    sub edx, ecx
+.qe_pl:
+    mov byte [rdi], 0
+    inc rdi
+    dec edx
+    jnz .qe_pl
+.qe_send:
+    mov rdx, rdi
+    lea rsi, [tmp_buf]
+    sub rdx, rsi
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    inc dword [x11_seq]
+
+    ; Read 32-byte reply
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_read_buf]
+    mov rdx, 32
+    syscall
+    cmp rax, 32
+    jl .qe_no
+    cmp byte [x11_read_buf + 8], 0   ; present
+    je .qe_no
+    movzx eax, byte [x11_read_buf + 9]   ; major opcode
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.qe_no:
+    xor eax, eax
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; Issue Xinerama QueryScreens (sub-opcode 5). Fills output_x/y/w/h
+; arrays and output_count. Requires xinerama_major to be set.
+xinerama_query_screens:
+    push rbx
+    push r12
+    push r13
+    call x11_flush
+
+    lea rdi, [tmp_buf]
+    movzx eax, byte [xinerama_major]
+    mov [rdi], al                    ; major opcode
+    mov byte [rdi+1], XIN_QUERY_SCREENS
+    mov word [rdi+2], 1              ; length = 1 word
+
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 4
+    syscall
+    inc dword [x11_seq]
+
+    ; Read the 32-byte reply header
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_read_buf]
+    mov rdx, 32
+    syscall
+    cmp rax, 32
+    jl .xqs_fail
+
+    ; Number of screens at offset 8 (CARD32)
+    mov ebx, [x11_read_buf + 8]
+    cmp ebx, MAX_OUTPUTS
+    jle .xqs_count_ok
+    mov ebx, MAX_OUTPUTS
+.xqs_count_ok:
+    test ebx, ebx
+    jz .xqs_fail
+
+    ; Reply additional length in bytes = reply_len_word * 4
+    mov edx, [x11_read_buf + 4]
+    shl edx, 2
+    test edx, edx
+    jz .xqs_fail
+
+    ; Read screen-info bytes into x11_read_buf + 32
+    xor r12, r12
+.xqs_read:
+    cmp r12, rdx
+    jge .xqs_parse
+    push rdx
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_read_buf + 32]
+    add rsi, r12
+    mov rcx, rdx
+    sub rcx, r12
+    mov rdx, rcx
+    syscall
+    pop rdx
+    test rax, rax
+    jle .xqs_fail
+    add r12, rax
+    jmp .xqs_read
+
+.xqs_parse:
+    mov [output_count], bl
+    xor r13d, r13d
+.xqs_loop:
+    cmp r13d, ebx
+    jge .xqs_done
+    mov rax, r13
+    shl rax, 3                       ; idx * 8 bytes per screen
+    lea rsi, [x11_read_buf + 32]
+    add rsi, rax
+    movzx eax, word [rsi]
+    mov [output_x + r13*2], ax
+    movzx eax, word [rsi + 2]
+    mov [output_y + r13*2], ax
+    movzx eax, word [rsi + 4]
+    mov [output_w + r13*2], ax
+    movzx eax, word [rsi + 6]
+    mov [output_h + r13*2], ax
+    inc r13
+    jmp .xqs_loop
+.xqs_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.xqs_fail:
+    mov byte [output_count], 0
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; Discover physical outputs. After this returns, output_count >= 1
+; and ws_pinned_output[] is initialised. Must be called after
+; intern_wm_atoms (so we don't interleave InternAtom and QueryExtension
+; replies on the wire).
+discover_outputs:
+    push rbx
+    lea rdi, [xinerama_name]
+    mov esi, xinerama_name_len
+    call query_extension
+    test eax, eax
+    jz .do_fallback
+    mov [xinerama_major], al
+    call xinerama_query_screens
+    cmp byte [output_count], 0
+    jne .do_pin
+.do_fallback:
+    ; XINERAMA absent or returned no screens — single virtual output
+    ; covering the whole root window.
+    mov byte [output_count], 1
+    mov word [output_x], 0
+    mov word [output_y], 0
+    mov ax, [x11_screen_width]
+    mov [output_w], ax
+    mov ax, [x11_screen_height]
+    mov [output_h], ax
+.do_pin:
+    ; Default workspace pinning: every workspace on output 0.
+    xor ebx, ebx
+.do_pin_loop:
+    cmp ebx, WS_COUNT
+    jge .do_pin_check_ws10
+    mov byte [ws_pinned_output + rbx], 0
+    inc ebx
+    jmp .do_pin_loop
+.do_pin_check_ws10:
+    ; If a secondary output exists, route WS 10 (the special "0" slot
+    ; in the bar) to it. Acts as the user's external-monitor pin —
+    ; works out-of-the-box for the laptop+HDMI setup; user can
+    ; override via `pin workspace N to OUTPUT_INDEX` in ~/.tilerc later.
+    cmp byte [output_count], 2
+    jl .do_pin_done
+    mov byte [ws_pinned_output + 9], 1
+.do_pin_done:
+    pop rbx
+    ret
+
 intern_wm_atoms:
     push rbx
     push r12
@@ -3396,10 +3718,16 @@ create_bar:
     mov [rdi+4], r12d                     ; wid
     mov eax, [x11_root_window]
     mov [rdi+8], eax                      ; parent
-    mov word [rdi+12], 0                  ; x
-    mov word [rdi+14], 0                  ; y
-    movzx eax, word [x11_screen_width]
-    mov [rdi+16], ax                      ; width
+    ; Bar lives on output 0 (the primary / laptop), not across the
+    ; whole root. With Xinerama in extended mode the root spans every
+    ; output and a bar at (0, 0, screen_w) would smear across the
+    ; external monitor too.
+    movzx eax, word [output_x]
+    mov [rdi+12], ax                      ; x = output_x[0]
+    movzx eax, word [output_y]
+    mov [rdi+14], ax                      ; y = output_y[0]
+    movzx eax, word [output_w]
+    mov [rdi+16], ax                      ; width = output_w[0]
     movzx eax, word [bar_height]
     mov [rdi+18], ax                      ; height
     mov word [rdi+20], 0                  ; border-width
@@ -3571,7 +3899,9 @@ render_bar:
     call set_bar_fg
     xor edi, edi
     xor esi, esi
-    movzx edx, word [x11_screen_width]
+    ; Bar lives on output 0, so coordinates are local to that output
+    ; and width = output_w[0], not the full root width.
+    movzx edx, word [output_w]
     movzx ecx, word [bar_height]
     call fill_rect
 
@@ -3593,7 +3923,7 @@ render_bar:
     imul ecx, SQUARE_GAP                  ; 9 inter-square gaps
     add eax, ecx
     add eax, 3 * WS_GROUP_GAP             ; 3 group gaps
-    movzx ecx, word [x11_screen_width]
+    movzx ecx, word [output_w]            ; bar lives on output 0
     sub ecx, eax
     test ecx, ecx
     jns .rb_ws_have_x
@@ -3784,9 +4114,10 @@ action_unstash:
     ; Re-track on current workspace.
     mov eax, ebx
     call track_client
-    ; Configure to fullscreen (in case screen size changed).
+    ; Configure to fullscreen on the current workspace's pinned output.
     mov edi, ebx
-    call configure_client_fullscreen
+    movzx esi, byte [current_ws]
+    call configure_client_for_workspace
     ; Make it the active tab (set_active_tab unmaps the old active and
     ; maps the new one).
     mov eax, ebx
