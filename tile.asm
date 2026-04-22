@@ -437,6 +437,17 @@ output_w:                resw MAX_OUTPUTS
 output_h:                resw MAX_OUTPUTS
 ws_pinned_output:        resb WS_COUNT
 
+; Per-output state: which workspace is currently visible on each
+; output. Allows the external monitor to keep showing WS 10 even
+; while the laptop user switches between workspaces 1..9. Initialized
+; in discover_outputs: output_current_ws[0] = 1 (laptop view defaults
+; to WS 1), output_current_ws[1] = 10 if a secondary exists.
+;
+; The global current_ws still tracks the most-recently-focused
+; workspace (used for "what does kill act on", "where does a new
+; client land", etc.).
+output_current_ws:       resb MAX_OUTPUTS
+
 ; Stash: a small LIFO of "hidden" client XIDs. `stash` unmaps the
 ; currently focused tab and pushes its XID; `unstash` pops and
 ; re-tracks it on the current workspace as the active tab. Replaces
@@ -1868,8 +1879,18 @@ discover_outputs:
     ; works out-of-the-box for the laptop+HDMI setup; user can
     ; override via `pin workspace N to OUTPUT_INDEX` in ~/.tilerc later.
     cmp byte [output_count], 2
-    jl .do_pin_done
+    jl .do_pin_set_outputs
     mov byte [ws_pinned_output + 9], 1
+.do_pin_set_outputs:
+    ; Initialise per-output current workspace.
+    ;   output 0 (laptop): defaults to WS 1
+    ;   output 1+ (external): defaults to whichever workspace is
+    ;                         pinned there. With the default pinning
+    ;                         that's WS 10 on output 1.
+    mov byte [output_current_ws + 0], 1
+    cmp byte [output_count], 2
+    jl .do_pin_done
+    mov byte [output_current_ws + 1], 10
 .do_pin_done:
     pop rbx
     ret
@@ -2019,18 +2040,38 @@ find_top_of_workspace:
     pop rbx
     ret
 
-; eax = new XID. Make it the active (visible) tab on the current
-; workspace. Unmaps whatever was previously active. Idempotent if eax
-; is already the active tab.
+; eax = new XID. Make it the active tab on the current workspace.
+; Unmaps the previously-active XID and maps the new one ON THE
+; OUTPUT this workspace is pinned to. Does not touch any other
+; output — so a different workspace currently visible on a different
+; output (e.g. WS 10 on the external) is left alone.
+;
+; Idempotent if eax already equals the workspace's active XID.
 set_active_tab:
     push rbx
     push r12
+    push r13
     mov r12d, eax                ; new active XID
-    movzx ecx, byte [current_ws]
+    movzx r13d, byte [current_ws]
+    test r13d, r13d
+    jz .sat_done
+    mov ecx, r13d
     dec ecx
     mov ebx, [ws_active_xid + rcx*4]
     cmp ebx, r12d
     je .sat_done
+    ; Update workspace state.
+    mov [ws_active_xid + rcx*4], r12d
+    ; If this workspace is currently visible on its output, swap the
+    ; visible window. Otherwise (workspace is not on-screen anywhere),
+    ; just record the new active and don't touch X.
+    mov eax, r13d
+    dec eax
+    movzx edi, byte [ws_pinned_output + rax]
+    movzx eax, byte [output_current_ws + rdi]
+    cmp eax, r13d
+    jne .sat_no_swap
+    ; Unmap old visible.
     test ebx, ebx
     jz .sat_skip_unmap
     mov eax, ebx
@@ -2041,24 +2082,23 @@ set_active_tab:
     mov eax, ebx
     call send_unmap_window
 .sat_skip_unmap:
-    movzx ecx, byte [current_ws]
-    dec ecx
-    mov [ws_active_xid + rcx*4], r12d
     mov eax, r12d
     call send_map_window
     mov eax, r12d
     call set_input_focus
+.sat_no_swap:
     call render_bar
     call x11_flush
 .sat_done:
+    pop r13
     pop r12
     pop rbx
     ret
 
 ; eax = XID that has been destroyed or unmapped client-initiated.
-; Untracks it, then if it was the active tab on any workspace, re-elects
-; a new top for that workspace and (if it's the current ws) makes it
-; visible.
+; Untracks it, then for any workspace whose active tab pointed at the
+; dying XID, elects a new top. If that workspace is currently visible
+; on its output, map+focus the new top.
 client_closed:
     push rbx
     push r12
@@ -2071,20 +2111,31 @@ client_closed:
     jge .cc_done
     cmp [ws_active_xid + rbx*4], r12d
     jne .cc_next
-    ; Stale active tab — find a replacement on this workspace.
+    ; Stale — re-elect on this workspace (ebx+1 is the workspace number).
     mov eax, ebx
-    inc eax                      ; ws number
+    inc eax
     call find_top_of_workspace
     mov [ws_active_xid + rbx*4], eax
     test eax, eax
     jz .cc_next                  ; workspace now empty
-    movzx edx, byte [current_ws]
-    dec edx
-    cmp edx, ebx
-    jne .cc_next                 ; not the current ws — stays hidden
+    ; Is this workspace currently visible on its pinned output?
+    movzx edx, byte [ws_pinned_output + rbx]
+    cmp dl, byte [output_count]
+    jge .cc_next
+    movzx ecx, byte [output_current_ws + rdx]
+    mov edx, ebx
+    inc edx                      ; ws number
+    cmp ecx, edx
+    jne .cc_next                 ; not visible — stays hidden
     push rax
     call send_map_window
     pop rax
+    ; Only steal keyboard focus if this is the GLOBAL current_ws —
+    ; don't yank focus away from the laptop just because a window
+    ; closed on the external.
+    movzx ecx, byte [current_ws]
+    cmp ecx, edx
+    jne .cc_next
     call set_input_focus
 .cc_next:
     inc ebx
@@ -2401,10 +2452,18 @@ run_autostart:
 ; map new active". Stash target ws in r12 (callee-saved) and old ws in
 ; r13 because find_client_index/send_unmap_window/send_map_window all
 ; clobber rdi (caller-saved).
+; edi = target workspace (1..WS_COUNT). With multi-monitor, switching
+; only affects the OUTPUT this workspace is pinned to — other outputs
+; keep showing whatever they were showing. So switching from WS 5
+; (laptop) to WS 10 (external) leaves the laptop displaying WS 5;
+; switching back from WS 10 to WS 5 leaves the external displaying
+; WS 10. The bar always reflects the global current_ws.
 switch_workspace:
     push rbx
     push r12
     push r13
+    push r14
+    push r15
     test edi, edi
     jz .sw_done
     cmp edi, WS_COUNT
@@ -2412,46 +2471,78 @@ switch_workspace:
     movzx r13d, byte [current_ws]
     cmp edi, r13d
     jne .sw_proceed
-    ; Already on the requested workspace — i3's
-    ; workspace_auto_back_and_forth: re-pressing the current ws number
-    ; toggles to the previously-active workspace. Silent no-op if no
-    ; previous workspace is recorded yet.
+    ; Already on the requested workspace — i3 auto back-and-forth.
     movzx eax, byte [prev_ws]
     test eax, eax
     jz .sw_done
     mov edi, eax
 .sw_proceed:
-    mov r12d, edi                ; r12 = target ws (preserved across calls)
+    mov r12d, edi                ; r12 = target ws
     mov [prev_ws], r13b
-    ; Unmap old workspace's active tab.
-    mov ecx, r13d
+    mov [current_ws], r12b
+
+    ; Determine target workspace's pinned output.
+    mov eax, r12d
+    dec eax
+    movzx r14d, byte [ws_pinned_output + rax]
+    cmp r14b, byte [output_count]
+    jl .sw_have_output
+    xor r14d, r14d
+.sw_have_output:
+
+    ; If target ws is already shown on its output, skip the swap.
+    movzx eax, byte [output_current_ws + r14]
+    cmp eax, r12d
+    je .sw_just_focus
+
+    ; Compute old visible XID on the target's output.
+    movzx ecx, byte [output_current_ws + r14]
+    test ecx, ecx
+    jz .sw_no_old_visible
     dec ecx
     mov ebx, [ws_active_xid + rcx*4]
+    jmp .sw_have_old
+.sw_no_old_visible:
+    xor ebx, ebx
+.sw_have_old:
+    ; Compute new visible XID.
+    mov ecx, r12d
+    dec ecx
+    mov r15d, [ws_active_xid + rcx*4]
+    cmp ebx, r15d
+    je .sw_update_state
+    ; Unmap old.
     test ebx, ebx
-    jz .sw_no_old
+    jz .sw_skip_unmap
     mov eax, ebx
     call find_client_index
     cmp eax, -1
-    je .sw_no_old
+    je .sw_skip_unmap
     mov byte [client_unmap_expected + rax], 1
     mov eax, ebx
     call send_unmap_window
-.sw_no_old:
-    mov [current_ws], r12b
-    ; Map new workspace's active tab (if any).
+.sw_skip_unmap:
+    ; Map new.
+    test r15d, r15d
+    jz .sw_update_state
+    mov eax, r15d
+    call send_map_window
+.sw_update_state:
+    mov [output_current_ws + r14], r12b
+.sw_just_focus:
+    ; Focus the target workspace's active tab if any.
     mov ecx, r12d
     dec ecx
-    mov ebx, [ws_active_xid + rcx*4]
-    test ebx, ebx
-    jz .sw_no_new
-    mov eax, ebx
-    call send_map_window
-    mov eax, ebx
+    mov eax, [ws_active_xid + rcx*4]
+    test eax, eax
+    jz .sw_render
     call set_input_focus
-.sw_no_new:
+.sw_render:
     call render_bar
     call x11_flush
 .sw_done:
+    pop r15
+    pop r14
     pop r13
     pop r12
     pop rbx
@@ -2517,14 +2608,22 @@ workspace_prev_populated:
     jmp switch_workspace
 
 ; edi = target workspace. Move the active tab from the current
-; workspace to the target. The window becomes the active tab on the
-; target workspace and is unmapped from the current view; the current
-; workspace re-elects its next-most-recent client as the new active
-; tab.
+; workspace to the target. With multi-monitor:
+;   - If both source and target are on the same output, only that
+;     output is touched (unmap moving from view, map source's new top).
+;   - If target is on a different output (e.g. laptop → external),
+;     the moving window appears on the target's output (if that
+;     output is currently displaying target_ws — typically true for
+;     the always-pinned WS 10 / external pair) AND the source's
+;     output re-renders its new active tab.
+; Focus stays with the source workspace per i3 convention; the user
+; can switch to target_ws explicitly if they want to follow.
 move_focused_to_workspace:
     push rbx
     push r12
     push r13
+    push r14
+    push r15
     test edi, edi
     jz .mtw_done
     cmp edi, WS_COUNT
@@ -2532,7 +2631,7 @@ move_focused_to_workspace:
     movzx eax, byte [current_ws]
     cmp edi, eax
     je .mtw_done                  ; same ws — no-op
-    mov r13d, edi                 ; target ws
+    mov r13d, edi                 ; r13 = target ws
     movzx ecx, byte [current_ws]
     dec ecx
     mov ebx, [ws_active_xid + rcx*4]
@@ -2542,8 +2641,9 @@ move_focused_to_workspace:
     call find_client_index
     cmp eax, -1
     je .mtw_done
-    mov r12d, eax                 ; index of moving client
-    ; Update populated counters.
+    mov r12d, eax                 ; r12 = moving client's index
+
+    ; Update populated counters and per-client workspace.
     movzx eax, byte [client_ws + r12]
     dec eax
     dec byte [workspace_populated + rax]
@@ -2551,30 +2651,79 @@ move_focused_to_workspace:
     mov eax, r13d
     dec eax
     inc byte [workspace_populated + rax]
-    ; Unmap from current view.
+
+    ; Snapshot prev target active before overwriting, for the
+    ; target-output refresh below.
+    mov eax, r13d
+    dec eax
+    mov r14d, [ws_active_xid + rax*4]   ; r14 = prev target active
+
+    ; Re-elect source's new active tab. find_top_of_workspace sees
+    ; client_ws already updated, so the moving client is excluded.
+    movzx eax, byte [current_ws]
+    call find_top_of_workspace
+    mov r15d, eax                       ; r15 = new top of source
+    movzx edx, byte [current_ws]
+    dec edx
+    mov [ws_active_xid + rdx*4], r15d
+
+    ; Make moving the active tab on target.
+    mov eax, r13d
+    dec eax
+    mov [ws_active_xid + rax*4], ebx
+
+    ; Refresh source's output if it shows source.
+    movzx eax, byte [current_ws]
+    dec eax
+    movzx edx, byte [ws_pinned_output + rax]
+    cmp dl, byte [output_count]
+    jge .mtw_skip_source
+    movzx ecx, byte [output_current_ws + rdx]
+    movzx edi, byte [current_ws]
+    cmp ecx, edi
+    jne .mtw_skip_source
+    ; Unmap moving (was visible on source's output).
     mov byte [client_unmap_expected + r12], 1
     mov eax, ebx
     call send_unmap_window
-    ; Make this client the active tab on the target workspace.
-    movzx eax, r13b
-    dec eax
-    mov [ws_active_xid + rax*4], ebx
-    ; Re-elect a new active tab on the source (current) workspace.
-    movzx eax, byte [current_ws]
-    call find_top_of_workspace    ; eax = new top XID or 0
-    movzx edx, byte [current_ws]
-    dec edx
-    mov [ws_active_xid + rdx*4], eax
-    test eax, eax
-    jz .mtw_flush
-    push rax
+    ; Map source's new top (if any) and focus it.
+    test r15d, r15d
+    jz .mtw_skip_source
+    mov eax, r15d
     call send_map_window
-    pop rax
+    mov eax, r15d
     call set_input_focus
-.mtw_flush:
+.mtw_skip_source:
+
+    ; Refresh target's output if it shows target.
+    mov eax, r13d
+    dec eax
+    movzx edx, byte [ws_pinned_output + rax]
+    cmp dl, byte [output_count]
+    jge .mtw_render
+    movzx ecx, byte [output_current_ws + rdx]
+    cmp ecx, r13d
+    jne .mtw_render
+    ; Unmap previous target active (if any and tracked).
+    test r14d, r14d
+    jz .mtw_target_map
+    mov eax, r14d
+    call find_client_index
+    cmp eax, -1
+    je .mtw_target_map
+    mov byte [client_unmap_expected + rax], 1
+    mov eax, r14d
+    call send_unmap_window
+.mtw_target_map:
+    mov eax, ebx
+    call send_map_window
+    ; Focus stays on source per convention; do not steal it here.
+.mtw_render:
     call render_bar
     call x11_flush
 .mtw_done:
+    pop r15
+    pop r14
     pop r13
     pop r12
     pop rbx
