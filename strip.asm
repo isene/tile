@@ -53,6 +53,24 @@
 %define X11_POLY_FILL_RECT      70
 %define X11_IMAGE_TEXT8         76
 %define X11_IMAGE_TEXT16        77
+%define X11_INTERN_ATOM         16
+%define X11_GET_SELECTION_OWNER 23
+%define X11_SET_SELECTION_OWNER 22
+%define X11_SEND_EVENT          25
+%define X11_REPARENT_WINDOW     7
+%define X11_CONFIGURE_WINDOW    12
+%define X11_CHANGE_PROPERTY     18
+
+; ClientMessage event type and SubstructureNotify mask.
+%define EV_CLIENT_MESSAGE       33
+%define EV_DESTROY_NOTIFY       17
+%define EV_UNMAP_NOTIFY         18
+%define SUBSTRUCTURE_NOTIFY_MASK    0x00080000
+%define STRUCTURE_NOTIFY_MASK       0x00020000
+
+; XEMBED / system-tray opcodes.
+%define SYS_TRAY_REQUEST_DOCK   0
+%define XEMBED_EMBEDDED_NOTIFY  0
 
 %define EV_EXPOSE               12
 
@@ -126,6 +144,23 @@ sh_dash_c:       db "-c", 0
 ; Empty placeholder for segments awaiting first run.
 empty_str:       db " ", 0
 
+; XEMBED system-tray atom names. We claim selection on screen 0
+; (_NET_SYSTEM_TRAY_S0) — strip lives on output 0 only.
+tray_sel_str:     db "_NET_SYSTEM_TRAY_S0", 0
+tray_sel_len      equ 19
+tray_op_str:      db "_NET_SYSTEM_TRAY_OPCODE", 0
+tray_op_len       equ 23
+tray_orient_str:  db "_NET_SYSTEM_TRAY_ORIENTATION", 0
+tray_orient_len   equ 28
+tray_visual_str:  db "_NET_SYSTEM_TRAY_VISUAL", 0
+tray_visual_len   equ 23
+xembed_str:       db "_XEMBED", 0
+xembed_len        equ 7
+xembed_info_str:  db "_XEMBED_INFO", 0
+xembed_info_len   equ 12
+manager_str:      db "MANAGER", 0
+manager_len       equ 7
+
 ; ANSI SGR → pixel colour lookup. Indexed by (code - 30) for 30..37
 ; (standard 8), (code - 90 + 8) for 90..97 (bright 8). 16 entries.
 ; All include opaque alpha. SGR 0 (reset) is handled specially →
@@ -194,6 +229,20 @@ cfg_bg:              resd 1
 cfg_fg:              resd 1
 strip_dirty:         resb 1            ; non-zero → re-render needed
 cfg_gap:             resd 1            ; pixels of padding between segments
+
+; XEMBED system tray.
+%define MAX_TRAY_ICONS 24
+tray_atom_sel:       resd 1            ; _NET_SYSTEM_TRAY_S0
+tray_atom_op:        resd 1            ; _NET_SYSTEM_TRAY_OPCODE
+tray_atom_orient:    resd 1            ; _NET_SYSTEM_TRAY_ORIENTATION
+tray_atom_visual:    resd 1            ; _NET_SYSTEM_TRAY_VISUAL
+tray_atom_xembed:    resd 1            ; _XEMBED
+tray_atom_xembed_info: resd 1          ; _XEMBED_INFO
+tray_atom_manager:   resd 1            ; MANAGER
+tray_icons:          resd MAX_TRAY_ICONS
+tray_icon_count:     resd 1
+tray_icon_size:      resd 1            ; px (square)
+tray_padding:        resd 1            ; px between icons
 
 ; Font config. font_name buffer stores either the default XLFD or a
 ; user-supplied override from striprc; font_name_len reflects the
@@ -298,6 +347,7 @@ _start:
     call create_pixmap
     call create_gc
     call map_strip_window
+    call tray_setup
     mov byte [strip_dirty], 1
     call x11_flush
 
@@ -471,8 +521,40 @@ drain_ready_fds:
     movzx eax, byte [x11_read_buf]
     and al, 0x7F
     cmp al, EV_EXPOSE
-    jne .drf_next
+    je .drf_x11_expose
+    cmp al, EV_CLIENT_MESSAGE
+    je .drf_x11_clientmsg
+    cmp al, EV_DESTROY_NOTIFY
+    je .drf_x11_destroy
+    cmp al, EV_UNMAP_NOTIFY
+    je .drf_x11_unmap
+    jmp .drf_next
+.drf_x11_expose:
     mov byte [strip_dirty], 1
+    jmp .drf_next
+.drf_x11_clientmsg:
+    ; Tray dock request? message_type at offset 8, format at offset 1.
+    mov eax, [x11_read_buf + 8]
+    cmp eax, [tray_atom_op]
+    jne .drf_next
+    ; data.l[1] (offset 16) = opcode; data.l[2] (offset 20) = window XID.
+    mov eax, [x11_read_buf + 16]
+    cmp eax, SYS_TRAY_REQUEST_DOCK
+    jne .drf_next
+    mov eax, [x11_read_buf + 20]
+    test eax, eax
+    jz .drf_next
+    call tray_dock_icon
+    jmp .drf_next
+.drf_x11_destroy:
+    ; bytes 8-11 = window XID
+    mov eax, [x11_read_buf + 8]
+    call tray_undock_icon
+    jmp .drf_next
+.drf_x11_unmap:
+    mov eax, [x11_read_buf + 8]
+    call tray_undock_icon
+    jmp .drf_next
 .drf_next:
     inc ebx
     jmp .drf_loop
@@ -2150,6 +2232,398 @@ parse_hex:
     pop rbx
     ret
 
+; ══════════════════════════════════════════════════════════════════════
+; XEMBED system tray
+; ══════════════════════════════════════════════════════════════════════
+
+; rdi = NUL-terminated atom name, esi = name length.
+; Synchronously interns the atom (only-if-exists = false). Returns
+; eax = atom or 0 on failure. Used during init only.
+intern_atom_sync:
+    push rbx
+    push r12
+    push r13
+    mov r12, rdi
+    mov r13d, esi
+    call x11_flush
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_INTERN_ATOM
+    mov byte [rdi+1], 0
+    mov eax, r13d
+    add eax, 3
+    shr eax, 2
+    add eax, 2                            ; req length in 4-byte words
+    mov [rdi+2], ax
+    mov [rdi+4], r13w                     ; name length (CARD16)
+    mov word [rdi+6], 0
+    lea rbx, [tmp_buf + 8]
+    mov rsi, r12
+    mov ecx, r13d
+.ias_cp:
+    test ecx, ecx
+    jz .ias_pad
+    mov al, [rsi]
+    mov [rbx], al
+    inc rsi
+    inc rbx
+    dec ecx
+    jmp .ias_cp
+.ias_pad:
+    mov ecx, r13d
+    and ecx, 3
+    jz .ias_send
+    mov edx, 4
+    sub edx, ecx
+.ias_pl:
+    mov byte [rbx], 0
+    inc rbx
+    dec edx
+    jnz .ias_pl
+.ias_send:
+    mov rdx, rbx
+    lea rsi, [tmp_buf]
+    sub rdx, rsi
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    inc dword [x11_seq]
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_read_buf]
+    mov rdx, 32
+    syscall
+    cmp rax, 32
+    jl .ias_zero
+    cmp byte [x11_read_buf], 1            ; reply type
+    jne .ias_zero
+    mov eax, [x11_read_buf + 8]
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.ias_zero:
+    xor eax, eax
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; Intern all 7 tray atoms once at startup.
+tray_intern_atoms:
+    lea rdi, [tray_sel_str]
+    mov esi, tray_sel_len
+    call intern_atom_sync
+    mov [tray_atom_sel], eax
+    lea rdi, [tray_op_str]
+    mov esi, tray_op_len
+    call intern_atom_sync
+    mov [tray_atom_op], eax
+    lea rdi, [tray_orient_str]
+    mov esi, tray_orient_len
+    call intern_atom_sync
+    mov [tray_atom_orient], eax
+    lea rdi, [tray_visual_str]
+    mov esi, tray_visual_len
+    call intern_atom_sync
+    mov [tray_atom_visual], eax
+    lea rdi, [xembed_str]
+    mov esi, xembed_len
+    call intern_atom_sync
+    mov [tray_atom_xembed], eax
+    lea rdi, [xembed_info_str]
+    mov esi, xembed_info_len
+    call intern_atom_sync
+    mov [tray_atom_xembed_info], eax
+    lea rdi, [manager_str]
+    mov esi, manager_len
+    call intern_atom_sync
+    mov [tray_atom_manager], eax
+    ret
+
+; SetSelectionOwner(_NET_SYSTEM_TRAY_S0, strip_window, CurrentTime).
+tray_claim_selection:
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_SET_SELECTION_OWNER
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov eax, [window_id]
+    mov [rdi+4], eax
+    mov eax, [tray_atom_sel]
+    mov [rdi+8], eax
+    mov dword [rdi+12], 0                 ; CurrentTime
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    ret
+
+; Set _NET_SYSTEM_TRAY_ORIENTATION = 0 (horizontal) on the strip window.
+tray_set_orientation:
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_PROPERTY
+    mov byte [rdi+1], 0                   ; mode = Replace
+    mov word [rdi+2], 7
+    mov eax, [window_id]
+    mov [rdi+4], eax
+    mov eax, [tray_atom_orient]
+    mov [rdi+8], eax
+    mov dword [rdi+12], 6                 ; type = CARDINAL
+    mov byte [rdi+16], 32                 ; format
+    mov byte [rdi+17], 0
+    mov word [rdi+18], 0
+    mov dword [rdi+20], 1                 ; data length (1 CARD32)
+    mov dword [rdi+24], 0                 ; 0 = horizontal
+    lea rsi, [tmp_buf]
+    mov rdx, 28
+    call x11_buffer
+    inc dword [x11_seq]
+    ret
+
+; Broadcast MANAGER ClientMessage to root so existing apps know we
+; just claimed the tray selection. Format:
+;   data.l[0] = timestamp (CurrentTime = 0)
+;   data.l[1] = _NET_SYSTEM_TRAY_S0 atom
+;   data.l[2] = strip_window
+;   data.l[3..4] = 0
+tray_broadcast_manager:
+    push rbx
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_SEND_EVENT
+    mov byte [rdi+1], 0                   ; propagate = false
+    mov word [rdi+2], 11                  ; length
+    mov eax, [x11_root_window]
+    mov [rdi+4], eax                      ; destination = root
+    mov dword [rdi+8], STRUCTURE_NOTIFY_MASK
+    ; Event body (32 bytes) starts at offset 12.
+    mov byte [rdi+12], EV_CLIENT_MESSAGE
+    mov byte [rdi+13], 32                 ; format
+    mov word [rdi+14], 0                  ; sequence (server fills)
+    mov eax, [x11_root_window]
+    mov [rdi+16], eax                     ; window = root
+    mov eax, [tray_atom_manager]
+    mov [rdi+20], eax                     ; message_type = MANAGER
+    mov dword [rdi+24], 0                 ; data.l[0] = timestamp
+    mov eax, [tray_atom_sel]
+    mov [rdi+28], eax                     ; data.l[1] = selection atom
+    mov eax, [window_id]
+    mov [rdi+32], eax                     ; data.l[2] = our window
+    mov dword [rdi+36], 0                 ; data.l[3]
+    mov dword [rdi+40], 0                 ; data.l[4]
+    lea rsi, [tmp_buf]
+    mov rdx, 44
+    call x11_buffer
+    inc dword [x11_seq]
+    pop rbx
+    ret
+
+; Run on startup AFTER the strip window is created/mapped.
+tray_setup:
+    call tray_intern_atoms
+    cmp dword [tray_atom_sel], 0
+    je .ts_done                           ; X server doesn't support? bail
+    ; Default geometry: square icons height=strip_height-4 with 4px padding.
+    movzx eax, word [strip_height]
+    sub eax, 4
+    mov [tray_icon_size], eax
+    mov dword [tray_padding], 4
+    mov dword [tray_icon_count], 0
+    call tray_claim_selection
+    call tray_set_orientation
+    call tray_broadcast_manager
+.ts_done:
+    ret
+
+; eax = icon window XID. Reparent into strip window, resize, map,
+; remember in tray_icons[], send XEMBED_EMBEDDED_NOTIFY, relayout.
+tray_dock_icon:
+    push rbx
+    push r12
+    push r13
+    mov r12d, eax                         ; XID
+    ; Bail if already docked or table full.
+    mov ecx, [tray_icon_count]
+    cmp ecx, MAX_TRAY_ICONS
+    jge .tdi_done
+    xor ebx, ebx
+.tdi_dup:
+    cmp ebx, ecx
+    jge .tdi_add
+    cmp [tray_icons + rbx*4], r12d
+    je .tdi_done
+    inc ebx
+    jmp .tdi_dup
+.tdi_add:
+    mov [tray_icons + rcx*4], r12d
+    inc dword [tray_icon_count]
+
+    ; ReparentWindow(child, parent=strip_window, x=0, y=0) — proper
+    ; placement happens in tray_layout right after.
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_REPARENT_WINDOW
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov [rdi+4], r12d
+    mov eax, [window_id]
+    mov [rdi+8], eax
+    mov word [rdi+12], 0
+    mov word [rdi+14], 0
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+
+    ; ConfigureWindow: resize to icon_size × icon_size.
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CONFIGURE_WINDOW
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 5
+    mov [rdi+4], r12d
+    mov word [rdi+8], 0x000C              ; CWWidth | CWHeight
+    mov word [rdi+10], 0
+    mov eax, [tray_icon_size]
+    mov [rdi+12], ax
+    mov [rdi+14], ax
+    lea rsi, [tmp_buf]
+    mov rdx, 20
+    call x11_buffer
+    inc dword [x11_seq]
+
+    ; Map the icon.
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_MAP_WINDOW
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov [rdi+4], r12d
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    call x11_buffer
+    inc dword [x11_seq]
+
+    ; Send XEMBED_EMBEDDED_NOTIFY ClientMessage.
+    ;   data.l[0] = CurrentTime
+    ;   data.l[1] = XEMBED_EMBEDDED_NOTIFY (0)
+    ;   data.l[2] = strip window (parent)
+    ;   data.l[3] = protocol version (0)
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_SEND_EVENT
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 11
+    mov [rdi+4], r12d                     ; destination = icon
+    mov dword [rdi+8], 0                  ; event-mask = NoEventMask
+    mov byte [rdi+12], EV_CLIENT_MESSAGE
+    mov byte [rdi+13], 32
+    mov word [rdi+14], 0
+    mov [rdi+16], r12d                    ; window = icon
+    mov eax, [tray_atom_xembed]
+    mov [rdi+20], eax                     ; type = _XEMBED
+    mov dword [rdi+24], 0                 ; data.l[0] = CurrentTime
+    mov dword [rdi+28], XEMBED_EMBEDDED_NOTIFY
+    mov eax, [window_id]
+    mov [rdi+32], eax                     ; data.l[2] = parent
+    mov dword [rdi+36], 0                 ; data.l[3] = version 0
+    mov dword [rdi+40], 0
+    lea rsi, [tmp_buf]
+    mov rdx, 44
+    call x11_buffer
+    inc dword [x11_seq]
+
+    call tray_layout
+.tdi_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; eax = window XID that just departed. Remove from icons[] if present.
+tray_undock_icon:
+    push rbx
+    push r12
+    mov r12d, eax
+    xor ebx, ebx
+.tu_loop:
+    cmp ebx, [tray_icon_count]
+    jge .tu_done
+    cmp [tray_icons + rbx*4], r12d
+    je .tu_remove
+    inc ebx
+    jmp .tu_loop
+.tu_remove:
+    ; Shift down.
+    mov ecx, [tray_icon_count]
+    dec ecx
+.tu_shift:
+    cmp ebx, ecx
+    jge .tu_dec
+    mov eax, [tray_icons + rbx*4 + 4]
+    mov [tray_icons + rbx*4], eax
+    inc ebx
+    jmp .tu_shift
+.tu_dec:
+    dec dword [tray_icon_count]
+    call tray_layout
+.tu_done:
+    pop r12
+    pop rbx
+    ret
+
+; Position docked icons right-justified across the strip width, with
+; tray_padding pixels between them. icons[0] is rightmost (most recently
+; docked goes to the left of existing ones — matches typical tray order).
+tray_layout:
+    push rbx
+    push r12
+    mov ecx, [tray_icon_count]
+    test ecx, ecx
+    jz .tl_done
+    movzx r12d, word [x11_screen_width]
+    movzx eax, word [strip_height]
+    sub eax, [tray_icon_size]
+    shr eax, 1                            ; vertical centring
+    mov edx, eax                          ; y offset
+
+    mov ebx, [tray_icon_size]
+    add ebx, [tray_padding]               ; per-icon stride
+    xor edi, edi                          ; iterator
+.tl_loop:
+    cmp edi, [tray_icon_count]
+    jge .tl_done
+    ; x = screen_w - tray_padding - (i+1)*stride + tray_padding
+    mov eax, edi
+    inc eax
+    imul eax, ebx
+    mov esi, r12d
+    sub esi, eax                          ; x
+    push rcx
+    push rdx
+    push rdi
+    ; Send ConfigureWindow to set x,y for this icon.
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CONFIGURE_WINDOW
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 5
+    mov ecx, [rsp + 8]                    ; iterator
+    mov eax, [tray_icons + rcx*4]
+    mov [rdi+4], eax
+    mov word [rdi+8], 0x0003              ; CWX | CWY
+    mov word [rdi+10], 0
+    mov [rdi+12], esi                     ; x
+    mov [rdi+16], edx                     ; y
+    push rsi
+    lea rsi, [tmp_buf]
+    mov rdx, 20
+    call x11_buffer
+    pop rsi
+    inc dword [x11_seq]
+    pop rdi
+    pop rdx
+    pop rcx
+    inc edi
+    jmp .tl_loop
+.tl_done:
+    pop r12
+    pop rbx
+    ret
+
 ; ──────────────────────────────────────────────────────────────────────
 ; X11 setup (cribbed from tile.asm; window create + map + GC + font)
 ; ──────────────────────────────────────────────────────────────────────
@@ -2231,7 +2705,7 @@ create_strip_window:
     mov eax, [cfg_bg]
     mov [rdi+32], eax
     mov dword [rdi+36], 1
-    mov dword [rdi+40], EXPOSURE_MASK
+    mov dword [rdi+40], EXPOSURE_MASK | SUBSTRUCTURE_NOTIFY_MASK
     mov byte [rdi], X11_CREATE_WINDOW
     lea rsi, [tmp_buf]
     mov rdx, 44
