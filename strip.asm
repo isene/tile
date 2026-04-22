@@ -52,6 +52,7 @@
 %define X11_COPY_AREA           62
 %define X11_POLY_FILL_RECT      70
 %define X11_IMAGE_TEXT8         76
+%define X11_IMAGE_TEXT16        77
 
 %define EV_EXPOSE               12
 
@@ -523,8 +524,10 @@ drain_segment_pipe:
     je .dsp_keep
     cmp dl, 32
     jb .dsp_skip_byte
-    cmp dl, 126
-    ja .dsp_skip_byte
+    ; Keep printable ASCII (32..126) AND UTF-8 high bytes (>= 128).
+    ; Only strip the C1 controls (127..159) we never want to render.
+    cmp dl, 127
+    je .dsp_skip_byte
 .dsp_keep:
     mov [r12 + SEG_OFF_INC_BUF + rbx], dl
     inc ebx
@@ -1024,12 +1027,10 @@ render_segment_sgr:
     mov edi, r12d
     mov esi, [font_baseline_var]
     lea rdx, [r13 + rbp]
-    call paint_text
-    mov ecx, r15d
-    sub ecx, ebp
-    add ebx, ecx
-    imul ecx, [char_width_var]
-    add r12d, ecx
+    call paint_text                       ; rax = codepoints drawn
+    add ebx, eax                          ; total += codepoints
+    imul eax, [char_width_var]
+    add r12d, eax                         ; advance x
 .rss_no_flush:
     ; Parse "ESC [ N (;N)* m": collect every numeric token into
     ; sgr_codes[], then process the array at 'm'. This lets 38;2;R;G;B
@@ -1093,11 +1094,9 @@ render_segment_sgr:
     mov esi, [font_baseline_var]
     lea rdx, [r13 + rbp]
     call paint_text
-    mov ecx, r15d
-    sub ecx, ebp
-    add ebx, ecx
-    imul ecx, [char_width_var]
-    add r12d, ecx
+    add ebx, eax
+    imul eax, [char_width_var]
+    add r12d, eax
 .rss_done:
     mov eax, ebx                          ; display chars drawn
     pop rbp
@@ -1108,65 +1107,164 @@ render_segment_sgr:
     pop rbx
     ret
 
-; paint_text(edi=x, esi=y, rdx=ptr, ecx=length).
-; ImageText8 onto the pixmap with explicit byte length. Caller is
-; responsible for not exceeding 255 bytes (X11 ImageText8 limit).
+; paint_text(edi=x, esi=y, rdx=ptr, ecx=byte_length).
+; Decodes the UTF-8 source into 16-bit codepoints (UCS-2, big-endian)
+; and sends X11_IMAGE_TEXT16. Returns eax = display codepoint count
+; so callers can advance x by codepoints * char_width.
 paint_text:
-    test ecx, ecx
-    jz .pt_done
-    cmp ecx, 255
-    jle .pt_ok
-    mov ecx, 255
-.pt_ok:
     push rbx
     push r12
-    mov r12, rdx                          ; preserve text ptr
-    lea rbx, [tmp_buf]
-    mov byte [rbx], X11_IMAGE_TEXT8
-    mov byte [rbx+1], cl
+    push r13
+    push r14
+    mov r12, rdx                          ; src ptr
+    mov r13d, ecx                         ; src byte length
+    mov r14d, edi                         ; x
+    push rsi                              ; y (later)
+    test r13d, r13d
+    jz .pt_zero
+
+    ; Decode src bytes into tmp_buf+1024 as 2-byte big-endian codepoints.
+    ; Cap at 255 codepoints (ImageText16 length field is CARD8).
+    lea rbx, [tmp_buf + 1024]
+    xor edx, edx                          ; src cursor
+    xor ecx, ecx                          ; codepoint count
+.pt_decode:
+    cmp edx, r13d
+    jge .pt_decoded
+    cmp ecx, 255
+    jge .pt_decoded
+    movzx eax, byte [r12 + rdx]
+    inc edx
+    cmp al, 0x80
+    jb .pt_emit_cp                        ; ASCII direct
+    cmp al, 0xC0
+    jb .pt_invalid                        ; lone continuation byte
+    cmp al, 0xE0
+    jb .pt_two
+    cmp al, 0xF0
+    jb .pt_three
+    ; 4-byte (rare, > U+FFFF) — fall back to '?'
+    add edx, 3
+    cmp edx, r13d
+    jg .pt_invalid
+    mov eax, '?'
+    jmp .pt_emit_cp
+.pt_two:
+    ; 110xxxxx 10xxxxxx → 11 bits
+    cmp edx, r13d
+    jge .pt_invalid
+    and eax, 0x1F
+    shl eax, 6
+    movzx edi, byte [r12 + rdx]
+    inc edx
+    and edi, 0x3F
+    or eax, edi
+    jmp .pt_emit_cp
+.pt_three:
+    ; 1110xxxx 10xxxxxx 10xxxxxx → 16 bits
+    mov esi, edx
+    add esi, 2
+    cmp esi, r13d
+    jg .pt_invalid
+    and eax, 0x0F
+    shl eax, 12
+    movzx edi, byte [r12 + rdx]
+    and edi, 0x3F
+    shl edi, 6
+    or eax, edi
+    movzx edi, byte [r12 + rdx + 1]
+    and edi, 0x3F
+    or eax, edi
+    add edx, 2
+.pt_emit_cp:
+    ; Big-endian write of codepoint into [rbx].
+    mov [rbx + 0], ah
+    mov [rbx + 1], al
+    add rbx, 2
+    inc ecx
+    jmp .pt_decode
+.pt_invalid:
+    ; Skip silently.
+    jmp .pt_decode
+
+.pt_decoded:
+    pop rsi                               ; restore y
+    test ecx, ecx
+    jz .pt_zero_post
+
+    ; Build ImageText16 request. Length unit = 4 bytes; header = 4 words
+    ; (16 bytes); body = 2 * count bytes, padded to 4.
+    mov r13d, ecx                         ; preserve count for return
+    lea rdi, [tmp_buf]
+    mov byte [rdi + 0], X11_IMAGE_TEXT16
+    mov byte [rdi + 1], cl                ; codepoint count (CARD8)
+    ; req length in 4-byte words = 4 + ceil(2*count / 4)
     mov eax, ecx
+    shl eax, 1                            ; bytes
     add eax, 3
     shr eax, 2
     add eax, 4
-    mov [rbx+2], ax
+    mov [rdi + 2], ax
     mov eax, [pixmap_id]
-    mov [rbx+4], eax
+    mov [rdi + 4], eax
     mov eax, [gc_id]
-    mov [rbx+8], eax
-    mov [rbx+12], di                      ; x
-    mov [rbx+14], si                      ; y
-    add rbx, 16
-    push rcx
-    xor edx, edx
-.pt_cp:
-    cmp edx, ecx
-    jge .pt_pad
-    mov al, [r12 + rdx]
-    mov [rbx], al
-    inc rbx
-    inc edx
-    jmp .pt_cp
-.pt_pad:
-    pop rcx
+    mov [rdi + 8], eax
+    mov [rdi + 12], r14w                  ; x
+    mov [rdi + 14], si                    ; y
+
+    ; Copy 2*count bytes of decoded codepoints from tmp_buf+1024 → tmp_buf+16.
+    lea rdi, [tmp_buf + 16]
+    lea rsi, [tmp_buf + 1024]
     mov edx, ecx
-    and edx, 3
+    shl edx, 1                            ; total bytes
+    push rdx
+.pt_cpy:
+    test edx, edx
+    jz .pt_pad
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec edx
+    jmp .pt_cpy
+.pt_pad:
+    pop rdx
+    mov ecx, edx
+    and ecx, 3
     jz .pt_send
     mov eax, 4
-    sub eax, edx
+    sub eax, ecx
 .pt_pl:
-    mov byte [rbx], 0
-    inc rbx
+    mov byte [rdi], 0
+    inc rdi
     dec eax
     jnz .pt_pl
 .pt_send:
-    mov rdx, rbx
+    mov rdx, rdi
     lea rsi, [tmp_buf]
     sub rdx, rsi
     call x11_buffer
     inc dword [x11_seq]
+    mov eax, r13d
+    pop r14
+    pop r13
     pop r12
     pop rbx
-.pt_done:
+    ret
+.pt_zero_post:
+    xor eax, eax
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.pt_zero:
+    add rsp, 8                            ; drop saved y
+    xor eax, eax
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; ══════════════════════════════════════════════════════════════════════
