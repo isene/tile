@@ -23,6 +23,14 @@
 %define SYS_EXECVE      59
 %define SYS_EXIT        60
 %define SYS_WAIT4       61
+%define SYS_RT_SIGACTION    13
+%define SYS_RT_SIGRETURN    15
+
+; Signals + sigaction flags
+%define SIGUSR1         10
+%define SA_RESTORER     0x04000000
+%define SA_RESTART      0x10000000
+%define EINTR           4
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Constants
@@ -40,6 +48,7 @@
 %define X11_UNMAP_WINDOW        10
 %define X11_CONFIGURE_WINDOW    12
 %define X11_INTERN_ATOM         16
+%define X11_CHANGE_PROPERTY     18
 %define X11_GET_PROPERTY        20
 %define X11_GRAB_KEY            33
 %define X11_UNGRAB_KEY          34
@@ -118,7 +127,7 @@
 
 ; Limits
 %define MAX_CLIENTS     128
-%define MAX_BINDS       64
+%define MAX_BINDS       128
 %define MAX_EXECS       32
 %define BIND_STRIDE     16        ; bytes per bind entry (see layout below)
 %define ARG_POOL_SIZE   16384
@@ -139,6 +148,7 @@
 %define ACT_LAYOUT      11
 %define ACT_SPAWN_SPLIT 12
 %define ACT_EXEC_HERE   13
+%define ACT_RELOAD      14
 
 %define MAX_STASH       8
 
@@ -162,6 +172,7 @@
 
 ; Bar (the row-of-squares strip at the top of the screen).
 %define DEFAULT_BAR_HEIGHT      10
+%define DEFAULT_BAR_PAD         4     ; pixels before first tab / after last WS
 %define DEFAULT_TAB_DIM_FACTOR  40    ; inactive tab brightness, 0..100
 %define DEFAULT_BORDER_WIDTH    1     ; pixels of focus border around managed windows
 %define DEFAULT_BORDER_FOCUSED   0xFFffffff
@@ -170,6 +181,7 @@
 %define WS_TAB_GAP              8     ; pixels of gap between WS and tab squares (legacy; kept for clarity)
 %define SQUARE_GAP              2     ; pixels of gap between adjacent squares
 %define WS_GROUP_GAP            6     ; extra gap before WS positions 1, 4, 7
+%define LAYOUT_GLYPH_GAP        6     ; extra gap after the layout indicator before the first tab
                                       ; (separates the special "0" slot and
                                       ; groups the rest into 1-3, 4-6, 7-9)
 
@@ -228,6 +240,8 @@ wm_delete_str:    db "WM_DELETE_WINDOW"
 wm_delete_len     equ 16
 tile_shell_pid_str: db "_TILE_SHELL_PID"
 tile_shell_pid_len equ 15
+net_active_window_str: db "_NET_ACTIVE_WINDOW"
+net_active_window_len equ 18
 
 ; XINERAMA extension name (uppercase per X11 convention).
 xinerama_name:    db "XINERAMA"
@@ -342,6 +356,19 @@ key_table:
     dd 0x005b
     db "bracketright", 0
     dd 0x005d
+    db "bar", 0
+    dd 0x007c                  ; |  (Norwegian layout: AltGr+something)
+    ; XF86 multimedia keysyms (laptop function-row keys).
+    db "XF86AudioMute", 0
+    dd 0x1008ff12
+    db "XF86AudioLowerVolume", 0
+    dd 0x1008ff11
+    db "XF86AudioRaiseVolume", 0
+    dd 0x1008ff13
+    db "XF86MonBrightnessDown", 0
+    dd 0x1008ff03
+    db "XF86MonBrightnessUp", 0
+    dd 0x1008ff02
     db 0                       ; terminator
 
 ; Action keyword table: name, NUL, action_id (BYTE), pad.
@@ -372,6 +399,8 @@ action_table:
     db ACT_SPAWN_SPLIT, 0
     db "exec-here", 0
     db ACT_EXEC_HERE, 0
+    db "reload", 0
+    db ACT_RELOAD, 0
     db 0                       ; terminator
 
 ; layout arg keyword table: `layout tabbed | split-h | split-v | toggle`.
@@ -488,6 +517,69 @@ cfg_tab_palette:         resd MAX_PALETTE
 cfg_tab_palette_count:   resb 1
 cfg_ws_active:           resd 1
 cfg_ws_populated:        resd 1
+; Per-workspace fixed colour (overrides the active/populated default).
+; Indexed as cfg_ws_colors[ws-1] for ws 1..10. 0xFFFFFFFF = unset
+; (use cfg_ws_active / cfg_ws_populated as before).
+cfg_ws_colors:           resd 10
+; WS-specific dim factor (% brightness for non-active WSes that use
+; cfg_ws_colors). Separate from cfg_tab_dim_factor because an
+; aggressive tab dim (e.g. 40%) leaves a configured ws_color barely
+; visible. Default 70.
+cfg_ws_dim_factor:       resb 1
+
+; Per-class window-to-workspace assignments. `assign <class> <ws>` in
+; ~/.tilerc populates the parallel arrays below: assign_class[i] is an
+; offset into arg_pool naming the WM_CLASS string to match (the
+; "class" half — second NUL-terminated string in the WM_CLASS
+; property), and assign_ws[i] is the target workspace 1..10. When a
+; new client lands, MapRequest reads its WM_CLASS, walks the table,
+; and routes the client to the matched workspace before tracking it.
+%define MAX_ASSIGNS 32
+assign_class:            resw MAX_ASSIGNS
+assign_ws:               resb MAX_ASSIGNS
+assign_count:            resd 1
+
+; Per-class stash-on-map list. Same shape as assign_*, but no ws
+; payload: any new client whose class matches this list is immediately
+; stashed (i3 scratchpad equivalent) instead of joining its destination
+; workspace's tab strip. Used for the marionette Firefox.
+%define MAX_STASH_ON_MAP 16
+stash_class:             resw MAX_STASH_ON_MAP
+stash_class_count:       resd 1
+
+; Override channel: when MapRequest decides the new client should land
+; on a workspace other than current_ws (because of an `assign` rule),
+; it sets pending_assign_ws to the target ws. track_client honours
+; this in place of current_ws, then the byte is cleared.
+pending_assign_ws:       resb 1
+
+; Scratch buffer for one synchronous WM_CLASS GetProperty round-trip.
+; 32-byte reply header + room for the value bytes (instance\0class\0).
+%define WM_CLASS_BUF_SIZE 512
+wm_class_buf:            resb WM_CLASS_BUF_SIZE
+
+; Reload coordination. SIGUSR1 sets `reload_pending`; the main event
+; loop drains it between events and calls reload_runtime. Keeps the
+; signal handler tiny — no async-unsafe calls inside it.
+reload_pending:          resb 1
+
+; sigaction(2) struct used to install the SIGUSR1 handler. Layout is
+; the kernel's struct sigaction (not glibc's): handler ptr at +0,
+; sa_flags at +8, sa_restorer at +16, sa_mask at +24 (8 bytes for the
+; first 64 signals). 32 bytes total.
+sigact_buf:              resb 32
+
+; Snapshot of the original config line being parsed, captured before
+; tokenization mutates the buffer with NUL bytes. Used by the stderr
+; warning emitter so users see their actual text in the diagnostic.
+cfg_line_buf:            resb 256
+cfg_line_recognized:     resb 1
+
+; Pixels of horizontal padding inside the bar — leaves breathing room
+; before the leftmost tab square and after the rightmost workspace
+; square. Defaults to a few pixels; ~/.tilerc may override via
+; `bar_pad`.
+cfg_bar_pad:             resw 1
 
 ; Inner gap: pixels of padding inside each managed window (so neighbouring
 ; windows / the bar get visual breathing room). Equivalent to i3's
@@ -617,6 +709,7 @@ ws_active_xid:           resd WS_COUNT
 wm_protocols_atom:   resd 1
 wm_delete_atom:      resd 1
 tile_shell_pid_atom: resd 1
+net_active_window_atom: resd 1
 
 ; Pending-event queue. Used when a synchronous X reply read (e.g. for
 ; GetProperty during the exec-here action) accidentally drains an
@@ -664,6 +757,7 @@ tmp_buf:             resb 16384
 x11_read_buf:        resb 65536
 x11_write_buf:       resb 65536
 x11_write_pos:       resq 1
+dkp_buf:             resb 64
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Code
@@ -702,9 +796,17 @@ _start:
     mov byte [cfg_tab_dim_factor], DEFAULT_TAB_DIM_FACTOR
     mov dword [cfg_ws_active], 0xFFffffff
     mov dword [cfg_ws_populated], 0xFF555555
+    mov byte [cfg_ws_dim_factor], 70
+    ; Per-workspace colour overrides — sentinel 0xFFFFFFFF means "use
+    ; the active/populated default for this slot".
+    mov rcx, 10
+    lea rdi, [cfg_ws_colors]
+    mov eax, 0xFFFFFFFF
+    rep stosd
     mov byte [cfg_tab_palette_count], 0
     mov word [cfg_gap_inner], 0
     mov word [cfg_strip_height], 0
+    mov word [cfg_bar_pad], DEFAULT_BAR_PAD
     mov byte [cfg_border_width], DEFAULT_BORDER_WIDTH
     mov dword [cfg_border_focused], DEFAULT_BORDER_FOCUSED
     mov dword [cfg_border_unfocused], DEFAULT_BORDER_UNFOCUSED
@@ -732,17 +834,22 @@ _start:
     ; extension isn't present. After this returns, output_count is at
     ; least 1 and ws_pinned_output[] is initialised.
     call discover_outputs
+    call dbg_dump_outputs
     call apply_pin_overrides
     call randr_setup
 
     ; Resolve every bind's keysym to a keycode and grab them on root.
     call resolve_and_grab_binds
+    call dbg_dump_binds
     call x11_flush
 
     ; Create the row-of-squares bar window across the top of the screen.
     call create_bar
     call render_bar
     call x11_flush
+
+    ; SIGUSR1 → reload ~/.tilerc without restarting.
+    call install_sigusr1
 
     ; Run autostart entries from ~/.tilerc.
     call run_autostart
@@ -1415,6 +1522,13 @@ x11_flush:
 ; ══════════════════════════════════════════════════════════════════════
 
 event_loop:
+    ; SIGUSR1 may have asked for a reload while we were busy or
+    ; sleeping in read(). Handle it here, between events, where the
+    ; X11 connection is in a known state (no half-sent requests).
+    cmp byte [reload_pending], 0
+    je .el_no_reload
+    call reload_runtime
+.el_no_reload:
     ; Always flush before sleeping so the server sees our requests.
     call x11_flush
 
@@ -1460,7 +1574,8 @@ event_loop:
     mov rdx, 32
     syscall
     test rax, rax
-    jle .x11_dead                ; 0 = EOF, negative = -errno (also fatal)
+    jz .x11_dead                 ; 0 = EOF (server gone)
+    js .el_read_err              ; negative = -errno; tolerate -EINTR
     cmp rax, 32
     jl event_loop                ; genuine short read — retry
 .el_dispatch:
@@ -1501,6 +1616,12 @@ event_loop:
     call render_bar
     jmp event_loop
 
+.el_read_err:
+    ; -EINTR (signal handler ran during the read, e.g. SIGUSR1) — go
+    ; back to the top of the loop so reload_pending gets drained.
+    cmp rax, -EINTR
+    je event_loop
+    ; Other errors are fatal in the same way EOF is.
 .x11_dead:
     ; X server connection lost (e.g. xephyr was killed, real X11 crashed).
     ; Exit cleanly rather than spin on a dead socket.
@@ -1509,18 +1630,107 @@ event_loop:
     syscall
 
 .ev_map_request:
-    ; New client lands on the current workspace; size it to that
-    ; workspace's pinned output before mapping. set_active_tab then
-    ; unmaps the previously-visible tab on the same workspace and
-    ; maps this one.
+    ; Debug: log map-req arrival with the XID
     mov eax, [x11_read_buf + 8]
-    mov edi, eax
+    call dbg_log_mapreq
+    ; New client. Two optional config-driven detours before the default
+    ; "land on current workspace, become active tab" path:
+    ;   1. `assign <class> <ws>`   → route to <ws> instead of current
+    ;   2. `stash-on-map <class>`  → after tracking, push to stash
+    ;                                 (i3-scratchpad equivalent)
+    mov edi, [x11_read_buf + 8]
+    call apply_assign                     ; eax = target ws or 0
+    test eax, eax
+    jnz .ev_mr_assigned
     movzx esi, byte [current_ws]
+    jmp .ev_mr_configure
+.ev_mr_assigned:
+    mov [pending_assign_ws], al
+    movzx esi, al
+.ev_mr_configure:
+    ; Debug: also log the workspace decision
+    push rsi
+    push rdi
+    push rcx
+    push rdx
+    push r8
+    push r9
+    push r10
+    push r11
+    lea rdi, [dkp_buf]
+    mov byte [rdi+0], 't'
+    mov byte [rdi+1], 'i'
+    mov byte [rdi+2], 'l'
+    mov byte [rdi+3], 'e'
+    mov byte [rdi+4], ':'
+    mov byte [rdi+5], ' '
+    mov byte [rdi+6], 'm'
+    mov byte [rdi+7], 'r'
+    mov byte [rdi+8], '-'
+    mov byte [rdi+9], 'w'
+    mov byte [rdi+10], 's'
+    mov byte [rdi+11], '='
+    add rdi, 12
+    mov rax, [rsp + 56]                    ; saved rsi (workspace target)
+    movzx eax, al
+    call dbg_u32_dec
+    mov byte [rdi], 10
+    inc rdi
+    lea rsi, [dkp_buf]
+    mov rdx, rdi
+    sub rdx, rsi
+    mov rax, SYS_WRITE
+    mov edi, 2
+    syscall
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rdi
+    pop rsi
+    mov edi, [x11_read_buf + 8]
     call configure_client_for_workspace
     mov eax, [x11_read_buf + 8]
-    call track_client
+    call track_client                     ; honours pending_assign_ws
+    mov byte [pending_assign_ws], 0
+    ; Debug: log post-track state.
+    mov eax, 0x100                         ; sentinel "after-track"
+    call dbg_log_mrtag
+
+    ; stash-on-map?
+    mov edi, [x11_read_buf + 8]
+    call apply_stash_on_map
+    push rax                               ; save stash result
+    movzx eax, al
+    add eax, 0x200                         ; sentinel "stash result"
+    call dbg_log_mrtag
+    pop rax
+    test eax, eax
+    jnz .ev_mr_done                       ; stashed — skip activation
+
+    ; Default: become the active tab on whatever ws we ended up on.
     mov eax, [x11_read_buf + 8]
-    call set_active_tab
+    call find_client_index
+    push rax
+    add eax, 0x300                         ; sentinel "find_client_index result"
+    call dbg_log_mrtag
+    pop rax
+    cmp eax, -1
+    je .ev_mr_done
+    movzx esi, byte [client_ws + rax]
+    mov eax, [x11_read_buf + 8]
+    ; Debug: log set_active_tab_on_ws entry args
+    push rax
+    push rsi
+    movzx eax, sil
+    add eax, 0x400                         ; sentinel "sat target ws"
+    call dbg_log_mrtag
+    pop rsi
+    pop rax
+    call set_active_tab_on_ws
+.ev_mr_done:
     jmp event_loop
 
 .ev_configure_request:
@@ -1595,8 +1805,441 @@ event_loop:
     movzx eax, byte [x11_read_buf + 1]
     movzx edx, word [x11_read_buf + 28]
     and edx, ~(MOD_LOCK | MOD_MOD2)      ; strip locks
+    push rax
+    push rdx
+    call dbg_keypress
+    pop rdx
+    pop rax
     call dispatch_keypress
     jmp event_loop
+
+; Debug: log every KeyPress to stderr so a session log can prove
+; whether tile is actually receiving keys. eax = keycode, edx = mods.
+; Format: "tile: kp=NNN mod=0xHH\n"
+dbg_keypress:
+    push rax
+    push rdx
+    push rcx
+    lea rdi, [dkp_buf]
+    lea rsi, [.dkp_pre]
+    mov ecx, .dkp_pre_len
+.dkp_copy:
+    test ecx, ecx
+    jz .dkp_kc
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec ecx
+    jmp .dkp_copy
+.dkp_kc:
+    lea rdi, [dkp_buf + .dkp_pre_len]    ; resume after the prefix
+    mov rax, [rsp + 16]                  ; original eax (keycode)
+    ; itoa decimal, 3 digits with leading space-pad; simple loop
+    mov rcx, 100
+    xor edx, edx
+    div rcx
+    add al, '0'
+    mov [rdi], al
+    inc rdi
+    mov rax, rdx
+    mov rcx, 10
+    xor edx, edx
+    div rcx
+    add al, '0'
+    mov [rdi], al
+    inc rdi
+    mov al, dl
+    add al, '0'
+    mov [rdi], al
+    inc rdi
+    mov byte [rdi], ' '
+    inc rdi
+    mov byte [rdi], 'm'
+    inc rdi
+    mov byte [rdi], '='
+    inc rdi
+    mov byte [rdi], '0'
+    inc rdi
+    mov byte [rdi], 'x'
+    inc rdi
+    mov rax, [rsp + 8]                   ; original edx (mods)
+    mov rdx, rax
+    shr rdx, 4
+    and edx, 0xF
+    cmp dl, 10
+    jl .dkp_hi_dig
+    add dl, 'a' - 10 - '0'
+.dkp_hi_dig:
+    add dl, '0'
+    mov [rdi], dl
+    inc rdi
+    and eax, 0xF
+    cmp al, 10
+    jl .dkp_lo_dig
+    add al, 'a' - 10 - '0'
+.dkp_lo_dig:
+    add al, '0'
+    mov [rdi], al
+    inc rdi
+    mov byte [rdi], 10
+    inc rdi
+    lea rsi, [dkp_buf]
+    mov rdx, rdi
+    sub rdx, rsi
+    mov rax, SYS_WRITE
+    mov edi, 2
+    syscall
+    pop rcx
+    pop rdx
+    pop rax
+    ret
+.dkp_pre: db "tile: kp="
+.dkp_pre_len equ $ - .dkp_pre
+
+; Debug: dump output table to stderr.
+;   "tile: outputs=N\n"
+;   "  out 0  x=NNN y=NNN w=NNNN h=NNNN  cur_ws=N pinned=N\n"
+;   ... per output, plus per-workspace pinned-output info.
+dbg_dump_outputs:
+    push rbx
+    push r12
+    ; Build "tile: outputs=N screen=WWWWxHHHH\n" and emit
+    movzx eax, byte [output_count]
+    mov rdi, dkp_buf
+    mov dword [rdi+0], 0x656c6974
+    mov byte  [rdi+4], ':'
+    mov byte  [rdi+5], ' '
+    mov dword [rdi+6], 0x70747568        ; "hutp" → little-endian: 'h','u','t','p' → "huts" wrong; just write bytes:
+    ; Easier approach: write byte-by-byte.
+    mov byte [rdi+0], 't'
+    mov byte [rdi+1], 'i'
+    mov byte [rdi+2], 'l'
+    mov byte [rdi+3], 'e'
+    mov byte [rdi+4], ':'
+    mov byte [rdi+5], ' '
+    mov byte [rdi+6], 'o'
+    mov byte [rdi+7], 'u'
+    mov byte [rdi+8], 't'
+    mov byte [rdi+9], 'p'
+    mov byte [rdi+10], 'u'
+    mov byte [rdi+11], 't'
+    mov byte [rdi+12], 's'
+    mov byte [rdi+13], '='
+    add al, '0'
+    mov [rdi+14], al
+    mov byte [rdi+15], 10
+    mov rax, SYS_WRITE
+    mov edi, 2
+    lea rsi, [dkp_buf]
+    mov edx, 16
+    syscall
+    ; Per-output: "  out N x=NNN y=NNN w=NNNN h=NNNN cur=N\n"
+    xor ebx, ebx
+.ddo_loop:
+    movzx eax, byte [output_count]
+    cmp ebx, eax
+    jge .ddo_done
+    ; Build line: "out N x=NNN y=NNN w=NNNN h=NNNN cur=N\n"
+    mov rdi, dkp_buf
+    mov byte [rdi+0], 'o'
+    mov byte [rdi+1], 'u'
+    mov byte [rdi+2], 't'
+    mov byte [rdi+3], ' '
+    mov al, bl
+    add al, '0'
+    mov [rdi+4], al
+    mov byte [rdi+5], ' '
+    mov byte [rdi+6], 'x'
+    mov byte [rdi+7], '='
+    add rdi, 8
+    movzx eax, word [output_x + rbx*2]
+    call dbg_u16_dec                    ; writes up to 5 digits, advances rdi
+    mov byte [rdi], ' '
+    mov byte [rdi+1], 'y'
+    mov byte [rdi+2], '='
+    add rdi, 3
+    movzx eax, word [output_y + rbx*2]
+    call dbg_u16_dec
+    mov byte [rdi], ' '
+    mov byte [rdi+1], 'w'
+    mov byte [rdi+2], '='
+    add rdi, 3
+    movzx eax, word [output_w + rbx*2]
+    call dbg_u16_dec
+    mov byte [rdi], ' '
+    mov byte [rdi+1], 'h'
+    mov byte [rdi+2], '='
+    add rdi, 3
+    movzx eax, word [output_h + rbx*2]
+    call dbg_u16_dec
+    mov byte [rdi], ' '
+    mov byte [rdi+1], 'c'
+    mov byte [rdi+2], 'u'
+    mov byte [rdi+3], 'r'
+    mov byte [rdi+4], '='
+    add rdi, 5
+    movzx eax, byte [output_current_ws + rbx]
+    call dbg_u16_dec
+    mov byte [rdi], 10
+    inc rdi
+    lea rsi, [dkp_buf]
+    mov rdx, rdi
+    sub rdx, rsi
+    mov rax, SYS_WRITE
+    mov edi, 2
+    syscall
+    inc ebx
+    jmp .ddo_loop
+.ddo_done:
+    pop r12
+    pop rbx
+    ret
+
+; rdi = destination buffer position, eax = unsigned 16-bit value to
+; print as decimal (up to 5 digits, leading zeros suppressed). After
+; the call, rdi points past the last digit written. Clobbers eax/edx/r9.
+dbg_u16_dec:
+    test eax, eax
+    jnz .du16_nonzero
+    mov byte [rdi], '0'
+    inc rdi
+    ret
+.du16_nonzero:
+    ; Build digits in reverse on a small local stack via r9.
+    sub rsp, 8
+    mov r9, rsp                          ; write head
+.du16_div:
+    test eax, eax
+    jz .du16_emit
+    xor edx, edx
+    mov ecx, 10
+    div ecx                              ; eax /= 10, edx = remainder
+    add dl, '0'
+    mov [r9], dl
+    inc r9
+    jmp .du16_div
+.du16_emit:
+    ; r9 - rsp = digit count; write them out in reverse.
+.du16_emit_loop:
+    cmp r9, rsp
+    je .du16_emit_done
+    dec r9
+    mov al, [r9]
+    mov [rdi], al
+    inc rdi
+    jmp .du16_emit_loop
+.du16_emit_done:
+    add rsp, 8
+    ret
+
+; Debug dump: at startup, log "tile: binds N" then one line per entry
+; with keysym, keycode, mods, action_id, arg_int, arg_off.
+dbg_dump_binds:
+    push rbx
+    push r12
+    ; Header: "tile: bind_count=NN\n"
+    lea rdi, [dkp_buf]
+    mov dword [rdi+0], 0x656c6974    ; "tile" (LE: 't','i','l','e' = 0x65,0x6c,0x69,0x74 → little-endian dword)
+    mov dword [rdi+4], 0x6e69623a    ; ":bin"
+    mov dword [rdi+8], 0x6f635f64    ; "d_co"
+    mov dword [rdi+12], 0x3d746e75   ; "unt="
+    mov rax, [bind_count]
+    cmp al, 100
+    jl .ddb_lt100
+    mov byte [rdi+16], '?'
+    mov byte [rdi+17], 10
+    mov edx, 18
+    jmp .ddb_hdr_emit
+.ddb_lt100:
+    mov dl, al
+    mov al, 0
+.ddb_d10:
+    cmp dl, 10
+    jl .ddb_d10_done
+    sub dl, 10
+    inc al
+    jmp .ddb_d10
+.ddb_d10_done:
+    add al, '0'
+    mov [rdi+16], al
+    add dl, '0'
+    mov [rdi+17], dl
+    mov byte [rdi+18], 10
+    mov edx, 19
+.ddb_hdr_emit:
+    mov rax, SYS_WRITE
+    mov edi, 2
+    lea rsi, [dkp_buf]
+    syscall
+    ; Per-entry: write keysym(hex 4) + space + keycode(dec 3) + space +
+    ; mod(hex 2) + space + a(dec 2) + space + i(dec 2) + LF
+    xor ebx, ebx
+.ddb_loop:
+    cmp ebx, [bind_count]
+    jge .ddb_done
+    mov rax, rbx
+    imul rax, BIND_STRIDE
+    lea r12, [bind_table + rax]
+    ; Build line in dkp_buf
+    lea rdi, [dkp_buf]
+    mov byte [rdi+0], 'b'
+    movzx eax, bl
+    cmp al, 10
+    jl .ddb_b1
+    mov dl, al
+    mov al, 0
+.ddb_bd:
+    cmp dl, 10
+    jl .ddb_bd_done
+    sub dl, 10
+    inc al
+    jmp .ddb_bd
+.ddb_bd_done:
+    add al, '0'
+    mov [rdi+1], al
+    add dl, '0'
+    mov [rdi+2], dl
+    mov rdi, dkp_buf + 3
+    jmp .ddb_b_after
+.ddb_b1:
+    add al, '0'
+    mov [rdi+1], al
+    mov rdi, dkp_buf + 2
+.ddb_b_after:
+    mov byte [rdi], ' '
+    mov byte [rdi+1], 'k'
+    mov byte [rdi+2], 'c'
+    mov byte [rdi+3], '='
+    add rdi, 4
+    movzx eax, byte [r12 + 4]            ; resolved keycode (low byte)
+    cmp al, 100
+    jl .ddb_kc_lt100
+    mov dl, 0
+.ddb_kc_h:
+    cmp al, 100
+    jl .ddb_kc_h_done
+    sub al, 100
+    inc dl
+    jmp .ddb_kc_h
+.ddb_kc_h_done:
+    add dl, '0'
+    mov [rdi], dl
+    inc rdi
+.ddb_kc_lt100:
+    cmp al, 10
+    jl .ddb_kc_one
+    mov dl, 0
+.ddb_kc_t:
+    cmp al, 10
+    jl .ddb_kc_t_done
+    sub al, 10
+    inc dl
+    jmp .ddb_kc_t
+.ddb_kc_t_done:
+    add dl, '0'
+    mov [rdi], dl
+    inc rdi
+.ddb_kc_one:
+    add al, '0'
+    mov [rdi], al
+    inc rdi
+    mov byte [rdi], ' '
+    mov byte [rdi+1], 'm'
+    mov byte [rdi+2], '='
+    mov byte [rdi+3], '0'
+    mov byte [rdi+4], 'x'
+    add rdi, 5
+    movzx eax, word [r12 + 8]            ; modifiers
+    mov edx, eax
+    shr edx, 4
+    and edx, 0xF
+    cmp dl, 10
+    jl .ddb_m_hi_d
+    add dl, 'a' - 10 - '0'
+.ddb_m_hi_d:
+    add dl, '0'
+    mov [rdi], dl
+    and eax, 0xF
+    cmp al, 10
+    jl .ddb_m_lo_d
+    add al, 'a' - 10 - '0'
+.ddb_m_lo_d:
+    add al, '0'
+    mov [rdi+1], al
+    add rdi, 2
+    mov byte [rdi], ' '
+    mov byte [rdi+1], 'a'
+    mov byte [rdi+2], '='
+    add rdi, 3
+    movzx eax, byte [r12 + 10]           ; action_id
+    cmp al, 10
+    jl .ddb_a1
+    mov dl, 0
+.ddb_a_t:
+    cmp al, 10
+    jl .ddb_a_t_done
+    sub al, 10
+    inc dl
+    jmp .ddb_a_t
+.ddb_a_t_done:
+    add dl, '0'
+    mov [rdi], dl
+    inc rdi
+.ddb_a1:
+    add al, '0'
+    mov [rdi], al
+    inc rdi
+    mov byte [rdi], ' '
+    mov byte [rdi+1], 'i'
+    mov byte [rdi+2], '='
+    add rdi, 3
+    movzx eax, byte [r12 + 11]           ; arg_int
+    cmp al, 100
+    jl .ddb_i_lt100
+    mov dl, 0
+.ddb_i_h:
+    cmp al, 100
+    jl .ddb_i_h_done
+    sub al, 100
+    inc dl
+    jmp .ddb_i_h
+.ddb_i_h_done:
+    add dl, '0'
+    mov [rdi], dl
+    inc rdi
+.ddb_i_lt100:
+    cmp al, 10
+    jl .ddb_i_one
+    mov dl, 0
+.ddb_i_t:
+    cmp al, 10
+    jl .ddb_i_t_done
+    sub al, 10
+    inc dl
+    jmp .ddb_i_t
+.ddb_i_t_done:
+    add dl, '0'
+    mov [rdi], dl
+    inc rdi
+.ddb_i_one:
+    add al, '0'
+    mov [rdi], al
+    inc rdi
+    mov byte [rdi], 10
+    inc rdi
+    lea rsi, [dkp_buf]
+    mov rdx, rdi
+    sub rdx, rsi
+    mov rax, SYS_WRITE
+    mov edi, 2
+    syscall
+    inc ebx
+    jmp .ddb_loop
+.ddb_done:
+    pop r12
+    pop rbx
+    ret
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Window management actions
@@ -1656,7 +2299,19 @@ configure_client_for_workspace:
     sub edx, eax                           ; oh -= reserved
 .ccfw_no_bar:
 
-    ; Apply inner gap on all four sides.
+    ; Apply inner gap on all four sides — but only when the workspace
+    ; is in a SPLIT layout. TABBED is single fullscreen and shouldn't
+    ; have any cosmetic frame.
+    movzx eax, sil                         ; ws number (still in sil)
+    test eax, eax
+    jz .ccfw_apply_gap                     ; ws=0 fallback → keep gap
+    cmp eax, WS_COUNT
+    jg .ccfw_apply_gap
+    dec eax
+    movzx eax, byte [ws_layout + rax]      ; LAYOUT_TABBED = 0
+    test eax, eax
+    jz .ccfw_skip_gap
+.ccfw_apply_gap:
     movzx eax, word [cfg_gap_inner]
     add r14d, eax                          ; ox += gap
     add r15d, eax                          ; oy += gap
@@ -1664,21 +2319,98 @@ configure_client_for_workspace:
     shl edi, 1                             ; 2*gap
     sub ecx, edi                           ; ow -= 2*gap
     sub edx, edi                           ; oh -= 2*gap
+.ccfw_skip_gap:
 
-    ; Build ConfigureWindow request: x, y, w, h.
+    ; Debug: log "tile: ccfw xid=N x=N y=N w=N h=N\n"
+    push rcx
+    push rdx
+    push rdi
+    push rsi
+    push r8
+    push r9
+    push r10
+    push r11
+    mov r10d, ecx                          ; w
+    mov r11d, edx                          ; h
+    lea rdi, [dkp_buf]
+    mov byte [rdi+0], 't'
+    mov byte [rdi+1], 'i'
+    mov byte [rdi+2], 'l'
+    mov byte [rdi+3], 'e'
+    mov byte [rdi+4], ':'
+    mov byte [rdi+5], ' '
+    mov byte [rdi+6], 'c'
+    mov byte [rdi+7], 'c'
+    mov byte [rdi+8], 'f'
+    mov byte [rdi+9], 'w'
+    mov byte [rdi+10], ' '
+    mov byte [rdi+11], 'x'
+    mov byte [rdi+12], 'i'
+    mov byte [rdi+13], 'd'
+    mov byte [rdi+14], '='
+    add rdi, 15
+    mov eax, r12d
+    call dbg_u32_dec
+    mov byte [rdi], ' '
+    mov byte [rdi+1], 'x'
+    mov byte [rdi+2], '='
+    add rdi, 3
+    mov eax, r14d
+    call dbg_u32_dec
+    mov byte [rdi], ' '
+    mov byte [rdi+1], 'y'
+    mov byte [rdi+2], '='
+    add rdi, 3
+    mov eax, r15d
+    call dbg_u32_dec
+    mov byte [rdi], ' '
+    mov byte [rdi+1], 'w'
+    mov byte [rdi+2], '='
+    add rdi, 3
+    mov eax, r10d
+    call dbg_u32_dec
+    mov byte [rdi], ' '
+    mov byte [rdi+1], 'h'
+    mov byte [rdi+2], '='
+    add rdi, 3
+    mov eax, r11d
+    call dbg_u32_dec
+    mov byte [rdi], 10
+    inc rdi
+    lea rsi, [dkp_buf]
+    mov rdx, rdi
+    sub rdx, rsi
+    mov rax, SYS_WRITE
+    mov edi, 2
+    syscall
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rsi
+    pop rdi
+    pop rdx
+    pop rcx
+    ; Build ConfigureWindow request: x, y, w, h, border-width=0. In
+    ; TABBED mode only one client is visible per workspace, so the focus
+    ; border is redundant — explicitly setting border-width to 0 here
+    ; both hides it (matching the user's expectation) and keeps the
+    ; visible footprint at exactly w x h (X draws borders OUTSIDE the
+    ; geometry, which would otherwise leak into the bar reservation).
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_CONFIGURE_WINDOW
     mov byte [rdi+1], 0
-    mov word [rdi+2], 7                    ; 3 header + 4 values = 7 words
+    mov word [rdi+2], 8                    ; 3 header + 5 values = 8 words
     mov [rdi+4], r12d                      ; window
-    mov word [rdi+8], CFG_X | CFG_Y | CFG_WIDTH | CFG_HEIGHT
+    mov word [rdi+8], CFG_X | CFG_Y | CFG_WIDTH | CFG_HEIGHT | CFG_BORDER
     mov word [rdi+10], 0
     mov dword [rdi+12], r14d               ; x
     mov dword [rdi+16], r15d               ; y
     mov dword [rdi+20], ecx                ; w
     mov dword [rdi+24], edx                ; h
+    mov dword [rdi+28], 0                  ; border-width = 0
     lea rsi, [tmp_buf]
-    mov rdx, 28
+    mov rdx, 32
     call x11_buffer
     inc dword [x11_seq]
     pop r15
@@ -1692,6 +2424,7 @@ configure_client_for_workspace:
 ; subsequent call (e.g. set_input_focus) can reuse the XID without
 ; reloading from memory.
 send_map_window:
+    call dbg_log_map                       ; logs "tile: map xid=N\n", preserves rax
     push rax
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_MAP_WINDOW
@@ -1705,6 +2438,202 @@ send_map_window:
     call x11_buffer
     pop rax
     inc dword [x11_seq]
+    ret
+
+; eax = sentinel + value. Writes "tile: tag=0xHHHH\n" to stderr —
+; lightweight checkpoint to trace which branches the MapRequest flow
+; reaches. Sentinels: 0x100 = post-track, 0x200|n = stash returned n,
+; 0x300|n = find_client_index returned n, 0x400|n = SAT entered with
+; ws=n.
+dbg_log_mrtag:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    mov r10d, eax
+    lea rdi, [dkp_buf]
+    mov byte [rdi+0], 't'
+    mov byte [rdi+1], 'i'
+    mov byte [rdi+2], 'l'
+    mov byte [rdi+3], 'e'
+    mov byte [rdi+4], ':'
+    mov byte [rdi+5], ' '
+    mov byte [rdi+6], 't'
+    mov byte [rdi+7], 'a'
+    mov byte [rdi+8], 'g'
+    mov byte [rdi+9], '='
+    mov byte [rdi+10], '0'
+    mov byte [rdi+11], 'x'
+    add rdi, 12
+    ; Emit 4 hex digits MSB-first (low 16 bits of r10d).
+    mov ecx, 12                            ; first shift = 12 (nibble 3)
+.dlt_hex:
+    mov eax, r10d
+    shr eax, cl
+    and al, 0xF
+    cmp al, 10
+    jl .dlt_dig
+    add al, 'a' - 10 - '0'
+.dlt_dig:
+    add al, '0'
+    mov [rdi], al
+    inc rdi
+    sub ecx, 4
+    jns .dlt_hex                           ; loop while >= 0
+    mov byte [rdi], 10
+    inc rdi
+    lea rsi, [dkp_buf]
+    mov rdx, rdi
+    sub rdx, rsi
+    mov rax, SYS_WRITE
+    mov edi, 2
+    syscall
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; eax = window XID. Writes "tile: map-req xid=NNNN\n" to stderr.
+dbg_log_mapreq:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    mov r10d, eax
+    lea rdi, [dkp_buf]
+    mov byte [rdi+0], 't'
+    mov byte [rdi+1], 'i'
+    mov byte [rdi+2], 'l'
+    mov byte [rdi+3], 'e'
+    mov byte [rdi+4], ':'
+    mov byte [rdi+5], ' '
+    mov byte [rdi+6], 'm'
+    mov byte [rdi+7], 'r'
+    mov byte [rdi+8], ' '
+    mov byte [rdi+9], 'x'
+    mov byte [rdi+10], 'i'
+    mov byte [rdi+11], 'd'
+    mov byte [rdi+12], '='
+    add rdi, 13
+    mov eax, r10d
+    call dbg_u32_dec
+    mov byte [rdi], 10
+    inc rdi
+    lea rsi, [dkp_buf]
+    mov rdx, rdi
+    sub rdx, rsi
+    mov rax, SYS_WRITE
+    mov edi, 2
+    syscall
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; eax = window XID. Writes "tile: map xid=NNNN\n" to stderr. Preserves
+; ALL caller registers (callers like send_map_window assume that
+; calling helpers near send doesn't clobber working state).
+dbg_log_map:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    mov r10d, eax                          ; save XID
+    lea rdi, [dkp_buf]
+    mov byte [rdi+0], 't'
+    mov byte [rdi+1], 'i'
+    mov byte [rdi+2], 'l'
+    mov byte [rdi+3], 'e'
+    mov byte [rdi+4], ':'
+    mov byte [rdi+5], ' '
+    mov byte [rdi+6], 'm'
+    mov byte [rdi+7], 'a'
+    mov byte [rdi+8], 'p'
+    mov byte [rdi+9], ' '
+    mov byte [rdi+10], 'x'
+    mov byte [rdi+11], 'i'
+    mov byte [rdi+12], 'd'
+    mov byte [rdi+13], '='
+    add rdi, 14
+    mov eax, r10d
+    call dbg_u32_dec
+    mov byte [rdi], 10
+    inc rdi
+    lea rsi, [dkp_buf]
+    mov rdx, rdi
+    sub rdx, rsi
+    mov rax, SYS_WRITE
+    mov edi, 2
+    syscall
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ret
+
+; rdi = buffer position, eax = unsigned 32-bit value (decimal, no
+; leading zeros). Updates rdi past the last digit. Clobbers eax/edx/r9.
+dbg_u32_dec:
+    test eax, eax
+    jnz .du32_nz
+    mov byte [rdi], '0'
+    inc rdi
+    ret
+.du32_nz:
+    sub rsp, 16
+    mov r9, rsp
+.du32_div:
+    test eax, eax
+    jz .du32_emit
+    xor edx, edx
+    mov ecx, 10
+    div ecx
+    add dl, '0'
+    mov [r9], dl
+    inc r9
+    jmp .du32_div
+.du32_emit:
+    cmp r9, rsp
+    je .du32_emit_done
+    dec r9
+    mov al, [r9]
+    mov [rdi], al
+    inc rdi
+    jmp .du32_emit
+.du32_emit_done:
+    add rsp, 16
     ret
 
 ; eax = window XID. SetInputFocus(window, RevertToParent=2, time=0).
@@ -1761,7 +2690,7 @@ set_input_focus:
     ret
 .sif_x:
     test ebx, ebx
-    jz .sif_done                          ; nothing to focus
+    jz .sif_clear_active                  ; nothing to focus → clear EWMH too
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_SET_INPUT_FOCUS
     mov byte [rdi+1], 2          ; revert-to = Parent
@@ -1772,7 +2701,60 @@ set_input_focus:
     mov rdx, 12
     call x11_buffer
     inc dword [x11_seq]
+    ; Publish _NET_ACTIVE_WINDOW on root so EWMH-aware apps (kitty,
+    ; GTK, etc.) recognise the focus change. Without this, those apps
+    ; can stay in "inactive" visual state (dimmed text/borders) even
+    ; after X grants them keyboard focus.
+    mov eax, [net_active_window_atom]
+    test eax, eax
+    jz .sif_done                          ; atom not interned, skip
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_PROPERTY
+    mov byte [rdi+1], 0                   ; mode = Replace
+    mov word [rdi+2], 7                   ; length: 6 base + 1 value word
+    mov eax, [x11_root_window]
+    mov [rdi+4], eax
+    mov eax, [net_active_window_atom]
+    mov [rdi+8], eax                      ; property
+    mov dword [rdi+12], 33                ; type = WINDOW (atom 33)
+    mov byte [rdi+16], 32                 ; format = 32 bits
+    mov byte [rdi+17], 0
+    mov byte [rdi+18], 0
+    mov byte [rdi+19], 0
+    mov dword [rdi+20], 1                 ; value-length (in 4-byte units of format)
+    mov [rdi+24], ebx                     ; the new active window XID
+    lea rsi, [tmp_buf]
+    mov rdx, 28
+    call x11_buffer
+    inc dword [x11_seq]
 .sif_done:
+    pop rbx
+    ret
+.sif_clear_active:
+    ; Focus-to-nothing: still publish _NET_ACTIVE_WINDOW = 0 so apps
+    ; clear their "I'm active" state. Useful when a workspace empties.
+    mov eax, [net_active_window_atom]
+    test eax, eax
+    jz .sif_done
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_PROPERTY
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 7
+    mov eax, [x11_root_window]
+    mov [rdi+4], eax
+    mov eax, [net_active_window_atom]
+    mov [rdi+8], eax
+    mov dword [rdi+12], 33
+    mov byte [rdi+16], 32
+    mov byte [rdi+17], 0
+    mov byte [rdi+18], 0
+    mov byte [rdi+19], 0
+    mov dword [rdi+20], 1
+    mov dword [rdi+24], 0
+    lea rsi, [tmp_buf]
+    mov rdx, 28
+    call x11_buffer
+    inc dword [x11_seq]
     pop rbx
     ret
 
@@ -1790,15 +2772,82 @@ track_client:
     cmp ebx, MAX_CLIENTS
     jge .tc_full
     mov [client_xids + rbx*4], r12d
+    ; Target workspace: pending_assign_ws if set (one-shot, set by the
+    ; MapRequest handler when an `assign` rule matched), else current_ws.
+    movzx ecx, byte [pending_assign_ws]
+    test ecx, ecx
+    jnz .tc_have_ws
     movzx ecx, byte [current_ws]
+.tc_have_ws:
     mov [client_ws + rbx], cl
     mov byte [client_unmap_expected + rbx], 0
     mov byte [client_color + rbx], 0      ; tab_default colour
     inc dword [client_count]
+    ; Debug: log "tile: trk xid=N idx=N cnt=N\n"
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    lea rdi, [dkp_buf]
+    mov byte [rdi+0], 't'
+    mov byte [rdi+1], 'i'
+    mov byte [rdi+2], 'l'
+    mov byte [rdi+3], 'e'
+    mov byte [rdi+4], ':'
+    mov byte [rdi+5], ' '
+    mov byte [rdi+6], 't'
+    mov byte [rdi+7], 'r'
+    mov byte [rdi+8], 'k'
+    mov byte [rdi+9], ' '
+    mov byte [rdi+10], 'x'
+    mov byte [rdi+11], 'i'
+    mov byte [rdi+12], 'd'
+    mov byte [rdi+13], '='
+    add rdi, 14
+    mov eax, r12d
+    call dbg_u32_dec
+    mov byte [rdi], ' '
+    mov byte [rdi+1], 'i'
+    mov byte [rdi+2], 'd'
+    mov byte [rdi+3], 'x'
+    mov byte [rdi+4], '='
+    add rdi, 5
+    mov eax, ebx
+    call dbg_u32_dec
+    mov byte [rdi], ' '
+    mov byte [rdi+1], 'c'
+    mov byte [rdi+2], 'n'
+    mov byte [rdi+3], 't'
+    mov byte [rdi+4], '='
+    add rdi, 5
+    mov eax, [client_count]
+    call dbg_u32_dec
+    mov byte [rdi], 10
+    inc rdi
+    lea rsi, [dkp_buf]
+    mov rdx, rdi
+    sub rdx, rsi
+    mov rax, SYS_WRITE
+    mov edi, 2
+    syscall
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
     ; Bump populated count for the workspace this client lives on.
-    movzx ecx, byte [current_ws]
-    dec ecx
-    inc byte [workspace_populated + rcx]
+    movzx eax, cl
+    dec eax
+    inc byte [workspace_populated + rax]
 
     ; Paint the new client's border with the unfocused colour. If it
     ; ends up focused (typical case for a fresh map), set_input_focus
@@ -1920,6 +2969,63 @@ untrack_client:
 find_client_index:
     push rbx
     mov ebx, eax
+    ; Debug: log "tile: find xid=N cnt=N first=N\n"
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    lea rdi, [dkp_buf]
+    mov byte [rdi+0], 't'
+    mov byte [rdi+1], 'i'
+    mov byte [rdi+2], 'l'
+    mov byte [rdi+3], 'e'
+    mov byte [rdi+4], ':'
+    mov byte [rdi+5], ' '
+    mov byte [rdi+6], 'f'
+    mov byte [rdi+7], 'i'
+    mov byte [rdi+8], 'n'
+    mov byte [rdi+9], 'd'
+    mov byte [rdi+10], ' '
+    mov byte [rdi+11], 'x'
+    mov byte [rdi+12], '='
+    add rdi, 13
+    mov eax, ebx
+    call dbg_u32_dec
+    mov byte [rdi], ' '
+    mov byte [rdi+1], 'c'
+    mov byte [rdi+2], '='
+    add rdi, 3
+    mov eax, [client_count]
+    call dbg_u32_dec
+    mov byte [rdi], ' '
+    mov byte [rdi+1], 'f'
+    mov byte [rdi+2], '0'
+    mov byte [rdi+3], '='
+    add rdi, 4
+    mov eax, [client_xids]
+    call dbg_u32_dec
+    mov byte [rdi], 10
+    inc rdi
+    lea rsi, [dkp_buf]
+    mov rdx, rdi
+    sub rdx, rsi
+    mov rax, SYS_WRITE
+    mov edi, 2
+    syscall
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
     xor ecx, ecx
 .fci_loop:
     cmp ecx, [client_count]
@@ -1968,6 +3074,38 @@ action_kill_focused:
     mov eax, [ws_active_xid + rcx*4]
     test eax, eax
     jz .akf_none
+
+    ; Pre-map the would-be-next-active so the moment the focused window
+    ; dies there's already a mapped window covering its area —
+    ; eliminates the wallpaper flash that otherwise appears between the
+    ; dying app's UnmapNotify (X already removed it) and tile sending
+    ; MapWindow for the new active in client_closed. Only meaningful
+    ; for TABBED layout (in SPLIT every client is already mapped).
+    push rax                                ; save dying XID
+    movzx edi, byte [current_ws]
+    dec edi
+    movzx edi, byte [ws_layout + rdi]
+    test edi, edi                            ; LAYOUT_TABBED = 0
+    jnz .akf_no_premap                       ; SPLIT — already mapped
+    mov eax, [rsp]                           ; dying XID
+    mov edx, eax                             ; exclude this one
+    movzx eax, byte [current_ws]
+    call find_top_excluding
+    test eax, eax
+    jz .akf_no_premap                        ; no other client → nothing to pre-map
+    push rax                                 ; save next-active XID
+    mov edi, eax
+    movzx esi, byte [current_ws]
+    call configure_client_for_workspace
+    pop rax
+    push rax
+    call send_map_window
+    pop rax
+    call set_input_focus                     ; also publishes _NET_ACTIVE_WINDOW
+    call x11_flush                           ; push to X before WM_DELETE
+.akf_no_premap:
+    pop rax                                  ; restore dying XID
+
     mov ecx, [wm_protocols_atom]
     test ecx, ecx
     jz .akf_force
@@ -2603,6 +3741,258 @@ intern_wm_atoms:
     syscall
     mov eax, [x11_read_buf + 8]
     mov [tile_shell_pid_atom], eax
+
+    ; --- _NET_ACTIVE_WINDOW --- (EWMH active-window hint; many apps,
+    ; including kitty and GTK clients, dim themselves when this points
+    ; at a different window even if X focus is on them.)
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_INTERN_ATOM
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2 + (net_active_window_len + 3) / 4
+    mov word [rdi+4], net_active_window_len
+    mov word [rdi+6], 0
+    lea rsi, [net_active_window_str]
+    lea rbx, [tmp_buf + 8]
+    xor ecx, ecx
+.iwa_cp4:
+    cmp ecx, net_active_window_len
+    jge .iwa_pad4
+    movzx eax, byte [rsi + rcx]
+    mov [rbx + rcx], al
+    inc ecx
+    jmp .iwa_cp4
+.iwa_pad4:
+    mov eax, net_active_window_len
+    add eax, 3
+    and eax, ~3
+    add eax, 8
+    mov rdx, rax
+    lea rsi, [tmp_buf]
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    inc dword [x11_seq]
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_read_buf]
+    mov rdx, 32
+    syscall
+    mov eax, [x11_read_buf + 8]
+    mov [net_active_window_atom], eax
+
+    pop r12
+    pop rbx
+    ret
+
+; rdi, rsi = NUL-terminated strings. Returns 1 in eax if equal, 0 otherwise.
+str_eq:
+.se_loop:
+    mov al, [rdi]
+    cmp al, [rsi]
+    jne .se_no
+    test al, al
+    je .se_yes
+    inc rdi
+    inc rsi
+    jmp .se_loop
+.se_yes:
+    mov eax, 1
+    ret
+.se_no:
+    xor eax, eax
+    ret
+
+; rdi = window XID. Sends GetProperty(WM_CLASS, STRING) and reads the
+; reply (queueing any events that arrive in the meantime). Returns
+; rax = pointer into wm_class_buf at the start of the CLASS string
+; (the second NUL-terminated half of WM_CLASS), or 0 on any failure.
+read_wm_class:
+    push rbx
+    push r12
+    mov r12d, edi
+    call x11_flush
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_GET_PROPERTY
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 6
+    mov [rdi+4], r12d
+    mov dword [rdi+8], 67                 ; XA_WM_CLASS
+    mov dword [rdi+12], 31                ; XA_STRING
+    mov dword [rdi+16], 0                 ; long-offset
+    mov dword [rdi+20], 64                ; long-length (256 bytes)
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 24
+    syscall
+    inc dword [x11_seq]
+
+    lea rdi, [wm_class_buf]
+    call read_reply_or_queue
+    test eax, eax
+    jz .rwc_fail
+
+    ; Reply value-length at +16; reply_length (CARD32 units) at +4.
+    mov ecx, [wm_class_buf + 16]
+    test ecx, ecx
+    jz .rwc_fail
+
+    ; Read the value bytes that follow the 32-byte header.
+    mov eax, [wm_class_buf + 4]
+    shl eax, 2                            ; bytes following header
+    test eax, eax
+    jz .rwc_fail
+    cmp eax, WM_CLASS_BUF_SIZE - 32
+    jbe .rwc_read_len_ok
+    mov eax, WM_CLASS_BUF_SIZE - 32
+.rwc_read_len_ok:
+    mov rdx, rax
+.rwc_read_loop:
+    test rdx, rdx
+    jz .rwc_after_read
+    push rdx
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [wm_class_buf + 32]
+    syscall
+    pop rdx
+    test rax, rax
+    jle .rwc_fail
+    sub rdx, rax
+    jmp .rwc_read_loop
+.rwc_after_read:
+
+    ; WM_CLASS is "instance\0class\0..." — find the NUL after instance.
+    lea rsi, [wm_class_buf + 32]
+    mov ecx, [wm_class_buf + 16]          ; value-length in bytes
+    test rcx, rcx
+    jz .rwc_fail
+    mov rax, rsi                          ; remember start
+.rwc_find_nul:
+    test rcx, rcx
+    jz .rwc_fail
+    cmp byte [rsi], 0
+    je .rwc_after_nul
+    inc rsi
+    dec rcx
+    jmp .rwc_find_nul
+.rwc_after_nul:
+    inc rsi                               ; skip the NUL
+    dec rcx
+    jz .rwc_fail                          ; no class part
+    ; Make sure CLASS is NUL-terminated within the buffer.
+    mov rax, rsi
+    pop r12
+    pop rbx
+    ret
+.rwc_fail:
+    xor eax, eax
+    pop r12
+    pop rbx
+    ret
+
+; rdi = window XID. If WM_CLASS class half matches an `assign` table
+; entry, returns target ws (1..10) in eax. Returns 0 on no match,
+; lookup failure, or any X11 hiccup. Skips the round-trip entirely
+; when the assign table is empty.
+apply_assign:
+    cmp dword [assign_count], 0
+    jne .aa_have_table
+    xor eax, eax
+    ret
+.aa_have_table:
+    push rbx
+    push r12
+    push r13
+    push r14
+    call read_wm_class
+    test rax, rax
+    jz .aa_no_match
+    mov r13, rax                          ; class string ptr
+    xor ebx, ebx
+.aa_loop:
+    cmp ebx, [assign_count]
+    jge .aa_no_match
+    movzx eax, word [assign_class + rbx*2]
+    lea rsi, [arg_pool + rax]
+    mov rdi, r13
+    call str_eq
+    test eax, eax
+    jnz .aa_match
+    inc ebx
+    jmp .aa_loop
+.aa_match:
+    movzx eax, byte [assign_ws + rbx]
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.aa_no_match:
+    xor eax, eax
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; rdi = window XID. If the class matches a `stash-on-map` entry,
+; immediately stashes the window (pushes to stash_xids LIFO, untracks,
+; sends UnmapWindow) and returns 1 in eax. Otherwise returns 0. Re-uses
+; the WM_CLASS read from a recent apply_assign when one happened, but
+; the X server caches well enough that re-reading is cheap.
+apply_stash_on_map:
+    cmp dword [stash_class_count], 0
+    jne .asom_have_table
+    xor eax, eax
+    ret
+.asom_have_table:
+    push rbx
+    push r12
+    push r13
+    mov r12d, edi                         ; XID
+    call read_wm_class
+    test rax, rax
+    jz .asom_no_match
+    mov r13, rax                          ; class ptr
+    xor ebx, ebx
+.asom_loop:
+    cmp ebx, [stash_class_count]
+    jge .asom_no_match
+    movzx eax, word [stash_class + rbx*2]
+    lea rsi, [arg_pool + rax]
+    mov rdi, r13
+    call str_eq
+    test eax, eax
+    jnz .asom_match
+    inc ebx
+    jmp .asom_loop
+.asom_match:
+    ; Stash this XID. Bail if stash full.
+    mov eax, [stash_count]
+    cmp eax, MAX_STASH
+    jge .asom_no_match
+    mov [stash_xids + rax*4], r12d
+    inc dword [stash_count]
+    ; Find tracked index, mark expected unmap, send unmap, untrack.
+    mov eax, r12d
+    call find_client_index
+    cmp eax, -1
+    je .asom_done                         ; not tracked yet — shouldn't happen
+    mov byte [client_unmap_expected + rax], 1
+    mov eax, r12d
+    call send_unmap_window
+    mov eax, r12d
+    call untrack_client
+.asom_done:
+    mov eax, 1
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.asom_no_match:
+    xor eax, eax
+    pop r13
     pop r12
     pop rbx
     ret
@@ -2735,6 +4125,34 @@ find_top_of_workspace:
     pop rbx
     ret
 
+; eax = ws, edx = XID to exclude. Returns the highest-indexed client on
+; ws whose XID isn't `edx` (or 0). Used by action_kill_focused to find
+; what would become the new active after the focused window dies.
+find_top_excluding:
+    push rbx
+    push r12
+    mov ebx, eax
+    mov r12d, edx
+    mov ecx, [client_count]
+.ftx_loop:
+    test ecx, ecx
+    jz .ftx_none
+    dec ecx
+    movzx eax, byte [client_ws + rcx]
+    cmp eax, ebx
+    jne .ftx_loop
+    mov eax, [client_xids + rcx*4]
+    cmp eax, r12d
+    je .ftx_loop
+    pop r12
+    pop rbx
+    ret
+.ftx_none:
+    xor eax, eax
+    pop r12
+    pop rbx
+    ret
+
 ; eax = new XID. Make it the active tab on the current workspace.
 ; In TABBED layout only the active is visible, so we unmap the
 ; previous active and map the new one (only if the workspace is
@@ -2744,12 +4162,19 @@ find_top_of_workspace:
 ; the side-by-side strip arrangement.
 ;
 ; Idempotent if eax already equals the workspace's active XID.
+; Wrapper for the common case: make EAX the active tab on the
+; current workspace.
 set_active_tab:
+    movzx esi, byte [current_ws]
+    ; fall through to set_active_tab_on_ws
+
+; eax = new active XID, esi = workspace number (1..WS_COUNT).
+set_active_tab_on_ws:
     push rbx
     push r12
     push r13
     mov r12d, eax                ; new active XID
-    movzx r13d, byte [current_ws]
+    mov r13d, esi                ; target workspace
     test r13d, r13d
     jz .sat_done
     mov ecx, r13d
@@ -2773,21 +4198,26 @@ set_active_tab:
     movzx eax, byte [ws_layout + r13 - 1]
     test eax, eax
     jnz .sat_split
-    ; ----- TABBED: unmap old, map new, focus new -----
-    test ebx, ebx
-    jz .sat_t_map
-    mov eax, ebx
-    call find_client_index
-    cmp eax, -1
-    je .sat_t_map
-    mov byte [client_unmap_expected + rax], 1
-    mov eax, ebx
-    call send_unmap_window
-.sat_t_map:
+    ; ----- TABBED: map new FIRST, then unmap old. Reverse order
+    ; eliminates a one-frame root-window flash (the old wallpaper
+    ; flicker) — both windows are at the same fullscreen geometry, so
+    ; the new one fully obscures the old before X destroys the old's
+    ; pixels. All requests share a single x11_flush below, so X
+    ; processes them in order without releasing the screen between
+    ; them.
     mov eax, r12d
     call send_map_window
     mov eax, r12d
     call set_input_focus
+    test ebx, ebx
+    jz .sat_render
+    mov eax, ebx
+    call find_client_index
+    cmp eax, -1
+    je .sat_render
+    mov byte [client_unmap_expected + rax], 1
+    mov eax, ebx
+    call send_unmap_window
     jmp .sat_render
 .sat_split:
     ; ----- SPLIT: re-apply layout (handles new client + re-slice) -----
@@ -2890,7 +4320,13 @@ client_closed:
     mov eax, edx
     call apply_workspace_layout
     ; Re-focus the new active if this is the global current_ws.
+    ; edx was clobbered by apply_workspace_layout (caller-saved); rebuild
+    ; the ws number from rbx (callee-saved across the call). Without this
+    ; rebuild, set_input_focus almost never fired in split/master modes —
+    ; tabbed escaped because action_kill_focused pre-focuses before kill.
     movzx ecx, byte [current_ws]
+    mov edx, ebx
+    inc edx
     cmp ecx, edx
     jne .cc_next
     mov eax, [ws_active_xid + rbx*4]
@@ -3043,6 +4479,84 @@ dispatch_keypress:
     movzx eax, byte [rcx + 10]
     movzx edx, word [rcx + 12]
     movzx esi, byte [rcx + 11]
+    ; Debug: log the matched bind ("tile: dk-match a=NN i=NN\n")
+    push rax
+    push rsi
+    push rcx
+    push rdx
+    lea rdi, [dkp_buf]
+    mov byte [rdi+0], 't'
+    mov byte [rdi+1], 'i'
+    mov byte [rdi+2], 'l'
+    mov byte [rdi+3], 'e'
+    mov byte [rdi+4], ':'
+    mov byte [rdi+5], ' '
+    mov byte [rdi+6], 'd'
+    mov byte [rdi+7], 'k'
+    mov byte [rdi+8], '='
+    ; action id (one or two digits)
+    mov rax, [rsp + 24]                  ; saved rax (action_id)
+    cmp al, 10
+    jl .dkm_one
+    mov dl, al
+    mov al, 0
+.dkm_div10:
+    cmp dl, 10
+    jl .dkm_div_done
+    sub dl, 10
+    inc al
+    jmp .dkm_div10
+.dkm_div_done:
+    add al, '0'
+    mov [rdi+9], al
+    add dl, '0'
+    mov [rdi+10], dl
+    mov rdi, dkp_buf + 11
+    jmp .dkm_arg
+.dkm_one:
+    add al, '0'
+    mov [rdi+9], al
+    mov rdi, dkp_buf + 10
+.dkm_arg:
+    mov byte [rdi], ' '
+    mov byte [rdi+1], 'i'
+    mov byte [rdi+2], '='
+    add rdi, 3
+    mov rax, [rsp + 16]                  ; saved rsi (arg_int)
+    cmp al, 10
+    jl .dkm_one2
+    mov dl, al
+    mov al, 0
+.dkm_div10b:
+    cmp dl, 10
+    jl .dkm_div_doneb
+    sub dl, 10
+    inc al
+    jmp .dkm_div10b
+.dkm_div_doneb:
+    add al, '0'
+    mov [rdi], al
+    add dl, '0'
+    mov [rdi+1], dl
+    add rdi, 2
+    jmp .dkm_lf
+.dkm_one2:
+    add al, '0'
+    mov [rdi], al
+    inc rdi
+.dkm_lf:
+    mov byte [rdi], 10
+    inc rdi
+    lea rsi, [dkp_buf]
+    mov rdx, rdi
+    sub rdx, rsi
+    mov rax, SYS_WRITE
+    mov edi, 2
+    syscall
+    pop rdx
+    pop rcx
+    pop rsi
+    pop rax
     cmp eax, ACT_EXEC
     je .dk_exec
     cmp eax, ACT_KILL
@@ -3069,6 +4583,8 @@ dispatch_keypress:
     je .dk_spawn_split
     cmp eax, ACT_EXEC_HERE
     je .dk_exec_here
+    cmp eax, ACT_RELOAD
+    je .dk_reload
     jmp .dk_done
 .dk_exec:
     test edx, edx
@@ -3167,6 +4683,9 @@ dispatch_keypress:
     lea rdi, [arg_pool + rdx]
     call action_exec_here
     jmp .dk_done
+.dk_reload:
+    call reload_runtime
+    jmp .dk_done
 .dk_skip:
     inc ebx
     jmp .dk_loop
@@ -3183,6 +4702,34 @@ fork_exec_string:
     push rbx
     push r12
     mov r12, rdi                 ; save command string
+    ; Debug: log every spawn attempt with PID return value, so the
+    ; session log shows exactly what tile tried to launch and whether
+    ; fork succeeded.
+    push rdi
+    mov rax, SYS_WRITE
+    mov edi, 2
+    lea rsi, [.fes_pre]
+    mov edx, .fes_pre_len
+    syscall
+    mov rax, SYS_WRITE
+    mov edi, 2
+    mov rsi, r12
+    xor ecx, ecx
+.fes_dlen:
+    cmp byte [rsi + rcx], 0
+    je .fes_dlen_done
+    inc ecx
+    cmp ecx, 200
+    jl .fes_dlen
+.fes_dlen_done:
+    mov edx, ecx
+    syscall
+    mov rax, SYS_WRITE
+    mov edi, 2
+    lea rsi, [.fes_lf]
+    mov edx, 1
+    syscall
+    pop rdi
     mov rax, SYS_FORK
     syscall
     test rax, rax
@@ -3214,6 +4761,121 @@ fork_exec_string:
     ret
 .fes_sh:    db "/bin/sh", 0
 .fes_dashc: db "-c", 0
+.fes_pre:   db "tile: fork-exec: "
+.fes_pre_len equ $ - .fes_pre
+.fes_lf:    db 10
+
+; ──────────────────────────────────────────────────────────────────────
+; Reload — re-read ~/.tilerc without restarting tile.
+;
+; Triggered by SIGUSR1 (e.g. `pkill -USR1 tile`) or by a `reload`
+; bind action. The signal handler itself does the absolute minimum
+; (sets a flag) so we stay async-safe; the real work happens at the
+; top of the event loop, between events. Re-runs key-grabs and pin
+; overrides, refreshes the bar, but deliberately does NOT re-run
+; autostart — that would spawn a duplicate strip, feh, etc.
+; ──────────────────────────────────────────────────────────────────────
+sigusr1_handler:
+    ; Mark a reload as needing to happen. Touch nothing else from a
+    ; signal context — async-signal-unsafe code (X11 writes, etc.) in
+    ; here would race the main loop and break the world.
+    mov byte [reload_pending], 1
+    ret
+
+; Install the SIGUSR1 handler. Uses the kernel sigaction layout (NOT
+; glibc's). The kernel demands SA_RESTORER + a restorer that issues
+; rt_sigreturn — without it the signal would corrupt rip on return
+; from user space.
+install_sigusr1:
+    push rbx
+    lea rdi, [sigact_buf]
+    lea rax, [sigusr1_handler]
+    mov [rdi], rax                        ; sa_handler
+    mov qword [rdi + 8], SA_RESTORER | SA_RESTART
+    lea rax, [sigreturn_trampoline]
+    mov [rdi + 16], rax                   ; sa_restorer
+    mov qword [rdi + 24], 0               ; sa_mask (no extra blocks)
+    mov rax, SYS_RT_SIGACTION
+    mov rdi, SIGUSR1
+    lea rsi, [sigact_buf]
+    xor edx, edx
+    mov r10, 8                            ; sigsetsize
+    syscall
+    pop rbx
+    ret
+
+sigreturn_trampoline:
+    mov rax, SYS_RT_SIGRETURN
+    syscall
+
+; Drop every key we grabbed on root, so a subsequent regrab won't
+; collide with the previous set (which might bind different keysyms).
+ungrab_all_keys:
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_UNGRAB_KEY
+    mov byte [rdi+1], 0                   ; key = AnyKey
+    mov word [rdi+2], 3                   ; length = 3 words = 12 bytes
+    mov eax, [x11_root_window]
+    mov [rdi+4], eax
+    mov word [rdi+8], 0x8000              ; modifiers = AnyModifier
+    mov word [rdi+10], 0
+    lea rsi, [tmp_buf]
+    mov rdx, 12
+    call x11_buffer
+    inc dword [x11_seq]
+    ret
+
+; Drained at the top of event_loop. Do the actual reload work here
+; — outside any signal context, with the X server in a sane state.
+reload_runtime:
+    push rbx
+    push r12
+    mov byte [reload_pending], 0
+    call ungrab_all_keys
+    ; load_config zeroes bind_count + exec_count and re-parses the file.
+    call load_config
+    call resolve_and_grab_binds
+    call apply_pin_overrides
+    ; Re-paint border colours on every tracked client so a changed
+    ; border_focused / border_unfocused / border_width takes effect on
+    ; existing windows.
+    xor ebx, ebx
+.rr_border_loop:
+    cmp ebx, [client_count]
+    jge .rr_border_done
+    mov eax, [client_xids + rbx*4]
+    cmp eax, [focused_xid]
+    jne .rr_border_dim
+    mov edx, [cfg_border_focused]
+    jmp .rr_border_apply
+.rr_border_dim:
+    mov edx, [cfg_border_unfocused]
+.rr_border_apply:
+    call set_window_border
+    inc ebx
+    jmp .rr_border_loop
+.rr_border_done:
+    ; Re-apply layout for every output's currently visible workspace.
+    ; Picks up changed gap_inner / strip_height / border_width on
+    ; already-mapped windows. Skips outputs with no current ws.
+    movzx r12d, byte [output_count]
+    xor ebx, ebx
+.rr_layout_loop:
+    cmp ebx, r12d
+    jge .rr_layout_done
+    movzx eax, byte [output_current_ws + rbx]
+    test eax, eax
+    jz .rr_layout_next
+    call apply_workspace_layout
+.rr_layout_next:
+    inc ebx
+    jmp .rr_layout_loop
+.rr_layout_done:
+    call render_bar
+    call x11_flush
+    pop r12
+    pop rbx
+    ret
 
 ; Iterate exec_list, fire-and-forget each command.
 run_autostart:
@@ -3256,6 +4918,38 @@ switch_workspace:
     push r13
     push r14
     push r15
+    ; Debug: write "tile: ws=N (was M)\n" to stderr.
+    push rdi
+    lea rdi, [dkp_buf]
+    mov byte [rdi+0], 't'
+    mov byte [rdi+1], 'i'
+    mov byte [rdi+2], 'l'
+    mov byte [rdi+3], 'e'
+    mov byte [rdi+4], ':'
+    mov byte [rdi+5], ' '
+    mov byte [rdi+6], 'w'
+    mov byte [rdi+7], 's'
+    mov byte [rdi+8], '='
+    mov rax, [rsp]
+    add al, '0'
+    mov [rdi+9], al
+    mov byte [rdi+10], ' '
+    mov byte [rdi+11], '('
+    mov byte [rdi+12], 'w'
+    mov byte [rdi+13], 'a'
+    mov byte [rdi+14], 's'
+    mov byte [rdi+15], ' '
+    movzx eax, byte [current_ws]
+    add al, '0'
+    mov [rdi+16], al
+    mov byte [rdi+17], ')'
+    mov byte [rdi+18], 10
+    mov rax, SYS_WRITE
+    mov edi, 2
+    lea rsi, [dkp_buf]
+    mov edx, 19
+    syscall
+    pop rdi
     test edi, edi
     jz .sw_done
     cmp edi, WS_COUNT
@@ -3288,20 +4982,23 @@ switch_workspace:
     cmp eax, r12d
     je .sw_just_focus
 
-    ; Hide everything on the workspace currently visible on this
-    ; output (could be a tabbed single window or a split-mode set).
-    movzx eax, byte [output_current_ws + r14]
-    test eax, eax
-    jz .sw_no_old_hide
-    call hide_workspace_clients
-.sw_no_old_hide:
-
-    ; Make the target workspace visible: update output state then
-    ; apply the target's layout (which configures and maps every
-    ; client that should be on screen).
+    ; Show the target workspace BEFORE hiding the old one — both maps
+    ; and unmaps share a single x11_flush below, so X processes them
+    ; back-to-back. With the target's windows mapped first (over the
+    ; old workspace's), the old's pixels stay covered until they're
+    ; unmapped, eliminating a one-frame root-window flash that showed
+    ; the wallpaper between the unmap and the map.
+    movzx ebx, byte [output_current_ws + r14]    ; rbx = old ws (was already preserved on entry to switch_workspace)
     mov [output_current_ws + r14], r12b
     mov eax, r12d
     call apply_workspace_layout
+
+    ; Now hide the previously-visible workspace's clients.
+    test ebx, ebx
+    jz .sw_no_old_hide
+    mov eax, ebx
+    call hide_workspace_clients
+.sw_no_old_hide:
 .sw_just_focus:
     ; Focus the target workspace's active tab if any.
     mov ecx, r12d
@@ -3530,6 +5227,74 @@ move_focused_to_workspace:
 configure_window_rect:
     push rbx
     mov rbx, rdi                          ; preserve XID across x11_buffer
+    ; Debug: log "tile: cfg xid=N x=N y=N w=N h=N\n"
+    push rdi
+    push rsi
+    push rdx
+    push rcx
+    push r8
+    push r9
+    push r10
+    push r11
+    mov r10, rdi                           ; XID
+    lea rdi, [dkp_buf]
+    mov byte [rdi+0], 't'
+    mov byte [rdi+1], 'i'
+    mov byte [rdi+2], 'l'
+    mov byte [rdi+3], 'e'
+    mov byte [rdi+4], ':'
+    mov byte [rdi+5], ' '
+    mov byte [rdi+6], 'c'
+    mov byte [rdi+7], 'f'
+    mov byte [rdi+8], 'g'
+    mov byte [rdi+9], ' '
+    mov byte [rdi+10], 'x'
+    mov byte [rdi+11], 'i'
+    mov byte [rdi+12], 'd'
+    mov byte [rdi+13], '='
+    add rdi, 14
+    mov eax, r10d
+    call dbg_u32_dec
+    mov byte [rdi], ' '
+    mov byte [rdi+1], 'x'
+    mov byte [rdi+2], '='
+    add rdi, 3
+    mov eax, [rsp + 48]                    ; saved esi
+    call dbg_u32_dec
+    mov byte [rdi], ' '
+    mov byte [rdi+1], 'y'
+    mov byte [rdi+2], '='
+    add rdi, 3
+    mov eax, [rsp + 40]                    ; saved edx
+    call dbg_u32_dec
+    mov byte [rdi], ' '
+    mov byte [rdi+1], 'w'
+    mov byte [rdi+2], '='
+    add rdi, 3
+    mov eax, [rsp + 32]                    ; saved ecx
+    call dbg_u32_dec
+    mov byte [rdi], ' '
+    mov byte [rdi+1], 'h'
+    mov byte [rdi+2], '='
+    add rdi, 3
+    mov eax, [rsp + 24]                    ; saved r8
+    call dbg_u32_dec
+    mov byte [rdi], 10
+    inc rdi
+    lea rsi, [dkp_buf]
+    mov rdx, rdi
+    sub rdx, rsi
+    mov rax, SYS_WRITE
+    mov edi, 2
+    syscall
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rcx
+    pop rdx
+    pop rsi
+    pop rdi
     ; Apply border inset: shift x,y by border, shrink w,h by 2*border.
     movzx eax, byte [cfg_border_width]
     test eax, eax
@@ -3643,36 +5408,48 @@ apply_workspace_layout:
     mov ecx, r13d
     dec ecx
     mov r15d, [ws_active_xid + rcx*4]     ; r15 = active XID (may be 0)
+    ; Two-pass: configure+map the active client FIRST so its pixels
+    ; cover the workspace before any non-active siblings get unmapped.
+    ; Single x11_flush below sends both passes in one go, so X never
+    ; releases the screen between them. Eliminates the wallpaper
+    ; flicker on workspace switch / re-elect.
     xor ebx, ebx
-.awl_t_loop:
+.awl_t_loop_show:
+    cmp ebx, [client_count]
+    jge .awl_t_done_show
+    movzx eax, byte [client_ws + rbx]
+    cmp eax, r13d
+    jne .awl_t_next_show
+    mov eax, [client_xids + rbx*4]
+    cmp eax, r15d
+    jne .awl_t_next_show
+    ; Active: route through configure_client_for_workspace for
+    ; no-border + no-gap (configure_window_rect would re-add them).
+    mov edi, eax
+    mov esi, r13d
+    call configure_client_for_workspace
+    mov eax, [client_xids + rbx*4]
+    call send_map_window
+.awl_t_next_show:
+    inc ebx
+    jmp .awl_t_loop_show
+.awl_t_done_show:
+    ; Second pass: hide non-active clients on this ws.
+    xor ebx, ebx
+.awl_t_loop_hide:
     cmp ebx, [client_count]
     jge .awl_t_done
     movzx eax, byte [client_ws + rbx]
     cmp eax, r13d
-    jne .awl_t_next
+    jne .awl_t_next_hide
     mov eax, [client_xids + rbx*4]
     cmp eax, r15d
-    je .awl_t_show
-    ; Hide non-active client (it might have been visible if we just
-    ; switched out of split mode).
+    je .awl_t_next_hide
     mov byte [client_unmap_expected + rbx], 1
     call send_unmap_window
-    jmp .awl_t_next
-.awl_t_show:
-    mov rdi, rax
-    mov esi, [rsp + 24]                   ; ws_x  (after 4 pushes)
-    mov edx, [rsp + 16]                   ; ws_y
-    mov ecx, [rsp + 8]                    ; ws_w
-    mov r8d, [rsp + 0]                    ; ws_h
-    call configure_window_rect
-    ; Re-fetch the XID from memory before send_map_window — both
-    ; configure_window_rect and x11_buffer (which it calls) clobber
-    ; eax. Same pattern as the SPLIT_H/SPLIT_V branches below.
-    mov eax, [client_xids + rbx*4]
-    call send_map_window
-.awl_t_next:
+.awl_t_next_hide:
     inc ebx
-    jmp .awl_t_loop
+    jmp .awl_t_loop_hide
 .awl_t_done:
     pop r12
     pop rcx
@@ -4538,7 +6315,18 @@ load_config:
     push r12
     mov dword [bind_count], 0
     mov dword [exec_count], 0
+    mov dword [assign_count], 0
+    mov dword [stash_class_count], 0
     mov qword [config_len], 0
+    ; Reset arg_pool so repeated reloads don't leak. The bind_table and
+    ; exec_list above are already empty, so no live offsets reference
+    ; arg_pool. Keep arg_pool[0] = 0 as the "no arg" sentinel.
+    mov dword [arg_pool_pos], 1
+    mov byte [arg_pool], 0
+    ; Reset pin overrides so a reload picks up removed `pin` lines.
+    mov rax, 0xFFFFFFFFFFFFFFFF
+    mov [ws_pin_override], rax
+    mov word [ws_pin_override + 8], 0xFFFF
 
     call build_config_path
     test rax, rax
@@ -4665,23 +6453,40 @@ add_bind:
 ; rdi = NUL-terminated string. Parse as integer. Returns workspace
 ; number in eax: 1..9 for "1".."9", 10 for "0" (matches i3-style
 ; numbering on the row of digit keys); 0 if not a valid digit.
+; rdi = NUL-terminated string. Reads up to 2 leading decimal digits and
+; returns the workspace number 1..10 in eax. Mapping:
+;   "1".."9"  → 1..9
+;   "0"       → 10  (i3-style — the digit row's "0" key sits after "9")
+;   "10"      → 10
+; Anything else (3+ digits, leading non-digit, value >10) → 0. Trailing
+; whitespace / comment / NUL after the digits is ignored, so the line
+; need not be tokenized before calling.
 parse_workspace_number:
-    mov al, [rdi]
-    cmp al, '1'
-    jb .pwn_check_zero
-    cmp al, '9'
-    ja .pwn_no
-    cmp byte [rdi + 1], 0
-    jne .pwn_no                  ; multi-char like "10" not supported here
-    sub al, '0'
-    movzx eax, al
+    movzx eax, byte [rdi]
+    sub eax, '0'
+    cmp eax, 9
+    ja .pwn_no                   ; not a digit at all
+    movzx ecx, byte [rdi + 1]
+    sub ecx, '0'
+    cmp ecx, 9
+    ja .pwn_one_digit            ; second char isn't a digit → 1-digit value
+    ; Two-digit value. Reject if a 3rd digit follows.
+    movzx edx, byte [rdi + 2]
+    sub edx, '0'
+    cmp edx, 9
+    jbe .pwn_no                  ; 3+ digits — reject
+    imul eax, eax, 10
+    add eax, ecx
+    cmp eax, 10
+    ja .pwn_no                   ; only 1..10 are valid workspaces
+    test eax, eax
+    jz .pwn_no                   ; "00" is nonsense
     ret
-.pwn_check_zero:
-    cmp al, '0'
-    jne .pwn_no
-    cmp byte [rdi + 1], 0
-    jne .pwn_no
-    mov eax, 10
+.pwn_one_digit:
+    test eax, eax
+    jnz .pwn_done                ; "1".."9" → 1..9
+    mov eax, 10                  ; "0" → 10
+.pwn_done:
     ret
 .pwn_no:
     xor eax, eax
@@ -4789,18 +6594,153 @@ arg_pool_dup:
 ; rdi = NUL-terminated line (LF already stripped). Parses one config
 ; statement: "bind <chord> <action> [arg]" or "exec <cmd>" or "mod = X"
 ; or comment / blank.
+; rdi = NUL-terminated original config line (held in cfg_line_buf, set
+; by parse_config_line before tokenization). Writes
+;   "tile: warning: ignoring config line: <line>\n"
+; to stderr. Visible when tile is launched from a terminal; harmless
+; (silently dropped) under xinit. Output errors are ignored — there's
+; nothing useful we could do about a closed stderr.
+warn_unknown_config_line:
+    push rbx
+    push r12
+    mov r12, rdi
+    mov rax, SYS_WRITE
+    mov edi, 2
+    lea rsi, [.wucl_pre]
+    mov edx, .wucl_pre_len
+    syscall
+    ; Walk the line to its NUL or 255 cap.
+    mov rdi, r12
+    xor ecx, ecx
+.wucl_len:
+    cmp byte [rdi + rcx], 0
+    je .wucl_len_done
+    inc ecx
+    cmp ecx, 255
+    jl .wucl_len
+.wucl_len_done:
+    test ecx, ecx
+    jz .wucl_lf_only
+    mov rax, SYS_WRITE
+    mov edi, 2
+    mov rsi, r12
+    mov edx, ecx
+    syscall
+.wucl_lf_only:
+    mov rax, SYS_WRITE
+    mov edi, 2
+    lea rsi, [.wucl_lf]
+    mov edx, 1
+    syscall
+    pop r12
+    pop rbx
+    ret
+.wucl_pre: db "tile: warning: ignoring config line: "
+.wucl_pre_len equ $ - .wucl_pre
+.wucl_lf: db 10
+
 parse_config_line:
     push rbx
     push r12
     push r13
     mov r12, rdi
+
+    ; Snapshot the line into cfg_line_buf BEFORE tokenization NUL-
+    ; terminates words inside it. The warning emitter reads this back
+    ; so the user sees the original text in the diagnostic.
+    push rdi
+    mov rsi, rdi
+    lea rdi, [cfg_line_buf]
+    mov ecx, 255
+.pcl_snap:
+    test ecx, ecx
+    jz .pcl_snap_done
+    mov al, [rsi]
+    mov [rdi], al
+    test al, al
+    jz .pcl_snap_done
+    inc rsi
+    inc rdi
+    dec ecx
+    jmp .pcl_snap
+.pcl_snap_done:
+    mov byte [rdi], 0
+    mov byte [cfg_line_recognized], 0
+    pop rdi
+    mov r12, rdi
+
+    ; Strip trailing inline comments from the WORKING copy: a `#` that
+    ; follows whitespace becomes a NUL terminator. The `#` in `#rrggbb`
+    ; hex colours is preserved because nothing whitespacey precedes it
+    ; (the value sits flush against `=`/the keyword + a space). The
+    ; cfg_line_buf snapshot keeps the original for warning text.
+    mov rsi, r12
+.pcl_strip_inline:
+    mov al, [rsi]
+    test al, al
+    je .pcl_strip_done
+    cmp al, ' '
+    je .pcl_strip_check_hash
+    cmp al, 9
+    je .pcl_strip_check_hash
+    inc rsi
+    jmp .pcl_strip_inline
+.pcl_strip_check_hash:
+    cmp byte [rsi + 1], '#'
+    jne .pcl_strip_advance_ws
+    ; A `#` after whitespace ONLY counts as a comment when it is itself
+    ; followed by whitespace (or end-of-line). That distinguishes
+    ;   bar_pad = 6   # comment        ← real comment
+    ; from
+    ;   bar_bg = #222222               ← hex colour, must not be eaten
+    movzx eax, byte [rsi + 2]
+    cmp al, 0
+    je .pcl_strip_kill
+    cmp al, ' '
+    je .pcl_strip_kill
+    cmp al, 9
+    je .pcl_strip_kill
+    jmp .pcl_strip_advance_ws            ; not whitespace after `#` → not a comment
+.pcl_strip_kill:
+    mov byte [rsi], 0
+    jmp .pcl_strip_done
+.pcl_strip_advance_ws:
+    inc rsi
+    jmp .pcl_strip_inline
+.pcl_strip_done:
+
+    ; Trim trailing whitespace. Some arg parsers (layout/focus/move-tab)
+    ; do strict equality lookups against short words — a lingering
+    ; space after `toggle` would turn "toggle" into "toggle " and miss.
+    mov rsi, r12
+.pcl_find_end:
+    mov al, [rsi]
+    test al, al
+    jz .pcl_trim_back
+    inc rsi
+    jmp .pcl_find_end
+.pcl_trim_back:
+    cmp rsi, r12
+    jbe .pcl_trim_done
+    mov al, [rsi - 1]
+    cmp al, ' '
+    je .pcl_trim_kill
+    cmp al, 9
+    je .pcl_trim_kill
+    jmp .pcl_trim_done
+.pcl_trim_kill:
+    dec rsi
+    mov byte [rsi], 0
+    jmp .pcl_trim_back
+.pcl_trim_done:
+
     ; Skip leading whitespace
     call .pcl_skip_ws
     mov al, [r12]
     test al, al
-    je .pcl_done                 ; blank
+    je .pcl_blank_or_comment     ; blank → don't warn
     cmp al, '#'
-    je .pcl_done                 ; comment
+    je .pcl_blank_or_comment     ; comment → don't warn
     ; Tokenize: r13 = start of command word
     mov r13, r12
 .pcl_cmd_end:
@@ -4837,14 +6777,27 @@ parse_config_line:
     call .pcl_streq
     test eax, eax
     jnz .pcl_handle_pin
+    mov rdi, r13
+    lea rsi, [.pcl_kw_assign]
+    call .pcl_streq
+    test eax, eax
+    jnz .pcl_handle_assign
+    mov rdi, r13
+    lea rsi, [.pcl_kw_stash_on_map]
+    call .pcl_streq
+    test eax, eax
+    jnz .pcl_handle_stash_on_map
     ; bar / palette settings (key = value)
     call .pcl_skip_ws
     cmp byte [r12], '='
-    jne .pcl_done                ; not a key=value line, ignore
+    jne .pcl_done                ; unknown command word — falls through to warn
     inc r12
     call .pcl_skip_ws
     mov rdi, r13
     call apply_setting
+    test eax, eax
+    jz .pcl_done                 ; unknown setting key — warn
+    mov byte [cfg_line_recognized], 1
     jmp .pcl_done
 
 .pcl_handle_bind:
@@ -4932,6 +6885,7 @@ parse_config_line:
     mov al, [r12]
     test al, al
     je .pcl_pop_mod_done
+    push rcx                     ; save action_id across helper calls
     mov rdi, r12
     call lookup_ws_arg           ; handles next/prev/back-and-forth
     test eax, eax
@@ -4939,61 +6893,84 @@ parse_config_line:
     mov rdi, r12
     call parse_workspace_number
     test eax, eax
-    jz .pcl_pop_mod_done         ; not a number, not a name
+    jnz .pcl_ws_have
+    pop rcx                      ; balance stack before bailing
+    jmp .pcl_pop_mod_done
 .pcl_ws_have:
     mov r8b, al                  ; arg_int
     xor edx, edx                 ; no arg_off
+    pop rcx                      ; restore action_id
     jmp .pcl_emit
 .pcl_arg_mt:
     call .pcl_skip_ws
     mov al, [r12]
     test al, al
     je .pcl_pop_mod_done
+    push rcx                     ; save action_id across parse_workspace_number
     mov rdi, r12
     call parse_workspace_number
     test eax, eax
-    jz .pcl_pop_mod_done
+    jnz .pcl_mt_ok
+    pop rcx
+    jmp .pcl_pop_mod_done
+.pcl_mt_ok:
     mov r8b, al
     xor edx, edx
+    pop rcx
     jmp .pcl_emit
 .pcl_arg_focus:
     call .pcl_skip_ws
     mov al, [r12]
     test al, al
     je .pcl_pop_mod_done
+    push rcx                     ; save action_id across lookup_packed_byte
     mov rdi, r12
     lea rdx, [focus_arg_table]
     call lookup_packed_byte
     test eax, eax
-    jz .pcl_pop_mod_done
+    jnz .pcl_focus_ok
+    pop rcx
+    jmp .pcl_pop_mod_done
+.pcl_focus_ok:
     mov r8b, al
     xor edx, edx
+    pop rcx
     jmp .pcl_emit
 .pcl_arg_mtab:
     call .pcl_skip_ws
     mov al, [r12]
     test al, al
     je .pcl_pop_mod_done
+    push rcx
     mov rdi, r12
     lea rdx, [mtab_arg_table]
     call lookup_packed_byte
     test eax, eax
-    jz .pcl_pop_mod_done
+    jnz .pcl_mtab_ok
+    pop rcx
+    jmp .pcl_pop_mod_done
+.pcl_mtab_ok:
     mov r8b, al
     xor edx, edx
+    pop rcx
     jmp .pcl_emit
 .pcl_arg_layout:
     call .pcl_skip_ws
     mov al, [r12]
     test al, al
     je .pcl_pop_mod_done
+    push rcx
     mov rdi, r12
     lea rdx, [layout_arg_table]
     call lookup_packed_byte
     test eax, eax
-    jz .pcl_pop_mod_done
+    jnz .pcl_layout_ok
+    pop rcx
+    jmp .pcl_pop_mod_done
+.pcl_layout_ok:
     mov r8b, al
     xor edx, edx
+    pop rcx
     jmp .pcl_emit
 .pcl_arg_spawn_split:
     ; "spawn-split <direction> <command...>"
@@ -5058,6 +7035,7 @@ parse_config_line:
     mov edx, ecx                 ; action_id (param 3)
     mov ecx, r9d                 ; arg_off (param 4)
     call add_bind
+    mov byte [cfg_line_recognized], 1
     jmp .pcl_done
 .pcl_pop_mod_done:
     pop rdx
@@ -5077,6 +7055,7 @@ parse_config_line:
     jge .pcl_done
     mov [exec_list + rdx*2], ax
     inc dword [exec_count]
+    mov byte [cfg_line_recognized], 1
     jmp .pcl_done
 
 .pcl_handle_pin:
@@ -5101,9 +7080,80 @@ parse_config_line:
     cmp eax, MAX_OUTPUTS
     jge .pcl_done
     mov [ws_pin_override + rbx - 1], al
+    mov byte [cfg_line_recognized], 1
     jmp .pcl_done
 
+.pcl_handle_assign:
+    ; "assign <class> <ws>"  — class string copied into arg_pool; ws is
+    ; 1..9 (digit) or 0 (= WS 10). Garbage drops the line.
+    call .pcl_skip_ws
+    mov al, [r12]
+    test al, al
+    je .pcl_done
+    mov r13, r12                          ; class start
+.pcl_assign_cls_end:
+    mov al, [r12]
+    test al, al
+    je .pcl_done                          ; need ws after class
+    cmp al, ' '
+    je .pcl_assign_cls_done
+    cmp al, 9
+    je .pcl_assign_cls_done
+    inc r12
+    jmp .pcl_assign_cls_end
+.pcl_assign_cls_done:
+    mov byte [r12], 0
+    inc r12
+    call .pcl_skip_ws
+    mov al, [r12]
+    test al, al
+    je .pcl_done
+    mov rdi, r12
+    call parse_workspace_number
+    test eax, eax
+    jz .pcl_done
+    mov ebx, eax                          ; ws
+    mov rdi, r13
+    call arg_pool_dup
+    test eax, eax
+    jz .pcl_done
+    mov ecx, [assign_count]
+    cmp ecx, MAX_ASSIGNS
+    jge .pcl_done
+    mov [assign_class + rcx*2], ax
+    mov [assign_ws + rcx], bl
+    inc dword [assign_count]
+    mov byte [cfg_line_recognized], 1
+    jmp .pcl_done
+
+.pcl_handle_stash_on_map:
+    ; "stash-on-map <class>"  — class string copied into arg_pool.
+    call .pcl_skip_ws
+    mov al, [r12]
+    test al, al
+    je .pcl_done
+    mov rdi, r12
+    call arg_pool_dup
+    test eax, eax
+    jz .pcl_done
+    mov ecx, [stash_class_count]
+    cmp ecx, MAX_STASH_ON_MAP
+    jge .pcl_done
+    mov [stash_class + rcx*2], ax
+    inc dword [stash_class_count]
+    mov byte [cfg_line_recognized], 1
+    jmp .pcl_done
+
+.pcl_blank_or_comment:
+    mov byte [cfg_line_recognized], 1
+    ; fall through to .pcl_done
+
 .pcl_done:
+    cmp byte [cfg_line_recognized], 0
+    jne .pcl_truly_done
+    lea rdi, [cfg_line_buf]
+    call warn_unknown_config_line
+.pcl_truly_done:
     pop r13
     pop r12
     pop rbx
@@ -5145,6 +7195,8 @@ parse_config_line:
 .pcl_kw_bind: db "bind", 0
 .pcl_kw_exec: db "exec", 0
 .pcl_kw_pin:  db "pin", 0
+.pcl_kw_assign: db "assign", 0
+.pcl_kw_stash_on_map: db "stash-on-map", 0
 
 ; rdi = chord string, e.g. "Mod4+Shift+Return".
 ; Tokens are split by '+'; the chord ends at the first whitespace or NUL.
@@ -5492,7 +7544,60 @@ apply_setting:
     call .as_streq
     test eax, eax
     jnz .as_strip_height
+    mov rdi, r13
+    lea rsi, [.as_kw_bar_pad]
+    call .as_streq
+    test eax, eax
+    jnz .as_bar_pad
+    mov rdi, r13
+    lea rsi, [.as_kw_ws_dim_factor]
+    call .as_streq
+    test eax, eax
+    jnz .as_ws_dim_factor
+    ; Per-workspace colour: ws_color_N where N is 1..10. Match the
+    ; "ws_color_" prefix, then parse the digit suffix.
+    mov rdi, r13
+    lea rsi, [.as_kw_ws_color_pre]
+    call .as_starts_with
+    test eax, eax
+    jnz .as_ws_color_pre
+    ; No keyword matched. Return 0 so the caller can warn the user.
+    xor eax, eax
+    pop r13
+    pop rbx
+    ret
+
+.as_ws_dim_factor:
+    mov rdi, r12
+    call parse_decimal_byte
+    cmp eax, 100
+    jle .as_ws_dim_ok
+    mov eax, 100
+.as_ws_dim_ok:
+    mov [cfg_ws_dim_factor], al
     jmp .as_done
+
+.as_ws_color_pre:
+    ; r13 + 9 points just past "ws_color_" (9 chars). Parse the number.
+    lea rdi, [r13 + 9]
+    call parse_decimal_byte
+    test eax, eax
+    jz .as_ws_color_bad
+    cmp eax, 10
+    jg .as_ws_color_bad
+    ; Save ws index, then parse the colour value.
+    push rax
+    mov rdi, r12
+    call parse_hex_color
+    pop rcx                                  ; rcx = ws (1..10)
+    dec rcx
+    mov [cfg_ws_colors + rcx*4], eax
+    jmp .as_done
+.as_ws_color_bad:
+    xor eax, eax
+    pop r13
+    pop rbx
+    ret
 
 .as_bar_height:
     mov rdi, r12
@@ -5570,7 +7675,13 @@ apply_setting:
     call parse_decimal_byte
     mov [cfg_strip_height], ax
     jmp .as_done
+.as_bar_pad:
+    mov rdi, r12
+    call parse_decimal_byte
+    mov [cfg_bar_pad], ax
+    jmp .as_done
 .as_done:
+    mov eax, 1                            ; matched + applied
     pop r13
     pop rbx
     ret
@@ -5609,6 +7720,32 @@ apply_setting:
 .as_kw_border_unfocused: db "border_unfocused", 0
 .as_kw_master_ratio:    db "master_ratio", 0
 .as_kw_strip_height:    db "strip_height", 0
+.as_kw_bar_pad:         db "bar_pad", 0
+.as_kw_ws_dim_factor:   db "ws_dim_factor", 0
+.as_kw_ws_color_pre:    db "ws_color_", 0
+
+; rdi = haystack, rsi = needle (NUL-terminated). Returns 1 in eax if
+; needle is a prefix of haystack, 0 otherwise.
+.as_starts_with:
+    push rbx
+.asw_loop:
+    mov al, [rsi]
+    test al, al
+    jz .asw_yes                              ; needle exhausted = match
+    mov bl, [rdi]
+    cmp al, bl
+    jne .asw_no
+    inc rdi
+    inc rsi
+    jmp .asw_loop
+.asw_yes:
+    mov eax, 1
+    pop rbx
+    ret
+.asw_no:
+    xor eax, eax
+    pop rbx
+    ret
 
 ; rdi = NUL-terminated string starting with optional '#' then 6 hex
 ; digits. Returns CARD32 0x00RRGGBB in eax. Garbage in → 0 in eax.
@@ -5713,16 +7850,27 @@ parse_palette:
     pop rbx
     ret
 
-; eax = source CARD32 0x00RRGGBB. Multiplies each channel by
-; cfg_tab_dim_factor / 100 and returns the result in eax. Used to draw
-; inactive tab squares dimly while keeping their hue recognisable.
+; eax = source CARD32 0x00RRGGBB, dl = factor (% 0..100). Multiplies
+; each channel by factor/100 and returns the result in eax. Tab path
+; uses cfg_tab_dim_factor; WS path uses cfg_ws_dim_factor.
+dim_color_pct:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r14d, eax
+    movzx r13d, dl
+    jmp dim_color_apply
+
+; Legacy entrypoint: dims by cfg_tab_dim_factor.
 dim_color:
     push rbx
     push r12
     push r13
     push r14
-    mov r14d, eax                         ; original 0x00RRGGBB
+    mov r14d, eax
     movzx r13d, byte [cfg_tab_dim_factor]
+dim_color_apply:
     ; --- R channel ---
     mov eax, r14d
     shr eax, 16
@@ -5833,6 +7981,137 @@ create_bar:
     ; Map the bar window.
     mov eax, r12d
     call send_map_window
+    pop r12
+    pop rbx
+    ret
+
+; eax = layout id (LAYOUT_TABBED / LAYOUT_SPLIT_H / LAYOUT_SPLIT_V /
+; LAYOUT_MASTER), edi = x position. Draws a bar_height × bar_height
+; glyph using the GC's current foreground colour, depicting the
+; layout's pane shape so the user knows where the next spawn lands.
+;
+;   TABBED   ▮          (one filled square)
+;   SPLIT_H  ▌▐         (two thin vertical bars side by side)
+;   SPLIT_V  ▀▄         (two thin horizontal bars stacked)
+;   MASTER   ▌▘▖        (left half full + right half split top/bottom)
+;
+; All glyphs occupy the same edge length so positioning stays
+; predictable. Bars are 2px thick on a typical bar_height=10.
+draw_layout_glyph:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12d, edi                          ; glyph x
+    movzx r13d, word [bar_height]          ; glyph edge
+    mov r14d, eax                          ; layout id
+    cmp r14d, LAYOUT_TABBED
+    je .dlg_tabbed
+    cmp r14d, LAYOUT_SPLIT_H
+    je .dlg_split_h
+    cmp r14d, LAYOUT_SPLIT_V
+    je .dlg_split_v
+    cmp r14d, LAYOUT_MASTER
+    je .dlg_master
+    jmp .dlg_done                          ; unknown layout — draw nothing
+
+.dlg_tabbed:
+    ; One filled square covering the whole cell.
+    mov edi, r12d
+    xor esi, esi
+    mov edx, r13d
+    mov ecx, r13d
+    call fill_rect
+    jmp .dlg_done
+
+.dlg_split_h:
+    ; Two thin vertical bars side by side: |‖|. Each bar = ~38% width,
+    ; with a small visual gap in the middle.
+    mov ebx, r13d
+    shr ebx, 2                             ; bar width = edge / 4
+    test ebx, ebx
+    jnz .dlg_sh_w_ok
+    mov ebx, 1
+.dlg_sh_w_ok:
+    ; Left bar
+    mov edi, r12d
+    xor esi, esi
+    mov edx, ebx
+    mov ecx, r13d
+    call fill_rect
+    ; Right bar
+    mov eax, r13d
+    sub eax, ebx
+    add eax, r12d
+    mov edi, eax
+    xor esi, esi
+    mov edx, ebx
+    mov ecx, r13d
+    call fill_rect
+    jmp .dlg_done
+
+.dlg_split_v:
+    ; Two thin horizontal bars stacked.
+    mov ebx, r13d
+    shr ebx, 2
+    test ebx, ebx
+    jnz .dlg_sv_h_ok
+    mov ebx, 1
+.dlg_sv_h_ok:
+    ; Top bar
+    mov edi, r12d
+    xor esi, esi
+    mov edx, r13d
+    mov ecx, ebx
+    call fill_rect
+    ; Bottom bar
+    mov eax, r13d
+    sub eax, ebx
+    mov edi, r12d
+    mov esi, eax
+    mov edx, r13d
+    mov ecx, ebx
+    call fill_rect
+    jmp .dlg_done
+
+.dlg_master:
+    ; Left half = single filled bar; right half = two stacked bars,
+    ; with a 1px gap between left and right.
+    ;   half_w  = edge / 2
+    ;   half_h  = edge / 2
+    ;   right_x = half_w + 1
+    ;   right_w = edge - half_w - 1
+    mov ebx, r13d
+    shr ebx, 1                             ; ebx = half_w (also half_h)
+    ; Left half (x=r12, y=0, w=half_w, h=edge)
+    mov edi, r12d
+    xor esi, esi
+    mov edx, ebx
+    mov ecx, r13d
+    call fill_rect
+    ; Right top quadrant (x=r12+half_w+1, y=0, w=edge-half_w-1, h=half_h)
+    lea edi, [r12d + 1]
+    add edi, ebx
+    xor esi, esi
+    mov edx, r13d
+    sub edx, ebx
+    sub edx, 1                             ; right_w
+    mov ecx, ebx                           ; half_h
+    call fill_rect
+    ; Right bottom quadrant (x=r12+half_w+1, y=half_h, w=right_w, h=edge-half_h)
+    lea edi, [r12d + 1]
+    add edi, ebx
+    mov esi, ebx                           ; y = half_h
+    mov edx, r13d
+    sub edx, ebx
+    sub edx, 1                             ; right_w
+    mov ecx, r13d
+    sub ecx, ebx                           ; bottom_h = edge - half_h
+    call fill_rect
+
+.dlg_done:
+    pop r14
+    pop r13
     pop r12
     pop rbx
     ret
@@ -5973,7 +8252,7 @@ render_bar:
     movzx ecx, word [bar_height]
     call fill_rect
 
-    ; Workspace squares: fixed 10 slots, right-justified, in the order
+    ; Workspace squares: fixed 10 slots, LEFT-justified, in the order
     ;   [WS1 WS2 WS3] [WS4 WS5 WS6] [WS7 WS8 WS9] [WS10]
     ; (display positions 0..8 = WS 1..9; display 9 = the "0" key =
     ; internal WS 10 — special; will be the external-monitor pin once
@@ -5983,21 +8262,7 @@ render_bar:
     ; is always visible. A small WS_GROUP_GAP precedes display positions
     ; 3, 6, 9 to group the bar as [1 2 3] [4 5 6] [7 8 9] [0].
     movzx r14d, word [bar_height]         ; square edge
-    ; Compute total WS-strip width: 10 squares + 9 inter-square gaps +
-    ; 3 group gaps (one each before slots 3, 6, 9).
-    mov eax, r14d
-    imul eax, WS_COUNT                    ; 10 * square
-    mov ecx, WS_COUNT - 1
-    imul ecx, SQUARE_GAP                  ; 9 inter-square gaps
-    add eax, ecx
-    add eax, 3 * WS_GROUP_GAP             ; 3 group gaps
-    movzx ecx, word [output_w]            ; bar lives on output 0
-    sub ecx, eax
-    test ecx, ecx
-    jns .rb_ws_have_x
-    xor ecx, ecx                          ; clamp if it doesn't fit
-.rb_ws_have_x:
-    mov r12d, ecx                         ; cursor x
+    movzx r12d, word [cfg_bar_pad]        ; cursor x — start at left padding
     xor r13d, r13d                        ; display position 0..9
 .rb_ws_loop:
     cmp r13d, WS_COUNT
@@ -6021,7 +8286,20 @@ render_bar:
 .rb_ws_zero:
     mov ebx, 10                           ; display 9 → internal WS 10
 .rb_ws_have_ws:
-    ; Pick colour: active if this is the current ws, else populated.
+    ; Pick colour. If a per-workspace override is set, use it for both
+    ; active and populated states (active = full intensity, populated =
+    ; dimmed by cfg_ws_dim_factor — separate from the tab dim so a
+    ; bright WS colour stays readable when not active).
+    mov eax, [cfg_ws_colors + rbx*4 - 4]
+    cmp eax, 0xFFFFFFFF
+    je .rb_ws_no_override
+    movzx ecx, byte [current_ws]
+    cmp ebx, ecx
+    je .rb_ws_have_fg                         ; active: per-ws colour at full
+    movzx edx, byte [cfg_ws_dim_factor]
+    call dim_color_pct                        ; populated: dim per-ws colour
+    jmp .rb_ws_have_fg
+.rb_ws_no_override:
     movzx eax, byte [current_ws]
     cmp ebx, eax
     jne .rb_ws_use_pop
@@ -6050,13 +8328,29 @@ render_bar:
     jmp .rb_ws_loop
 .rb_ws_done:
 
-    ; Tabs are left-justified at x=0 so they have their own anchor
-    ; (look top-left for tabs, top-right for workspaces).
+    ; Visual separation between the WS strip and the layout indicator,
+    ; same gap unit as between [1 2 3] groups.
+    add r12d, WS_GROUP_GAP
+
+    ; Layout indicator (always drawn, regardless of whether the
+    ; workspace has tabs): a single bar_height-square glyph that shows
+    ; the current ws's layout mode, sitting between the WS strip and
+    ; the tab strip.
+    mov eax, [cfg_tab_default]
+    call set_bar_fg
+    movzx eax, byte [current_ws]
+    dec eax
+    movzx eax, byte [ws_layout + rax]
+    mov edi, r12d                          ; x for the glyph
+    call draw_layout_glyph
+    add r12d, r14d                         ; advance past the glyph (square width)
+    add r12d, LAYOUT_GLYPH_GAP             ; visual separation from tabs
+
+    ; Tabs are left-justified, starting after the layout indicator.
     movzx r15d, byte [current_ws]
     movzx eax, byte [workspace_populated + r15 - 1]
     test eax, eax
     jz .rb_done                           ; no tabs on this workspace
-    xor r12d, r12d                        ; cursor x = 0
     ; Active tab XID for this workspace.
     movzx r13d, byte [current_ws]
     dec r13d
