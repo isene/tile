@@ -65,6 +65,15 @@
 #                            spawn CMD into the slot just next to the
 #                            focused window. DIR is one of right, left,
 #                            (→ split-h) up, down (→ split-v).
+#   reload                   re-read ~/.tilerc without restarting tile.
+#                            Equivalent to `pkill -USR1 tile`. Refreshes
+#                            keybindings, palette/colours, pin overrides
+#                            and the bar; deliberately does NOT re-run
+#                            `exec` autostart (so strip / feh / nm-applet
+#                            don't get spawned twice). Lines tile can't
+#                            parse are ignored with a warning written
+#                            to stderr (visible if tile is launched from
+#                            a terminal).
 
 # === Spawn ===
 # Mod4+Return: new glass; if workspace is in split mode, lands to the right
@@ -136,8 +145,16 @@ bind Mod4+o             unstash
 # === Lock screen ===
 bind Mod4+Escape        exec i3lock -c 000000
 
+# === Reload config without restarting tile ===
+# Re-grabs keys, refreshes colours/pin overrides/bar; doesn't re-run
+# autostart. Equivalent to `pkill -USR1 tile`.
+bind Mod4+Shift+r       reload
+
 # === Bar (the row-of-squares strip at the top of the screen) ===
 # bar_height       = strip thickness in pixels (also the side length of each square)
+# bar_pad          = horizontal padding inside the bar — pixels left clear
+#                    before the leftmost tab and after the rightmost
+#                    workspace square (default 4)
 # bar_bg           = background color of the strip
 # tab_default      = colour for newly-spawned (uncoloured) tabs
 # tab_dim_factor   = inactive-tab brightness, 0..100 (40 = 40%)
@@ -147,6 +164,7 @@ bind Mod4+Escape        exec i3lock -c 000000
 # ws_populated     = colour of any other populated workspace
 
 bar_height       = 10
+bar_pad          = 4
 gap_inner        = 0           # pixels of padding around managed windows
 bar_bg           = #000000
 tab_default      = #555555
@@ -180,6 +198,32 @@ master_ratio     = 50
 #
 # pin 0 1                        # WS 10 → external (default)
 # pin 9 1                        # WS 9 also lives on external
+
+# === Window-to-workspace assignments ===
+# assign <class> <ws>
+#   New windows whose WM_CLASS class half matches <class> land on
+#   workspace <ws> (1..9, or 0 = WS 10) regardless of which workspace
+#   is currently focused. The window only becomes the active tab if
+#   <ws> is currently visible on its pinned output; otherwise it joins
+#   that workspace's tab strip and shows up in the bar's populated
+#   indicator. Up to 32 entries.
+#
+# Example (matches the i3 setup):
+# assign Weechat  1
+# assign discord  1
+# assign caprine  1
+# assign Kastrup  2
+# assign Tock     2
+# assign Firefox  3
+# assign firefox  3              # case-sensitive — list both for Mozilla
+# assign qutebrowser 3
+
+# === Stash-on-map ===
+# stash-on-map <class>
+#   New windows whose class matches <class> are immediately stashed
+#   instead of joining a workspace. Replaces i3's
+#   `for_window [class="X"] move scratchpad`. Recall with `unstash`.
+# stash-on-map FirefoxMarionette
 
 # === Autostart ===
 exec strip                                           # the status bar

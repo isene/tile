@@ -20,6 +20,16 @@ suite, alongside [bare](https://github.com/isene/bare) (shell),
 
 <br clear="left"/>
 
+![tile in action](img/screenshot.png)
+
+A tile-managed desktop: row-of-squares bar across the top, tabs on
+the left, workspace indicators on the right, glass panes in a
+master/stack layout, **strip** + the **asmites** (the per-segment
+programs in [chasm-bits](https://github.com/isene/chasm-bits))
+driving the status row above tile's bar, **show** in the left +
+bottom-right panes, **bare** behind the prompt. Every binary on
+screen is pure x86_64 assembly.
+
 **Status: phase 1a (early development).** See
 [PLAN.md](PLAN.md) for the full architecture and roadmap.
 
