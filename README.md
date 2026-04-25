@@ -2,11 +2,12 @@
 
 <img src="img/tile.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.0.1-blue)
+![Version](https://img.shields.io/badge/version-0.1.0-blue)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
 ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue)
 ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
+![Binary](https://img.shields.io/badge/binary-~71KB-orange)
 ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600)
 
 Tiling window manager written in x86_64 Linux assembly. No libc, no
@@ -30,8 +31,10 @@ driving the status row above tile's bar, **show** in the left +
 bottom-right panes, **bare** behind the prompt. Every binary on
 screen is pure x86_64 assembly.
 
-**Status: phase 1a (early development).** See
-[PLAN.md](PLAN.md) for the full architecture and roadmap.
+**Status: daily-driver since 2026-04 (the author runs nothing else).**
+See [PLAN.md](PLAN.md) for the full architecture and roadmap, and
+[CONFIG-FUTURE.md](CONFIG-FUTURE.md) for hardcoded constants that may
+become `~/.tilerc` keys later.
 
 ## Goals
 
@@ -93,40 +96,51 @@ To launch a test app inside the Xephyr session:
 DISPLAY=:9 glass                        # or: DISPLAY=:9 xterm
 ```
 
-## Current capabilities (phases 1a + 1b.1 + 1b.2 + 1b.3a)
+## Current capabilities
 
-- Connects to X11 via Unix socket, MIT-MAGIC-COOKIE-1 authentication
-- Claims SubstructureRedirectMask on the root window (single-WM enforcement)
-- Maps incoming MapRequest windows full-screen
-- ICCCM `WM_DELETE_WINDOW` protocol — `kill` asks the app to close
-  cleanly rather than yanking its X11 connection
+- X11 wire protocol over Unix socket, MIT-MAGIC-COOKIE-1 authentication
+- Claims SubstructureRedirectMask on the root (single-WM enforcement)
+- ICCCM `WM_DELETE_WINDOW` — `kill` asks the app to close cleanly
 - **10 workspaces** with `workspace N` / `move-to N` / smart cycling
-  (`workspace next-populated` walks only workspaces that have at least
-  one window — improvement over i3) / `workspace back-and-forth`
-- **Tabbed semantics per workspace** — every workspace is a flat tab
-  list. New windows append as tabs; only the active tab is mapped at
-  any time. `focus next-tab` / `focus prev-tab` cycles tabs.
-  `move-tab left/right` reorders. Closing the active tab auto-focuses
-  the next-most-recent one.
-- **Row-of-squares bar** at the very top of the screen (default 4px tall):
-  one square per populated workspace (current = bright, others = dim),
-  a small gap, then one square per tab on the current workspace
-  (active = bright, others = dimmed to ~40%). Each tab carries a colour
-  index; `tab-color-cycle` rotates it through `tab_palette` so you can
-  visually tag tabs (red for build, green for logs, etc.). Mirrors
-  glass's Alt+b colour cycling for terminal backgrounds.
+  (`workspace next-populated` walks only populated workspaces) /
+  `workspace back-and-forth`
+- **Per-workspace layout**: TABBED, SPLIT_H, SPLIT_V, MASTER. New
+  windows append; cycle / reorder / move tabs across workspaces.
+  Closing the active tab auto-focuses the next-most-recent one.
+  Tab cycling in TABBED reconfigures the new active before mapping,
+  so siblings sized in MASTER/SPLIT take the full TABBED geometry
+  on cycle (no half-screen leftovers).
+- **Multi-output (Xinerama)** with workspace-pinned outputs: a
+  designated workspace always shows on the external monitor.
+- **Row-of-squares bar** at the very top: WS squares grouped
+  `[1 2 3]·[4 5 6]·[7 8 9]·[0]` with configurable per-WS colour
+  overrides, vertical separator bar, layout-mode glyph (TABBED ☰,
+  SPLIT_H ▌▐, SPLIT_V ▀▄, MASTER ▌▘▖), then the tab strip
+  (current = bright, others dimmed). `tab-color-cycle` rotates a
+  per-tab colour through `tab_palette`.
+- **strip status row** (companion bar) with text segments fed by
+  the [chasm-bits](https://github.com/isene/chasm-bits) asmites
+  (clock, battery, cpu, mem, disk, net, mailbox, brightness, vol,
+  weather, wintitle). Per-segment refresh interval, `+N` leading-gap
+  override, default-fg colour, all driven by `~/.striprc`.
+- **XEMBED system tray** (phase 2c) — apps that emit `_NET_WM_S0`
+  selection requests dock into strip's tray area.
+- **Stash / unstash** — i3 scratchpad replacement: a small LIFO of
+  unmapped tabs you can pop back to the current workspace.
+- **In-place restart** — `restart` action does
+  `execve("/proc/self/exe")`, picking up a freshly-built tile binary
+  without losing any X clients (X owns the windows, WM just
+  reconnects).
 - WM-initiated unmaps don't get treated as window-closed
-- `~/.tilerc` config parser
+- `~/.tilerc` and `~/.striprc` config parsers (reload via SIGUSR1)
 
-See `tilerc.example` for the full config syntax. Recognised statements:
-`bind <chord> <action> [arg]`, `exec <cmdline>`, `key = value` for bar
-appearance, `# comments`.
+See `tilerc.example` for the full config syntax. Recognised
+statements: `bind <chord> <action> [arg]`, `exec <cmdline>`,
+`key = value` for bar appearance, `# comments`.
 Modifiers: `Shift`, `Ctrl`/`Control`, `Alt`/`Mod1`, `Mod4`/`Win`/`Super`.
-Actions: `exec`, `kill`, `exit`, `workspace`, `move-to`, `focus`,
-`move-tab`, `tab-color-cycle`, `stash`, `unstash`.
-
-No splits, no multi-monitor, no `strip` (heavyweight bar with text /
-clock / tray) yet. Those land in phases 1b.3b through 2c.
+Actions: `exec`, `exec-here`, `kill`, `exit`, `workspace`, `move-to`,
+`focus`, `move-tab`, `tab-color-cycle`, `stash`, `unstash`, `layout`,
+`spawn-split`, `reload`, `restart`.
 
 ## License
 
