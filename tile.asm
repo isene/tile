@@ -242,6 +242,32 @@ tile_shell_pid_len equ 15
 net_active_window_str: db "_NET_ACTIVE_WINDOW"
 net_active_window_len equ 18
 
+; EWMH window-type atoms — used to detect dialog/utility/tool/menu
+; windows that should NOT be tiled (Gimp tool palettes, file pickers,
+; tooltips, splash screens, …). Apps that don't set
+; WM_TRANSIENT_FOR (most modern GTK/Qt apps) communicate "I am a
+; floating thing" via _NET_WM_WINDOW_TYPE = one of these atoms.
+nwwt_str:        db "_NET_WM_WINDOW_TYPE"
+nwwt_len         equ 19
+nwwt_dialog_str: db "_NET_WM_WINDOW_TYPE_DIALOG"
+nwwt_dialog_len  equ 26
+nwwt_util_str:   db "_NET_WM_WINDOW_TYPE_UTILITY"
+nwwt_util_len    equ 27
+nwwt_tool_str:   db "_NET_WM_WINDOW_TYPE_TOOLBAR"
+nwwt_tool_len    equ 27
+nwwt_splash_str: db "_NET_WM_WINDOW_TYPE_SPLASH"
+nwwt_splash_len  equ 26
+nwwt_menu_str:   db "_NET_WM_WINDOW_TYPE_MENU"
+nwwt_menu_len    equ 24
+nwwt_popup_str:  db "_NET_WM_WINDOW_TYPE_POPUP_MENU"
+nwwt_popup_len   equ 30
+nwwt_drop_str:   db "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU"
+nwwt_drop_len    equ 33
+nwwt_notif_str:  db "_NET_WM_WINDOW_TYPE_NOTIFICATION"
+nwwt_notif_len   equ 32
+nwwt_tooltip_str:db "_NET_WM_WINDOW_TYPE_TOOLTIP"
+nwwt_tooltip_len equ 27
+
 ; XINERAMA extension name (uppercase per X11 convention).
 xinerama_name:    db "XINERAMA"
 xinerama_name_len equ 8
@@ -712,6 +738,23 @@ wm_protocols_atom:   resd 1
 wm_delete_atom:      resd 1
 tile_shell_pid_atom: resd 1
 net_active_window_atom: resd 1
+
+; EWMH window-type atoms (resolved at startup; 0 if unresolved means
+; the X server has never seen the atom, which implies no window has
+; that type either, so the comparison naturally fails closed).
+nwwt_atom:           resd 1            ; _NET_WM_WINDOW_TYPE (the property)
+nwwt_dialog_atom:    resd 1
+nwwt_util_atom:      resd 1
+nwwt_tool_atom:      resd 1
+nwwt_splash_atom:    resd 1
+nwwt_menu_atom:      resd 1
+nwwt_popup_atom:     resd 1
+nwwt_drop_atom:      resd 1
+nwwt_notif_atom:     resd 1
+nwwt_tooltip_atom:   resd 1
+; Buffer for _NET_WM_WINDOW_TYPE GetProperty reply: 32-byte header +
+; up to 16 atoms (4 bytes each).
+nwwt_reply_buf:      resb 32 + 64
 
 ; Pending-event queue. Used when a synchronous X reply read (e.g. for
 ; GetProperty during the exec-here action) accidentally drains an
@@ -1635,6 +1678,28 @@ event_loop:
     ; Debug: log map-req arrival with the XID
     mov eax, [x11_read_buf + 8]
     call dbg_log_mapreq
+    ; Transient / dialog windows (Gimp tool windows, file pickers,
+    ; …): WM_TRANSIENT_FOR is set. Don't tile — just MapWindow them.
+    ; They keep whatever geometry they asked for; later
+    ; ConfigureRequests from them hit the "unknown client" branch
+    ; below, which passes the request through verbatim.
+    mov edi, [x11_read_buf + 8]
+    call is_transient_window
+    test eax, eax
+    jz .ev_mr_not_transient
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_MAP_WINDOW
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov eax, [x11_read_buf + 8]
+    mov [rdi+4], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    call x11_buffer
+    inc dword [x11_seq]
+    call x11_flush
+    jmp event_loop
+.ev_mr_not_transient:
     ; New client. Two optional config-driven detours before the default
     ; "land on current workspace, become active tab" path:
     ;   1. `assign <class> <ws>`   → route to <ws> instead of current
@@ -1773,10 +1838,14 @@ event_loop:
     call configure_client_for_workspace
     jmp event_loop
 .ev_cr_default_ws:
+    ; Unknown client — typically a transient/dialog window we chose
+    ; not to track in MapRequest. Pass the request through verbatim
+    ; so e.g. Gimp's tool windows get the size+position they ask
+    ; for. Without this, we'd fullscreen-them via
+    ; configure_client_for_workspace, the client would re-request
+    ; its real size, and we'd re-fullscreen → flicker loop.
     pop rax
-    mov edi, eax
-    movzx esi, byte [current_ws]
-    call configure_client_for_workspace
+    call passthrough_configure_request
     jmp event_loop
 
 .ev_unmap_notify:
@@ -3782,6 +3851,121 @@ intern_wm_atoms:
     mov eax, [x11_read_buf + 8]
     mov [net_active_window_atom], eax
 
+    ; --- EWMH window-type atoms ---
+    ; Intern the property atom + the float-class type atoms in one
+    ; sweep. intern_one_atom does the same dance as the blocks above
+    ; (request, write, read, return atom in eax) but factored.
+    lea rdi, [nwwt_str]
+    mov esi, nwwt_len
+    call intern_one_atom
+    mov [nwwt_atom], eax
+
+    lea rdi, [nwwt_dialog_str]
+    mov esi, nwwt_dialog_len
+    call intern_one_atom
+    mov [nwwt_dialog_atom], eax
+
+    lea rdi, [nwwt_util_str]
+    mov esi, nwwt_util_len
+    call intern_one_atom
+    mov [nwwt_util_atom], eax
+
+    lea rdi, [nwwt_tool_str]
+    mov esi, nwwt_tool_len
+    call intern_one_atom
+    mov [nwwt_tool_atom], eax
+
+    lea rdi, [nwwt_splash_str]
+    mov esi, nwwt_splash_len
+    call intern_one_atom
+    mov [nwwt_splash_atom], eax
+
+    lea rdi, [nwwt_menu_str]
+    mov esi, nwwt_menu_len
+    call intern_one_atom
+    mov [nwwt_menu_atom], eax
+
+    lea rdi, [nwwt_popup_str]
+    mov esi, nwwt_popup_len
+    call intern_one_atom
+    mov [nwwt_popup_atom], eax
+
+    lea rdi, [nwwt_drop_str]
+    mov esi, nwwt_drop_len
+    call intern_one_atom
+    mov [nwwt_drop_atom], eax
+
+    lea rdi, [nwwt_notif_str]
+    mov esi, nwwt_notif_len
+    call intern_one_atom
+    mov [nwwt_notif_atom], eax
+
+    lea rdi, [nwwt_tooltip_str]
+    mov esi, nwwt_tooltip_len
+    call intern_one_atom
+    mov [nwwt_tooltip_atom], eax
+
+    pop r12
+    pop rbx
+    ret
+
+; rdi = name pointer, esi = name length. Returns interned atom in eax
+; (0 on any failure / X reply hiccup). Mirrors the per-atom blocks
+; inlined above; factored out to keep new EWMH atoms cheap to add.
+intern_one_atom:
+    push rbx
+    push r12
+    push r13
+    mov r12, rdi                           ; name ptr
+    mov r13d, esi                          ; name len
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_INTERN_ATOM
+    mov byte [rdi+1], 0                    ; only-if-exists = false
+    mov eax, r13d
+    add eax, 3
+    shr eax, 2
+    add eax, 2
+    mov [rdi+2], ax                        ; request length (words)
+    mov [rdi+4], r13w                      ; name length
+    mov word [rdi+6], 0
+    ; Copy name into request payload at tmp_buf+8.
+    lea rbx, [tmp_buf + 8]
+    xor ecx, ecx
+.ioa_cp:
+    cmp ecx, r13d
+    jge .ioa_pad
+    movzx eax, byte [r12 + rcx]
+    mov [rbx + rcx], al
+    inc ecx
+    jmp .ioa_cp
+.ioa_pad:
+    ; Total bytes written = 8 + ((len + 3) & ~3).
+    mov eax, r13d
+    add eax, 3
+    and eax, ~3
+    add eax, 8
+    mov rdx, rax
+    lea rsi, [tmp_buf]
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    inc dword [x11_seq]
+    ; Read 32-byte reply.
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_read_buf]
+    mov rdx, 32
+    syscall
+    cmp rax, 32
+    jl .ioa_fail
+    mov eax, [x11_read_buf + 8]
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.ioa_fail:
+    xor eax, eax
+    pop r13
     pop r12
     pop rbx
     ret
@@ -3889,6 +4073,166 @@ read_wm_class:
     ret
 .rwc_fail:
     xor eax, eax
+    pop r12
+    pop rbx
+    ret
+
+; rdi = window XID. Returns rax=1 if the window should NOT be tiled —
+; i.e. it's a transient (WM_TRANSIENT_FOR) OR has an EWMH window-type
+; that signifies a floating role (DIALOG, UTILITY, TOOLBAR, SPLASH,
+; MENU, POPUP_MENU, DROPDOWN_MENU, NOTIFICATION, TOOLTIP). Apps split
+; roughly 50/50 between the two conventions: GTK/Qt apps like Gimp
+; use _NET_WM_WINDOW_TYPE_UTILITY for tool palettes; xterm-style
+; apps use WM_TRANSIENT_FOR for dialogs. We honour both.
+is_transient_window:
+    push rbx
+    push r12
+    mov r12d, edi
+    ; --- Pass 1: WM_TRANSIENT_FOR (predefined atoms 68/33). ---
+    call x11_flush
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_GET_PROPERTY
+    mov byte [rdi+1], 0                    ; delete = false
+    mov word [rdi+2], 6
+    mov [rdi+4], r12d
+    mov dword [rdi+8], 68                  ; XA_WM_TRANSIENT_FOR
+    mov dword [rdi+12], 33                 ; XA_WINDOW
+    mov dword [rdi+16], 0                  ; long-offset
+    mov dword [rdi+20], 1                  ; long-length (1 CARD32)
+    mov rdx, 24
+    lea rsi, [tmp_buf]
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    inc dword [x11_seq]
+
+    lea rdi, [tmp_buf + 64]
+    call read_reply_or_queue
+    test eax, eax
+    jz .itw_try_ewmh
+    mov eax, [tmp_buf + 64 + 16]           ; value-length (bytes)
+    test eax, eax
+    jz .itw_try_ewmh
+    cmp eax, 4
+    jb .itw_drain_to_ewmh
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf + 96]
+    mov rdx, 4
+    syscall
+    cmp rax, 4
+    jl .itw_try_ewmh
+    mov eax, [tmp_buf + 96]
+    test eax, eax
+    jnz .itw_yes
+    jmp .itw_try_ewmh
+.itw_drain_to_ewmh:
+    push rax
+    mov ecx, eax
+.itw_d2e_loop:
+    test ecx, ecx
+    jz .itw_d2e_done
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf + 96]
+    mov rdx, 1
+    syscall
+    test rax, rax
+    jle .itw_d2e_done
+    sub ecx, eax
+    jmp .itw_d2e_loop
+.itw_d2e_done:
+    pop rax
+
+.itw_try_ewmh:
+    ; --- Pass 2: _NET_WM_WINDOW_TYPE (atom = nwwt_atom, type = ATOM=4). ---
+    ; Skipped if startup atom-intern failed for some reason.
+    mov eax, [nwwt_atom]
+    test eax, eax
+    jz .itw_no
+    call x11_flush
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_GET_PROPERTY
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 6
+    mov [rdi+4], r12d
+    mov [rdi+8], eax                       ; property = _NET_WM_WINDOW_TYPE
+    mov dword [rdi+12], 4                  ; type = XA_ATOM
+    mov dword [rdi+16], 0                  ; long-offset
+    mov dword [rdi+20], 16                 ; up to 16 atoms (64 bytes)
+    mov rdx, 24
+    lea rsi, [tmp_buf]
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    inc dword [x11_seq]
+
+    lea rdi, [nwwt_reply_buf]
+    call read_reply_or_queue
+    test eax, eax
+    jz .itw_no
+    mov ecx, [nwwt_reply_buf + 16]         ; value-length (bytes)
+    test ecx, ecx
+    jz .itw_no
+    cmp ecx, 64
+    jbe .itw_have_len
+    mov ecx, 64
+.itw_have_len:
+    ; Read value bytes that follow the 32-byte header.
+    push rcx
+    mov rdx, rcx
+.itw_read_loop:
+    test rdx, rdx
+    jz .itw_match_loop_pre
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [nwwt_reply_buf + 32]
+    syscall
+    test rax, rax
+    jle .itw_no_pop1
+    sub rdx, rax
+    jmp .itw_read_loop
+.itw_match_loop_pre:
+    pop rcx
+    ; Walk the 4-byte atom values; if any matches one of our float
+    ; types, return 1.
+    xor ebx, ebx                           ; offset
+.itw_match_loop:
+    cmp ebx, ecx
+    jge .itw_no
+    mov eax, [nwwt_reply_buf + 32 + rbx]
+    add ebx, 4
+    test eax, eax
+    jz .itw_match_loop
+    cmp eax, [nwwt_dialog_atom]
+    je .itw_yes
+    cmp eax, [nwwt_util_atom]
+    je .itw_yes
+    cmp eax, [nwwt_tool_atom]
+    je .itw_yes
+    cmp eax, [nwwt_splash_atom]
+    je .itw_yes
+    cmp eax, [nwwt_menu_atom]
+    je .itw_yes
+    cmp eax, [nwwt_popup_atom]
+    je .itw_yes
+    cmp eax, [nwwt_drop_atom]
+    je .itw_yes
+    cmp eax, [nwwt_notif_atom]
+    je .itw_yes
+    cmp eax, [nwwt_tooltip_atom]
+    je .itw_yes
+    jmp .itw_match_loop
+
+.itw_no_pop1:
+    pop rcx
+.itw_no:
+    xor eax, eax
+    pop r12
+    pop rbx
+    ret
+.itw_yes:
+    mov eax, 1
     pop r12
     pop rbx
     ret
@@ -5380,6 +5724,107 @@ configure_window_rect:
     call x11_buffer                       ; byte-read loop; preserve so
     pop rax                               ; callers can rely on rax post-call
     inc dword [x11_seq]
+    pop rbx
+    ret
+
+; ConfigureRequest pass-through. Re-emits the request as a
+; ConfigureWindow with the same value-mask + values, so unknown
+; (untracked / transient / dialog) clients get the geometry they
+; ask for. Reads the source event from x11_read_buf:
+;   +8  window
+;   +12 above-sibling
+;   +16 x (INT16)        +20 width  (CARD16)   +24 border-w (CARD16)
+;   +18 y (INT16)        +22 height (CARD16)   +26 value-mask (CARD16)
+; Mask bits: 0x01 X, 0x02 Y, 0x04 W, 0x08 H, 0x10 BW, 0x20 Sib, 0x40 Stack.
+; Without this, an untracked client whose ConfigureRequest we
+; fullscreen would re-request its real size in a tight loop → flicker.
+passthrough_configure_request:
+    push rbx
+    push r12
+    push r13
+    movzx r13d, word [x11_read_buf + 26]   ; value-mask
+    and r13d, 0x7F                         ; sanitize
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CONFIGURE_WINDOW
+    mov byte [rdi+1], 0
+    ; Length (in 4-byte units): 3 + popcount(mask).
+    mov eax, r13d
+    xor ecx, ecx
+.pcr_pop:
+    test eax, eax
+    jz .pcr_pop_done
+    mov edx, eax
+    and edx, 1
+    add ecx, edx
+    shr eax, 1
+    jmp .pcr_pop
+.pcr_pop_done:
+    add ecx, 3
+    mov [rdi+2], cx                        ; length
+    mov eax, [x11_read_buf + 8]            ; window
+    mov [rdi+4], eax
+    mov [rdi+8], r13w                      ; value-mask
+    mov word [rdi+10], 0                   ; pad
+    lea r12, [rdi + 12]                    ; payload cursor
+
+    ; Bit 0x01 — X (sign-extend INT16 → INT32)
+    test r13d, 0x01
+    jz .pcr_no_x
+    movsx eax, word [x11_read_buf + 16]
+    mov [r12], eax
+    add r12, 4
+.pcr_no_x:
+    ; Bit 0x02 — Y
+    test r13d, 0x02
+    jz .pcr_no_y
+    movsx eax, word [x11_read_buf + 18]
+    mov [r12], eax
+    add r12, 4
+.pcr_no_y:
+    ; Bit 0x04 — Width (zero-extend CARD16)
+    test r13d, 0x04
+    jz .pcr_no_w
+    movzx eax, word [x11_read_buf + 20]
+    mov [r12], eax
+    add r12, 4
+.pcr_no_w:
+    ; Bit 0x08 — Height
+    test r13d, 0x08
+    jz .pcr_no_h
+    movzx eax, word [x11_read_buf + 22]
+    mov [r12], eax
+    add r12, 4
+.pcr_no_h:
+    ; Bit 0x10 — Border-Width
+    test r13d, 0x10
+    jz .pcr_no_bw
+    movzx eax, word [x11_read_buf + 24]
+    mov [r12], eax
+    add r12, 4
+.pcr_no_bw:
+    ; Bit 0x20 — Sibling (CARD32)
+    test r13d, 0x20
+    jz .pcr_no_sib
+    mov eax, [x11_read_buf + 12]
+    mov [r12], eax
+    add r12, 4
+.pcr_no_sib:
+    ; Bit 0x40 — Stack-Mode (only the byte at +1 of the event header is
+    ; meaningful; pad to CARD32).
+    test r13d, 0x40
+    jz .pcr_no_stack
+    movzx eax, byte [x11_read_buf + 1]
+    mov [r12], eax
+    add r12, 4
+.pcr_no_stack:
+    ; Send: rdx = total bytes = (3 + popcount) * 4
+    lea rsi, [tmp_buf]
+    mov rdx, r12
+    sub rdx, rsi
+    call x11_buffer
+    inc dword [x11_seq]
+    pop r13
+    pop r12
     pop rbx
     ret
 
