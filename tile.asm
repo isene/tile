@@ -149,6 +149,7 @@
 %define ACT_SPAWN_SPLIT 12
 %define ACT_EXEC_HERE   13
 %define ACT_RELOAD      14
+%define ACT_RESTART     15
 
 %define MAX_STASH       8
 
@@ -179,9 +180,12 @@
 %define DEFAULT_BORDER_UNFOCUSED 0xFF222222
 %define MAX_PALETTE             16
 %define WS_TAB_GAP              8     ; pixels of gap between WS and tab squares (legacy; kept for clarity)
-%define SQUARE_GAP              2     ; pixels of gap between adjacent squares
-%define WS_GROUP_GAP            6     ; extra gap before WS positions 1, 4, 7
-%define LAYOUT_GLYPH_GAP        6     ; extra gap after the layout indicator before the first tab
+%define SQUARE_GAP              2     ; pixels of gap between adjacent tab squares
+%define WS_SQUARE_GAP           4     ; pixels of gap between WS squares within a group
+%define WS_GROUP_GAP            14    ; extra gap before WS positions 4, 7, 10 (group breaks)
+%define BAR_SEP_GAP             8     ; space on each side of the vertical separator
+%define BAR_SEP_WIDTH           2     ; width of the vertical separator bar
+%define LAYOUT_GLYPH_GAP        14    ; group-sized gap after the layout indicator before tabs
                                       ; (separates the special "0" slot and
                                       ; groups the rest into 1-3, 4-6, 7-9)
 
@@ -223,11 +227,6 @@ err_x11:         db "tile: cannot connect to X server", 10
 err_x11_len      equ $ - err_x11
 err_redirect:    db "tile: another window manager is already running (substructure redirect denied)", 10
 err_redirect_len equ $ - err_redirect
-
-; Spawn fallback chain for Alt+Return: try glass, then xterm.
-glass_path:      db "/usr/local/bin/glass", 0
-glass_path_alt:  db "/home/geir/Main/G/GIT-isene/glass/glass", 0
-xterm_path:      db "/usr/bin/xterm", 0
 
 env_display:     db "DISPLAY=", 0  ; placeholder; tile inherits envp directly
 
@@ -401,6 +400,8 @@ action_table:
     db ACT_EXEC_HERE, 0
     db "reload", 0
     db ACT_RELOAD, 0
+    db "restart", 0
+    db ACT_RESTART, 0
     db 0                       ; terminator
 
 ; layout arg keyword table: `layout tabbed | split-h | split-v | toggle`.
@@ -465,10 +466,11 @@ ws_arg_table:
     db WS_BACK_FORTH, 0
     db 0
 
-; Default exec command path for the built-in Alt+Return bind, used when
-; no ~/.tilerc is found. Same fallback as the phase 1a action.
+; Default exec command for the built-in Alt+Return bind, used when no
+; ~/.tilerc is found. Goes through fork_exec_string → /bin/sh -c, so
+; PATH search resolves the binary; users install glass anywhere on PATH.
 default_glass_arg:
-    db "/home/geir/Main/G/GIT-isene/glass/glass", 0
+    db "glass", 0
 default_glass_arg_len equ $ - default_glass_arg - 1
 
 
@@ -4205,6 +4207,14 @@ set_active_tab_on_ws:
     ; pixels. All requests share a single x11_flush below, so X
     ; processes them in order without releasing the screen between
     ; them.
+    ;
+    ; Configure first: a sibling that was last sized in MASTER/SPLIT
+    ; layout still carries that geometry. Without this re-configure
+    ; it would map at half-width (or whatever its previous strip
+    ; size was), exposing the wallpaper next to it.
+    mov edi, r12d
+    mov esi, r13d
+    call configure_client_for_workspace
     mov eax, r12d
     call send_map_window
     mov eax, r12d
@@ -4585,6 +4595,8 @@ dispatch_keypress:
     je .dk_exec_here
     cmp eax, ACT_RELOAD
     je .dk_reload
+    cmp eax, ACT_RESTART
+    je .dk_restart
     jmp .dk_done
 .dk_exec:
     test edx, edx
@@ -4685,6 +4697,10 @@ dispatch_keypress:
     jmp .dk_done
 .dk_reload:
     call reload_runtime
+    jmp .dk_done
+.dk_restart:
+    call action_restart
+    ; only returns on failure
     jmp .dk_done
 .dk_skip:
     inc ebx
@@ -4824,6 +4840,36 @@ ungrab_all_keys:
     call x11_buffer
     inc dword [x11_seq]
     ret
+
+; In-place restart: re-execs /proc/self/exe so a freshly-built tile
+; binary takes over without dropping any X clients (X owns the windows
+; — they remain mapped while the WM disconnects and reconnects). Same
+; pattern as i3's `restart` command. Only returns if execve fails (in
+; which case the running tile keeps going and the user sees nothing).
+action_restart:
+    ; Close the X server connection cleanly so the new instance can
+    ; reconnect on the same DISPLAY without the kernel-side socket
+    ; lingering.
+    mov rax, SYS_CLOSE
+    mov edi, [x11_fd]
+    syscall
+    ; Build argv = ["/proc/self/exe", NULL] on the stack (.text is
+    ; read-only). execve copies argv into the kernel before unmapping
+    ; the caller's pages, so stack storage is fine.
+    sub rsp, 16
+    lea rax, [rel .ar_path]
+    mov [rsp], rax
+    mov qword [rsp + 8], 0
+    mov rax, SYS_EXECVE
+    lea rdi, [rel .ar_path]
+    mov rsi, rsp
+    mov rdx, [envp]
+    syscall
+    ; execve failed (binary missing / not executable). Restore stack and
+    ; return — the running tile keeps going.
+    add rsp, 16
+    ret
+.ar_path:    db "/proc/self/exe", 0
 
 ; Drained at the top of event_loop. Do the actual reload work here
 ; — outside any signal context, with the X server in a sane state.
@@ -7990,7 +8036,8 @@ create_bar:
 ; glyph using the GC's current foreground colour, depicting the
 ; layout's pane shape so the user knows where the next spawn lands.
 ;
-;   TABBED   ▮          (one filled square)
+;   TABBED   ☰          (three thin horizontal bars stacked, distinct
+;                       from the filled-square app indicators)
 ;   SPLIT_H  ▌▐         (two thin vertical bars side by side)
 ;   SPLIT_V  ▀▄         (two thin horizontal bars stacked)
 ;   MASTER   ▌▘▖        (left half full + right half split top/bottom)
@@ -8016,11 +8063,71 @@ draw_layout_glyph:
     jmp .dlg_done                          ; unknown layout — draw nothing
 
 .dlg_tabbed:
-    ; One filled square covering the whole cell.
-    mov edi, r12d
-    xor esi, esi
+    ; Three thin horizontal bars stacked (☰): visually distinct from the
+    ; filled-square app indicators that follow. Bar thickness ≈ edge/5,
+    ; gap ≈ edge/10 (both clamped to ≥1px so it stays visible at small
+    ; bar_height).
+    mov ebx, r13d
+    mov rax, rbx
+    xor edx, edx
+    mov ecx, 5
+    div rcx                                ; bar thickness = edge / 5
+    test eax, eax
+    jnz .dlg_tab_th_ok
+    inc eax
+.dlg_tab_th_ok:
+    mov ecx, eax                           ; ecx = bar thickness
+    mov ebx, r13d
+    mov rax, rbx
+    xor edx, edx
+    mov esi, 10
+    div rsi                                ; gap = edge / 10
+    test eax, eax
+    jnz .dlg_tab_gp_ok
+    inc eax
+.dlg_tab_gp_ok:
+    mov ebx, eax                           ; ebx = gap between bars
+    ; Total occupied = 3*thickness + 2*gap; vertical pad to centre.
+    mov eax, ecx
+    add eax, ecx
+    add eax, ecx
+    mov edx, ebx
+    add edx, ebx
+    add eax, edx                           ; eax = 3*th + 2*gap
     mov edx, r13d
-    mov ecx, r13d
+    sub edx, eax
+    shr edx, 1                             ; edx = top pad (signed half)
+    test edx, edx
+    jns .dlg_tab_pad_ok
+    xor edx, edx                           ; clamp negative to 0
+.dlg_tab_pad_ok:
+    ; Bar 1 — top
+    mov edi, r12d
+    mov esi, edx
+    push rdx
+    mov edx, r13d                          ; width = full edge
+    push rcx
+    ; ecx already = thickness
+    call fill_rect
+    pop rcx
+    pop rdx
+    add edx, ecx                           ; y += thickness
+    add edx, ebx                           ; y += gap
+    ; Bar 2 — middle
+    mov edi, r12d
+    mov esi, edx
+    push rdx
+    mov edx, r13d
+    push rcx
+    call fill_rect
+    pop rcx
+    pop rdx
+    add edx, ecx
+    add edx, ebx
+    ; Bar 3 — bottom
+    mov edi, r12d
+    mov esi, edx
+    mov edx, r13d
     call fill_rect
     jmp .dlg_done
 
@@ -8323,14 +8430,26 @@ render_bar:
     call outline_rect
 .rb_ws_advance:
     add r12d, r14d
-    add r12d, SQUARE_GAP
+    add r12d, WS_SQUARE_GAP
     inc r13d
     jmp .rb_ws_loop
 .rb_ws_done:
+    ; Strip the trailing WS_SQUARE_GAP we added after the last WS so the
+    ; following separator gap is symmetric.
+    sub r12d, WS_SQUARE_GAP
 
-    ; Visual separation between the WS strip and the layout indicator,
-    ; same gap unit as between [1 2 3] groups.
-    add r12d, WS_GROUP_GAP
+    ; Separator between WS strip and the layout indicator:
+    ; [ BAR_SEP_GAP ] [ vertical bar BAR_SEP_WIDTH × bar_height ] [ BAR_SEP_GAP ]
+    add r12d, BAR_SEP_GAP
+    mov eax, [cfg_tab_default]
+    call set_bar_fg
+    mov edi, r12d
+    xor esi, esi
+    mov edx, BAR_SEP_WIDTH
+    mov ecx, r14d                          ; height = bar_height
+    call fill_rect
+    add r12d, BAR_SEP_WIDTH
+    add r12d, BAR_SEP_GAP
 
     ; Layout indicator (always drawn, regardless of whether the
     ; workspace has tabs): a single bar_height-square glyph that shows
@@ -8344,7 +8463,7 @@ render_bar:
     mov edi, r12d                          ; x for the glyph
     call draw_layout_glyph
     add r12d, r14d                         ; advance past the glyph (square width)
-    add r12d, LAYOUT_GLYPH_GAP             ; visual separation from tabs
+    add r12d, LAYOUT_GLYPH_GAP             ; group-sized visual separation from tabs
 
     ; Tabs are left-justified, starting after the layout indicator.
     movzx r15d, byte [current_ws]
