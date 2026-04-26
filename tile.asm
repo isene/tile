@@ -181,10 +181,10 @@
 %define MAX_PALETTE             16
 %define WS_TAB_GAP              8     ; pixels of gap between WS and tab squares (legacy; kept for clarity)
 %define SQUARE_GAP              2     ; pixels of gap between adjacent tab squares
-%define WS_SQUARE_GAP           4     ; pixels of gap between WS squares within a group
+%define WS_SQUARE_GAP           6     ; pixels of gap between WS squares within a group
 %define WS_GROUP_GAP            14    ; extra gap before WS positions 4, 7, 10 (group breaks)
-%define BAR_SEP_GAP             8     ; space on each side of the vertical separator
-%define BAR_SEP_WIDTH           2     ; width of the vertical separator bar
+%define BAR_SEP_GAP             14    ; full WS_GROUP_GAP space on each side of the vertical separator
+%define BAR_SEP_WIDTH           1     ; width of the vertical separator bar (1 px hairline)
 %define LAYOUT_GLYPH_GAP        14    ; group-sized gap after the layout indicator before tabs
                                       ; (separates the special "0" slot and
                                       ; groups the rest into 1-3, 4-6, 7-9)
@@ -636,6 +636,13 @@ focused_xid:             resd 1
 ; height vertical strips on the right. The "master" is the first
 ; client (in client_xids order) whose client_ws matches.
 cfg_master_ratio:        resb 1
+; Color of the layout indicator glyph (between WS strip and tabs).
+; 0 = use cfg_tab_default. Otherwise an ARGB CARD32 pixel value.
+cfg_layout_color:        resd 1
+; Frame colour drawn around the active workspace square AND the active
+; tab square. 0 = disabled (no frame). Otherwise an ARGB CARD32 pixel
+; value — drawn with PolyRectangle (1 px outline) on top of the fill.
+cfg_active_frame:        resd 1
 
 ; Xinerama / multi-monitor state (phase 1c).
 ;
@@ -857,6 +864,8 @@ _start:
     mov dword [cfg_border_unfocused], DEFAULT_BORDER_UNFOCUSED
     mov dword [focused_xid], 0
     mov byte [cfg_master_ratio], DEFAULT_MASTER_RATIO
+    mov dword [cfg_layout_color], 0           ; 0 → fall back to cfg_tab_default
+    mov dword [cfg_active_frame], 0           ; 0 → no frame drawn
     ; Initialise pin override table to "unset" (0xFF). load_config
     ; will populate any explicit `pin N M` lines.
     mov rax, 0xFFFFFFFFFFFFFFFF
@@ -8045,6 +8054,16 @@ apply_setting:
     call .as_streq
     test eax, eax
     jnz .as_ws_dim_factor
+    mov rdi, r13
+    lea rsi, [.as_kw_layout_color]
+    call .as_streq
+    test eax, eax
+    jnz .as_layout_color
+    mov rdi, r13
+    lea rsi, [.as_kw_active_frame]
+    call .as_streq
+    test eax, eax
+    jnz .as_active_frame
     ; Per-workspace colour: ws_color_N where N is 1..10. Match the
     ; "ws_color_" prefix, then parse the digit suffix.
     mov rdi, r13
@@ -8171,6 +8190,16 @@ apply_setting:
     call parse_decimal_byte
     mov [cfg_bar_pad], ax
     jmp .as_done
+.as_layout_color:
+    mov rdi, r12
+    call parse_hex_color
+    mov [cfg_layout_color], eax
+    jmp .as_done
+.as_active_frame:
+    mov rdi, r12
+    call parse_hex_color
+    mov [cfg_active_frame], eax
+    jmp .as_done
 .as_done:
     mov eax, 1                            ; matched + applied
     pop r13
@@ -8214,6 +8243,8 @@ apply_setting:
 .as_kw_bar_pad:         db "bar_pad", 0
 .as_kw_ws_dim_factor:   db "ws_dim_factor", 0
 .as_kw_ws_color_pre:    db "ws_color_", 0
+.as_kw_layout_color:    db "layout_color", 0
+.as_kw_active_frame:    db "active_frame", 0
 
 ; rdi = haystack, rsi = needle (NUL-terminated). Returns 1 in eax if
 ; needle is a prefix of haystack, 0 otherwise.
@@ -8870,8 +8901,24 @@ render_bar:
     test eax, eax
     jz .rb_ws_outline
     call fill_rect
-    jmp .rb_ws_advance
+    jmp .rb_ws_maybe_frame
 .rb_ws_outline:
+    call outline_rect
+.rb_ws_maybe_frame:
+    ; If this is the active WS AND a frame colour is configured, paint
+    ; a 1 px outline on top in the user's frame colour. Skipped when
+    ; cfg_active_frame == 0 so existing configs see no visual change.
+    movzx ecx, byte [current_ws]
+    cmp ebx, ecx
+    jne .rb_ws_advance
+    mov eax, [cfg_active_frame]
+    test eax, eax
+    jz .rb_ws_advance
+    call set_bar_fg
+    mov edi, r12d
+    xor esi, esi
+    mov edx, r14d
+    mov ecx, r14d
     call outline_rect
 .rb_ws_advance:
     add r12d, r14d
@@ -8899,8 +8946,13 @@ render_bar:
     ; Layout indicator (always drawn, regardless of whether the
     ; workspace has tabs): a single bar_height-square glyph that shows
     ; the current ws's layout mode, sitting between the WS strip and
-    ; the tab strip.
+    ; the tab strip. Colour: cfg_layout_color if set, else cfg_tab_default
+    ; (back-compat for configs without the new key).
+    mov eax, [cfg_layout_color]
+    test eax, eax
+    jnz .rb_layout_have_color
     mov eax, [cfg_tab_default]
+.rb_layout_have_color:
     call set_bar_fg
     movzx eax, byte [current_ws]
     dec eax
@@ -8930,15 +8982,33 @@ render_bar:
     call client_color_to_pixel
     mov ecx, [client_xids + rbx*4]
     cmp ecx, r13d
-    je .rb_tab_active
+    je .rb_tab_is_active
     call dim_color
-.rb_tab_active:
+    xor ecx, ecx                              ; not active: no frame this iter
+    jmp .rb_tab_paint
+.rb_tab_is_active:
+    mov ecx, 1                                ; remember "draw frame after fill"
+.rb_tab_paint:
+    push rcx
     call set_bar_fg
     mov edi, r12d
     xor esi, esi
     mov edx, r14d
     mov ecx, r14d
     call fill_rect
+    pop rcx
+    test ecx, ecx
+    jz .rb_tab_no_frame
+    mov eax, [cfg_active_frame]
+    test eax, eax
+    jz .rb_tab_no_frame
+    call set_bar_fg
+    mov edi, r12d
+    xor esi, esi
+    mov edx, r14d
+    mov ecx, r14d
+    call outline_rect
+.rb_tab_no_frame:
     add r12d, r14d
     add r12d, SQUARE_GAP
 .rb_tab_next:
