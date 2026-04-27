@@ -1687,27 +1687,18 @@ event_loop:
     ; Debug: log map-req arrival with the XID
     mov eax, [x11_read_buf + 8]
     call dbg_log_mapreq
-    ; Transient / dialog windows (Gimp tool windows, file pickers,
-    ; …): WM_TRANSIENT_FOR is set. Don't tile — just MapWindow them.
-    ; They keep whatever geometry they asked for; later
-    ; ConfigureRequests from them hit the "unknown client" branch
-    ; below, which passes the request through verbatim.
-    mov edi, [x11_read_buf + 8]
-    call is_transient_window
-    test eax, eax
-    jz .ev_mr_not_transient
-    lea rdi, [tmp_buf]
-    mov byte [rdi], X11_MAP_WINDOW
-    mov byte [rdi+1], 0
-    mov word [rdi+2], 2
-    mov eax, [x11_read_buf + 8]
-    mov [rdi+4], eax
-    lea rsi, [tmp_buf]
-    mov rdx, 8
-    call x11_buffer
-    inc dword [x11_seq]
-    call x11_flush
-    jmp event_loop
+    ; All windows — including transient dialogs (file pickers, login
+    ; dialogs, etc.) — get tracked as full-cell tabs. The user prefers
+    ; this over the i3-style "float dialogs" behaviour: a Slack file
+    ; picker, a forticlient login, a Gimp tool palette all open as
+    ; their own tab on the current workspace and can be killed /
+    ; navigated like any other client.
+    ;
+    ; The previous transient short-circuit (just MapWindow, never
+    ; track) interacted badly with synchronous GetProperty inside
+    ; is_transient_window — a stalled reply could hang the WM. The
+    ; read-timeout in read_reply_or_queue bounds that, but the
+    ; cleanest fix is to skip the property probe entirely.
 .ev_mr_not_transient:
     ; New client. Two optional config-driven detours before the default
     ; "land on current workspace, become active tab" path:
