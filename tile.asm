@@ -1695,18 +1695,39 @@ event_loop:
     ; Debug: log map-req arrival with the XID
     mov eax, [x11_read_buf + 8]
     call dbg_log_mapreq
-    ; All windows — including transient dialogs (file pickers, login
-    ; dialogs, etc.) — get tracked as full-cell tabs. The user prefers
-    ; this over the i3-style "float dialogs" behaviour: a Slack file
-    ; picker, a forticlient login, a Gimp tool palette all open as
-    ; their own tab on the current workspace and can be killed /
-    ; navigated like any other client.
+    ; Transient / dialog popups (Gimp save-changes prompt, GTK
+    ; FileChooser, etc.) signal their floating role via
+    ; WM_TRANSIENT_FOR or _NET_WM_WINDOW_TYPE_DIALOG/UTILITY/etc.
+    ; Force-tiling them produces a flicker loop because GIMP-style
+    ; apps fight tile's ConfigureWindow → workspace-fullscreen with
+    ; their own "I want 400×300 centered" geometry hints, unmapping
+    ; and remapping until something gives.
     ;
-    ; The previous transient short-circuit (just MapWindow, never
-    ; track) interacted badly with synchronous GetProperty inside
-    ; is_transient_window — a stalled reply could hang the WM. The
-    ; read-timeout in read_reply_or_queue bounds that, but the
-    ; cleanest fix is to skip the property probe entirely.
+    ; Just MapWindow these — they keep whatever geometry they asked
+    ; for and stay outside the tab strip. Standalone-style windows
+    ; without a transient parent (forticlient login, etc.) DON'T
+    ; match this check and continue to land as full-cell tabs.
+    ;
+    ; The synchronous GetProperty inside is_transient_window is now
+    ; bounded by read_reply_or_queue's 250 ms poll budget, so the
+    ; slack-file-picker-style lockup the previous transient path
+    ; allowed can no longer wedge tile.
+    mov edi, [x11_read_buf + 8]
+    call is_transient_window
+    test eax, eax
+    jz .ev_mr_not_transient
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_MAP_WINDOW
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov eax, [x11_read_buf + 8]
+    mov [rdi+4], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    call x11_buffer
+    inc dword [x11_seq]
+    call x11_flush
+    jmp event_loop
 .ev_mr_not_transient:
     ; New client. Two optional config-driven detours before the default
     ; "land on current workspace, become active tab" path:
