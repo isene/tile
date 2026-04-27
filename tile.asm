@@ -609,6 +609,13 @@ cfg_line_recognized:     resb 1
 ; `bar_pad`.
 cfg_bar_pad:             resw 1
 
+; Pixels of vertical padding at the BOTTOM of the bar — gives the
+; workspace squares / tabs a thin breathing strip above the cell area
+; instead of touching the row of clients below. Default 1.
+; ~/.tilerc may override via `bar_pad_bottom`. Clamped to bar_height-1
+; at render time so the bar can never collapse to nothing.
+cfg_bar_pad_bottom:      resw 1
+
 ; Inner gap: pixels of padding inside each managed window (so neighbouring
 ; windows / the bar get visual breathing room). Equivalent to i3's
 ; `gaps inner N`. Tabs already mean only one window is visible at a time
@@ -859,6 +866,7 @@ _start:
     mov word [cfg_gap_inner], 0
     mov word [cfg_strip_height], 0
     mov word [cfg_bar_pad], DEFAULT_BAR_PAD
+    mov word [cfg_bar_pad_bottom], 1
     mov byte [cfg_border_width], DEFAULT_BORDER_WIDTH
     mov dword [cfg_border_focused], DEFAULT_BORDER_FOCUSED
     mov dword [cfg_border_unfocused], DEFAULT_BORDER_UNFOCUSED
@@ -8060,6 +8068,11 @@ apply_setting:
     test eax, eax
     jnz .as_strip_height
     mov rdi, r13
+    lea rsi, [.as_kw_bar_pad_bottom]
+    call .as_streq
+    test eax, eax
+    jnz .as_bar_pad_bottom
+    mov rdi, r13
     lea rsi, [.as_kw_bar_pad]
     call .as_streq
     test eax, eax
@@ -8205,6 +8218,11 @@ apply_setting:
     call parse_decimal_byte
     mov [cfg_bar_pad], ax
     jmp .as_done
+.as_bar_pad_bottom:
+    mov rdi, r12
+    call parse_decimal_byte
+    mov [cfg_bar_pad_bottom], ax
+    jmp .as_done
 .as_layout_color:
     mov rdi, r12
     call parse_hex_color
@@ -8256,6 +8274,7 @@ apply_setting:
 .as_kw_master_ratio:    db "master_ratio", 0
 .as_kw_strip_height:    db "strip_height", 0
 .as_kw_bar_pad:         db "bar_pad", 0
+.as_kw_bar_pad_bottom:  db "bar_pad_bottom", 0
 .as_kw_ws_dim_factor:   db "ws_dim_factor", 0
 .as_kw_ws_color_pre:    db "ws_color_", 0
 .as_kw_layout_color:    db "layout_color", 0
@@ -8860,11 +8879,18 @@ render_bar:
     ; is always visible. A small WS_GROUP_GAP precedes display positions
     ; 3, 6, 9 to group the bar as [1 2 3] [4 5 6] [7 8 9] [0].
     movzx r14d, word [bar_height]         ; square edge
+    movzx eax, word [cfg_bar_pad_bottom]   ; user-configurable bottom padding
+    cmp eax, r14d
+    jb .rb_pad_ok                          ; pad < height → safe
     test r14d, r14d
     jz .rb_no_bottom_pad
-    dec r14d                              ; 1 px bg-padding row at the bottom
-                                          ; of the bar so squares/tabs don't
-                                          ; touch the edge of the bar window.
+    lea eax, [r14d - 1]                    ; clamp pad ≤ height - 1
+.rb_pad_ok:
+    sub r14d, eax                          ; squares/tabs are pad-px shorter
+                                           ; than the bar so the bottom strip
+                                           ; stays in bg colour, giving the
+                                           ; bar visual breathing room above
+                                           ; the cell area below.
 .rb_no_bottom_pad:
     movzx r12d, word [cfg_bar_pad]        ; cursor x — start at left padding
     xor r13d, r13d                        ; display position 0..9
