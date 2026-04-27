@@ -4365,7 +4365,31 @@ read_reply_or_queue:
     push r12
     push r13
     mov r12, rdi                          ; reply dest
+    ; Cap total wait at ~250ms across all attempts so a misbehaving X
+    ; server reply (or a popup that floods events) can never wedge
+    ; tile's event loop indefinitely. r13 = remaining ms.
+    mov r13, 250
 .rrq_loop:
+    ; poll(x11_fd, POLLIN, r13_ms) before every read so a stalled
+    ; reply trips the timeout instead of blocking forever. The user
+    ; reported a complete tile lockup when slack opened a file
+    ; picker — Mod4+Shift+q wouldn't fire because the event loop
+    ; was stuck in this read. Bounded poll keeps tile responsive.
+    test r13, r13
+    jle .rrq_fail
+    sub rsp, 16
+    mov rax, [x11_fd]
+    mov [rsp], eax
+    mov word [rsp + 4], 1                 ; POLLIN
+    mov word [rsp + 6], 0                 ; revents
+    mov rdx, r13                          ; timeout ms
+    mov rdi, rsp
+    mov rsi, 1
+    mov rax, SYS_POLL
+    syscall
+    add rsp, 16
+    test rax, rax
+    jle .rrq_fail                         ; timeout (0) or error → fail
     mov rax, SYS_READ
     mov rdi, [x11_fd]
     mov rsi, r12
@@ -8845,6 +8869,12 @@ render_bar:
     ; is always visible. A small WS_GROUP_GAP precedes display positions
     ; 3, 6, 9 to group the bar as [1 2 3] [4 5 6] [7 8 9] [0].
     movzx r14d, word [bar_height]         ; square edge
+    test r14d, r14d
+    jz .rb_no_bottom_pad
+    dec r14d                              ; 1 px bg-padding row at the bottom
+                                          ; of the bar so squares/tabs don't
+                                          ; touch the edge of the bar window.
+.rb_no_bottom_pad:
     movzx r12d, word [cfg_bar_pad]        ; cursor x — start at left padding
     xor r13d, r13d                        ; display position 0..9
 .rb_ws_loop:
