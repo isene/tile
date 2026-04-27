@@ -25,6 +25,8 @@
 %define SYS_WAIT4       61
 %define SYS_RT_SIGACTION    13
 %define SYS_RT_SIGRETURN    15
+%define SYS_CLOCK_GETTIME 228
+%define CLOCK_MONOTONIC 1
 
 ; Signals + sigaction flags
 %define SIGUSR1         10
@@ -769,6 +771,20 @@ nwwt_tooltip_atom:   resd 1
 ; Buffer for _NET_WM_WINDOW_TYPE GetProperty reply: 32-byte header +
 ; up to 16 atoms (4 bytes each).
 nwwt_reply_buf:      resb 32 + 64
+
+; Recent-unmap ring. When client_closed runs we record (xid,
+; clock_ms) so MapRequest can spot a window that's flickering —
+; mapping, unmapping, remapping in rapid succession because tile's
+; force-tile-to-fullscreen fights the app's own geometry hints
+; (GIMP's File > Open is the load-bearing case the user reported).
+; A subsequent map for the same XID within RECENT_UNMAP_WINDOW_MS
+; routes the window through the just-MapWindow (floating) path
+; instead of tracking it again, breaking the loop.
+%define RECENT_UNMAP_SLOTS         8
+%define RECENT_UNMAP_WINDOW_MS  1500
+recent_unmap_xids:    resd RECENT_UNMAP_SLOTS
+recent_unmap_times:   resq RECENT_UNMAP_SLOTS
+recent_unmap_head:    resd 1                  ; next slot to overwrite
 
 ; Pending-event queue. Used when a synchronous X reply read (e.g. for
 ; GetProperty during the exec-here action) accidentally drains an
@@ -1695,6 +1711,30 @@ event_loop:
     ; Debug: log map-req arrival with the XID
     mov eax, [x11_read_buf + 8]
     call dbg_log_mapreq
+    ; Flicker break: if this XID unmapped within the last
+    ; RECENT_UNMAP_WINDOW_MS (1.5 s), treat the new map as floating.
+    ; This catches windows whose own geometry hints fight tile's
+    ; force-tile-to-fullscreen — they unmap, MapRequest fires again,
+    ; tile retiles, they unmap, etc. (Reproduced with GIMP's File >
+    ; Open dialog. LibreOffice's GTK FileChooser doesn't trigger
+    ; this because it accepts whatever geometry the WM gives it.)
+    mov eax, [x11_read_buf + 8]
+    call recent_unmap_check
+    test eax, eax
+    jz .ev_mr_check_transient
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_MAP_WINDOW
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov eax, [x11_read_buf + 8]
+    mov [rdi+4], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    call x11_buffer
+    inc dword [x11_seq]
+    call x11_flush
+    jmp event_loop
+.ev_mr_check_transient:
     ; Transient / dialog popups (Gimp save-changes prompt, GTK
     ; FileChooser, etc.) signal their floating role via
     ; WM_TRANSIENT_FOR or _NET_WM_WINDOW_TYPE_DIALOG/UTILITY/etc.
@@ -4677,11 +4717,111 @@ hide_workspace_clients:
 ; mode the new active becomes mapped; in SPLIT modes the remaining
 ; clients re-slice to fill the freed strip. Steals keyboard focus
 ; only if the dying window's workspace matches the global current_ws.
+; Record an XID unmap timestamp into the recent-unmap ring. Called
+; from client_closed so MapRequest can detect a flicker loop (window
+; mapped → tile force-tiled → app unmapped → MapRequest fires again
+; for the same XID within ~1.5 s) and route the second map through
+; the floating path. eax = XID. Clobbers rax, rcx, rdx.
+recent_unmap_record:
+    push rbx
+    push rdi
+    push rsi
+    mov ebx, eax
+    sub rsp, 16
+    mov rax, SYS_CLOCK_GETTIME
+    mov rdi, CLOCK_MONOTONIC
+    mov rsi, rsp
+    syscall
+    mov rax, [rsp]
+    imul rax, 1000
+    mov rcx, [rsp + 8]
+    mov rdx, 1000000
+    push rax
+    mov rax, rcx
+    xor edx, edx
+    mov rcx, 1000000
+    div rcx
+    pop rcx
+    add rax, rcx                            ; rax = monotonic ms
+    add rsp, 16
+    mov ecx, [recent_unmap_head]
+    mov [recent_unmap_xids + rcx*4], ebx
+    mov [recent_unmap_times + rcx*8], rax
+    inc ecx
+    cmp ecx, RECENT_UNMAP_SLOTS
+    jl .rur_no_wrap
+    xor ecx, ecx
+.rur_no_wrap:
+    mov [recent_unmap_head], ecx
+    pop rsi
+    pop rdi
+    pop rbx
+    ret
+
+; Did this XID unmap recently? eax = XID. Returns 1 in eax if yes
+; (and the unmap was within RECENT_UNMAP_WINDOW_MS), 0 otherwise.
+; Used by MapRequest to short-circuit a flickering window into the
+; floating path.
+recent_unmap_check:
+    push rbx
+    push r12
+    push rdi
+    push rsi
+    mov ebx, eax                            ; XID we're asking about
+    ; Get current monotonic ms.
+    sub rsp, 16
+    mov rax, SYS_CLOCK_GETTIME
+    mov rdi, CLOCK_MONOTONIC
+    mov rsi, rsp
+    syscall
+    mov rax, [rsp]
+    imul rax, 1000
+    mov rcx, [rsp + 8]
+    xor edx, edx
+    mov rdi, 1000000
+    push rax
+    mov rax, rcx
+    div rdi
+    pop rcx
+    add rax, rcx                            ; rax = now_ms
+    add rsp, 16
+    mov r12, rax                            ; r12 = now_ms
+    xor ecx, ecx
+.ruc_loop:
+    cmp ecx, RECENT_UNMAP_SLOTS
+    jge .ruc_no
+    cmp [recent_unmap_xids + rcx*4], ebx
+    jne .ruc_next
+    mov rax, r12
+    sub rax, [recent_unmap_times + rcx*8]
+    cmp rax, RECENT_UNMAP_WINDOW_MS
+    ja .ruc_next                            ; too old, treat as miss
+    mov eax, 1
+    pop rsi
+    pop rdi
+    pop r12
+    pop rbx
+    ret
+.ruc_next:
+    inc ecx
+    jmp .ruc_loop
+.ruc_no:
+    xor eax, eax
+    pop rsi
+    pop rdi
+    pop r12
+    pop rbx
+    ret
+
 client_closed:
     push rbx
     push r12
     push r13
     mov r12d, eax                ; the dying XID
+    push rax
+    call recent_unmap_record     ; remember the unmap so a fast
+    pop rax                      ; remap from the same XID can route
+                                 ; through the floating path.
     cmp r12d, [focused_xid]
     jne .cc_no_focus_clear
     mov dword [focused_xid], 0   ; X has already moved focus away
