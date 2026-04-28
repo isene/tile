@@ -235,6 +235,7 @@ err_redirect:    db "tile: another window manager is already running (substructu
 err_redirect_len equ $ - err_redirect
 
 env_display:     db "DISPLAY=", 0  ; placeholder; tile inherits envp directly
+naflag_str:      db "--no-autostart", 0    ; argv flag set by action_restart
 
 ; ICCCM atoms we intern at startup so we can speak the WM_DELETE_WINDOW
 ; protocol — gives apps a chance to save state before closing rather
@@ -513,6 +514,7 @@ section .bss
 
 envp:                resq 1
 argv0:               resq 1          ; saved argv[0] for action_restart fallback
+skip_autostart:      resb 1          ; set by --no-autostart (action_restart re-exec)
 display_num:         resq 1
 x11_fd:              resq 1
 x11_seq:             resd 1
@@ -878,6 +880,36 @@ _start:
     lea rax, [rdi + 1]
     lea rcx, [rsi + rax*8]
     mov [envp], rcx
+    ; Scan argv[1..argc-1] for --no-autostart (set by action_restart so
+    ; the re-exec'd tile doesn't fire another firefox/strip/glass).
+    mov rcx, rdi                 ; argc
+    cmp rcx, 1
+    jle .start_argv_done
+    mov rdx, rsi                 ; argv ptr
+    add rdx, 8                   ; argv[1]
+.start_argv_loop:
+    mov r8, [rdx]
+    test r8, r8
+    jz .start_argv_done
+    lea r9, [rel naflag_str]
+.start_argv_cmp:
+    mov al, [r9]
+    cmp al, [r8]
+    jne .start_argv_next
+    test al, al
+    jz .start_argv_match
+    inc r8
+    inc r9
+    jmp .start_argv_cmp
+.start_argv_match:
+    mov byte [skip_autostart], 1
+    jmp .start_argv_done
+.start_argv_next:
+    add rdx, 8
+    dec rcx
+    cmp rcx, 1
+    jg .start_argv_loop
+.start_argv_done:
 
     ; Open /tmp/tile.log so config warnings, X errors, and any future
     ; runtime diagnostics survive even when tile is launched under
@@ -966,8 +998,13 @@ _start:
     ; SIGUSR1 → reload ~/.tilerc without restarting.
     call install_sigusr1
 
-    ; Run autostart entries from ~/.tilerc.
+    ; Run autostart entries from ~/.tilerc — but skip when re-exec'd
+    ; via action_restart (which passes --no-autostart) so we don't
+    ; spawn a duplicate firefox/strip/feh/glass over the user's session.
+    cmp byte [skip_autostart], 0
+    jne .skip_autostart_run
     call run_autostart
+.skip_autostart_run:
 
     ; Enter event loop.
     jmp event_loop
@@ -5600,8 +5637,13 @@ ungrab_all_keys:
 ; the existing connection. The kernel will close all fds on a
 ; successful exec anyway.
 action_restart:
-    sub rsp, 16
-    mov qword [rsp + 8], 0
+    ; Build argv = [path, "--no-autostart", NULL] so the re-exec'd tile
+    ; doesn't run autostart again (which would spawn a duplicate
+    ; firefox/strip/feh/glass over the user's existing session).
+    sub rsp, 32
+    lea rax, [rel naflag_str]
+    mov [rsp + 8], rax
+    mov qword [rsp + 16], 0
     ; Attempt 1: /proc/self/exe
     lea rax, [rel .ar_path1]
     mov [rsp], rax
@@ -5630,7 +5672,7 @@ action_restart:
     mov rdx, [envp]
     syscall
     ; All three failed. Log and bail; running tile continues.
-    add rsp, 16
+    add rsp, 32
     push rax
     lea rsi, [.ar_fail_msg]
     mov rdx, .ar_fail_msg_len
