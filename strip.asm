@@ -65,6 +65,7 @@
 %define EV_CLIENT_MESSAGE       33
 %define EV_DESTROY_NOTIFY       17
 %define EV_UNMAP_NOTIFY         18
+%define EV_CONFIGURE_NOTIFY     22
 %define SUBSTRUCTURE_NOTIFY_MASK    0x00080000
 %define STRUCTURE_NOTIFY_MASK       0x00020000
 
@@ -528,6 +529,63 @@ drain_ready_fds:
     je .drf_x11_destroy
     cmp al, EV_UNMAP_NOTIFY
     je .drf_x11_unmap
+    cmp al, EV_CONFIGURE_NOTIFY
+    je .drf_x11_configure
+    jmp .drf_next
+.drf_x11_configure:
+    ; ConfigureNotify from a child of strip. SubstructureNotifyMask
+    ; is set on strip's window, so we get told whenever any child's
+    ; geometry changes — including when a tray icon (KeePassXC,
+    ; Discord, some Electron trays) unilaterally resizes itself
+    ; past the tray_icon_size we set on dock. Snap it back, so the
+    ; icon stays inside the tray instead of drawing past the strip's
+    ; vertical bounds. Bytes 8-11 = window XID.
+    mov eax, [x11_read_buf + 8]
+    test eax, eax
+    jz .drf_next
+    ; Is this XID one of our tray icons?
+    xor ebx, ebx
+.drf_cn_scan:
+    cmp ebx, [tray_icon_count]
+    jge .drf_next                            ; not a tray icon
+    cmp [tray_icons + rbx*4], eax
+    je .drf_cn_check_size
+    inc ebx
+    jmp .drf_cn_scan
+.drf_cn_check_size:
+    ; ConfigureNotify wire layout: x@16, y@18, width@20, height@22,
+    ; border@24, override-redirect@26. Earlier code had width/height
+    ; at 16/18 (those are actually x/y) and re-fired the resize on
+    ; every Notify because x ≠ tray_icon_size — Slack ended up in
+    ; an infinite ConfigureWindow ↔ ConfigureNotify loop and stopped
+    ; rendering.
+    movzx ecx, word [x11_read_buf + 20]
+    movzx edx, word [x11_read_buf + 22]
+    mov esi, [tray_icon_size]
+    cmp ecx, esi
+    jne .drf_cn_resize
+    cmp edx, esi
+    je .drf_next                             ; already correct size
+.drf_cn_resize:
+    ; ConfigureWindow: clamp child back to tray_icon_size × tray_icon_size.
+    ; Mask 0x0C = W|H. Total 5 words = 20 bytes.
+    push rbx
+    push rsi
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CONFIGURE_WINDOW
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 5
+    mov [rdi+4], eax
+    mov word [rdi+8], 0x000C
+    mov word [rdi+10], 0
+    mov [rdi+12], esi
+    mov [rdi+16], esi
+    lea rsi, [tmp_buf]
+    mov rdx, 20
+    call x11_buffer
+    inc dword [x11_seq]
+    pop rsi
+    pop rbx
     jmp .drf_next
 .drf_x11_expose:
     mov byte [strip_dirty], 1
