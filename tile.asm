@@ -1558,6 +1558,29 @@ select_substructure_redirect:
     inc dword [x11_seq]
     ret
 
+; Subscribe to PropertyNotify on a tracked client. Used for late
+; WM_CLASS arrival (e.g. Firefox marionette toplevels) so stash-on-map
+; can fire even when the class wasn't set at MapRequest time. Gated
+; on stash_class_count > 0 by the caller — when no `stash-on-map`
+; rules exist this is never called and costs nothing.
+;
+; eax = window XID
+select_property_notify:
+    push rax
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_WINDOW_ATTRS
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov [rdi+4], eax
+    mov dword [rdi+8], CW_EVENT_MASK
+    mov dword [rdi+12], PROPERTY_CHANGE_MASK
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    pop rax
+    ret
+
 ; After flushing the substructure-redirect request, read once with a short
 ; poll; if an X error of code BadAccess arrives, another WM is running.
 check_redirect_ok:
@@ -1807,6 +1830,8 @@ event_loop:
     je .ev_destroy_notify
     cmp al, EV_EXPOSE
     je .ev_expose
+    cmp al, EV_PROPERTY_NOTIFY
+    je .ev_property_notify
     ; RandR ScreenChangeNotify? Only check if RandR was successfully set
     ; up at startup (otherwise randr_event_base could collide with 0).
     cmp byte [randr_present], 0
@@ -2092,6 +2117,27 @@ event_loop:
 .ev_destroy_notify:
     mov eax, [x11_read_buf + 8]
     call client_closed
+    jmp event_loop
+
+.ev_property_notify:
+    ; Late stash-on-map retry. PropertyNotify layout:
+    ;   bytes 4-7 = window XID, bytes 8-11 = atom (XA_WM_CLASS = 67).
+    ; Filter: only act on WM_CLASS changes; no-op when no stash-on-map
+    ; rules exist (we wouldn't have subscribed in that case, but check
+    ; defensively in case of leftover events from a reload).
+    mov eax, [x11_read_buf + 8]            ; atom
+    cmp eax, 67                            ; XA_WM_CLASS
+    jne event_loop
+    cmp dword [stash_class_count], 0
+    je event_loop
+    mov edi, [x11_read_buf + 4]            ; window XID
+    ; Only retry on currently-tracked clients — stash already untracks.
+    mov eax, edi
+    call find_client_index
+    cmp eax, -1
+    je event_loop
+    mov edi, [x11_read_buf + 4]
+    call apply_stash_on_map
     jmp event_loop
 
 .ev_key_press:
@@ -3152,6 +3198,18 @@ track_client:
     movzx eax, cl
     dec eax
     inc byte [workspace_populated + rax]
+
+    ; Subscribe to PropertyNotify on this client — but only when there
+    ; is at least one `stash-on-map` rule to retry. Most apps ship
+    ; WM_CLASS in the order ICCCM mandates (set before MapWindow), but
+    ; Firefox + GTK sometimes set it asynchronously around mapping; if
+    ; apply_stash_on_map at MapRequest time saw an empty class, we
+    ; want a second chance via PropertyNotify(WM_CLASS).
+    cmp dword [stash_class_count], 0
+    je .tc_no_propnotify
+    mov eax, r12d
+    call select_property_notify
+.tc_no_propnotify:
 
     ; Paint the new client's border with the unfocused colour. If it
     ; ends up focused (typical case for a fresh map), set_input_focus
