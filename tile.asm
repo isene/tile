@@ -4479,29 +4479,69 @@ apply_stash_on_map:
 ;
 ; rdi = output buffer (must be ≥ 32 bytes). Returns rax = 1 on success
 ; (reply written to [rdi]), 0 on failure (EOF / error reading).
+; clock_ms — returns rax = milliseconds since CLOCK_MONOTONIC epoch.
+; Used by read_reply_or_queue (and only there for now) to enforce
+; an absolute wall-clock deadline so an event flood doesn't keep
+; refreshing a per-iteration timeout.
+clock_ms:
+    sub rsp, 16
+    push rdi
+    push rsi
+    mov rax, SYS_CLOCK_GETTIME
+    mov rdi, CLOCK_MONOTONIC
+    lea rsi, [rsp + 16]
+    syscall
+    mov rax, [rsp + 16]                   ; sec
+    imul rax, 1000
+    mov rcx, [rsp + 24]                   ; nsec
+    mov rdx, 0
+    mov rsi, 1000000
+    push rax
+    mov rax, rcx
+    xor edx, edx
+    div rsi
+    mov rcx, rax
+    pop rax
+    add rax, rcx
+    pop rsi
+    pop rdi
+    add rsp, 16
+    ret
+
 read_reply_or_queue:
     push rbx
     push r12
     push r13
     mov r12, rdi                          ; reply dest
-    ; Cap total wait at ~250ms across all attempts so a misbehaving X
-    ; server reply (or a popup that floods events) can never wedge
-    ; tile's event loop indefinitely. r13 = remaining ms.
-    mov r13, 250
+    ; Cap TOTAL wall-clock wait at 250ms so a popup that floods events
+    ; can never wedge tile. r13 = absolute deadline in ms (clock_ms +
+    ; 250). Earlier code stored a fixed 250ms here and re-used it as
+    ; the poll timeout each iteration; that meant each event arrival
+    ; restarted the budget, and tile could spin in this loop until the
+    ; X server stopped sending. The user hit this with a fresh-glass
+    ; spawn after killing the previous glass on an empty workspace —
+    ; "FULLSCREEN unresponsive glass; had to Mod4+Shift+q out of tile."
+    call clock_ms
+    add rax, 100                          ; tightened from 250ms — any
+                                          ; healthy X server replies in
+                                          ; well under 10ms; cap the
+                                          ; perceptible freeze on a
+                                          ; misbehaving popup at 100ms
+                                          ; per synchronous query.
+    mov r13, rax                          ; absolute deadline (ms)
 .rrq_loop:
-    ; poll(x11_fd, POLLIN, r13_ms) before every read so a stalled
-    ; reply trips the timeout instead of blocking forever. The user
-    ; reported a complete tile lockup when slack opened a file
-    ; picker — Mod4+Shift+q wouldn't fire because the event loop
-    ; was stuck in this read. Bounded poll keeps tile responsive.
-    test r13, r13
+    push r13
+    call clock_ms
+    pop r13
+    mov rcx, r13
+    sub rcx, rax                          ; rcx = ms remaining
     jle .rrq_fail
     sub rsp, 16
     mov rax, [x11_fd]
     mov [rsp], eax
     mov word [rsp + 4], 1                 ; POLLIN
     mov word [rsp + 6], 0                 ; revents
-    mov rdx, r13                          ; timeout ms
+    mov rdx, rcx                          ; timeout = remaining ms
     mov rdi, rsp
     mov rsi, 1
     mov rax, SYS_POLL
