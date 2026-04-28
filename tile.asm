@@ -509,6 +509,7 @@ default_glass_arg_len equ $ - default_glass_arg - 1
 section .bss
 
 envp:                resq 1
+argv0:               resq 1          ; saved argv[0] for action_restart fallback
 display_num:         resq 1
 x11_fd:              resq 1
 x11_seq:             resd 1
@@ -866,9 +867,11 @@ section .text
 global _start
 
 _start:
-    ; Save envp (after argv NULL terminator)
+    ; Save envp (after argv NULL terminator) and argv[0] for restart.
     mov rdi, [rsp]               ; argc
     lea rsi, [rsp + 8]           ; argv
+    mov rax, [rsi]               ; argv[0]
+    mov [argv0], rax
     lea rax, [rdi + 1]
     lea rcx, [rsi + rax*8]
     mov [envp], rcx
@@ -5560,35 +5563,69 @@ ungrab_all_keys:
     inc dword [x11_seq]
     ret
 
-; In-place restart: re-execs /proc/self/exe so a freshly-built tile
-; binary takes over without dropping any X clients (X owns the windows
-; — they remain mapped while the WM disconnects and reconnects). Same
-; pattern as i3's `restart` command. Only returns if execve fails (in
-; which case the running tile keeps going and the user sees nothing).
+; In-place restart: re-execs the on-disk tile binary so a freshly-
+; built version takes over without dropping any X clients (X owns
+; the windows — they remain mapped while the WM disconnects and
+; reconnects). Pattern matches i3's `restart` command.
+;
+; Try execve in order:
+;   1. /proc/self/exe   — works when binary hasn't been replaced
+;   2. saved argv[0]    — the path the user originally invoked
+;   3. /home/geir/bin/tile — the symlink most setups use
+;
+; Earlier code closed x11_fd BEFORE the first execve. When the on-disk
+; binary had been atomically replaced (rebuild-then-rename), execve of
+; /proc/self/exe ENOENT'd, the function "returned" with x11_fd already
+; closed, every subsequent X11 syscall failed, and tile spiraled into
+; .x11_dead → SYS_EXIT. The user dropped to gdm. Now: don't touch
+; x11_fd; if all execve attempts fail just return and keep running on
+; the existing connection. The kernel will close all fds on a
+; successful exec anyway.
 action_restart:
-    ; Close the X server connection cleanly so the new instance can
-    ; reconnect on the same DISPLAY without the kernel-side socket
-    ; lingering.
-    mov rax, SYS_CLOSE
-    mov edi, [x11_fd]
-    syscall
-    ; Build argv = ["/proc/self/exe", NULL] on the stack (.text is
-    ; read-only). execve copies argv into the kernel before unmapping
-    ; the caller's pages, so stack storage is fine.
     sub rsp, 16
-    lea rax, [rel .ar_path]
-    mov [rsp], rax
     mov qword [rsp + 8], 0
+    ; Attempt 1: /proc/self/exe
+    lea rax, [rel .ar_path1]
+    mov [rsp], rax
     mov rax, SYS_EXECVE
-    lea rdi, [rel .ar_path]
+    lea rdi, [rel .ar_path1]
     mov rsi, rsp
     mov rdx, [envp]
     syscall
-    ; execve failed (binary missing / not executable). Restore stack and
-    ; return — the running tile keeps going.
+    ; Attempt 2: saved argv[0]
+    mov rax, [argv0]
+    test rax, rax
+    jz .ar_try_path3
+    mov [rsp], rax
+    mov rax, SYS_EXECVE
+    mov rdi, [argv0]
+    mov rsi, rsp
+    mov rdx, [envp]
+    syscall
+.ar_try_path3:
+    ; Attempt 3: /home/geir/bin/tile (the symlink → /home/geir/bin/tile)
+    lea rax, [rel .ar_path3]
+    mov [rsp], rax
+    mov rax, SYS_EXECVE
+    lea rdi, [rel .ar_path3]
+    mov rsi, rsp
+    mov rdx, [envp]
+    syscall
+    ; All three failed. Log and bail; running tile continues.
     add rsp, 16
+    push rax
+    lea rsi, [.ar_fail_msg]
+    mov rdx, .ar_fail_msg_len
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    syscall
+    call log_write_buf
+    pop rax
     ret
-.ar_path:    db "/proc/self/exe", 0
+.ar_path1: db "/proc/self/exe", 0
+.ar_path3: db "/home/geir/bin/tile", 0
+.ar_fail_msg: db "tile: action_restart: all execve attempts failed", 10
+.ar_fail_msg_len equ $ - .ar_fail_msg
 
 ; Drained at the top of event_loop. Do the actual reload work here
 ; — outside any signal context, with the X server in a sane state.
