@@ -5344,7 +5344,12 @@ install_sigusr1:
     lea rdi, [sigact_buf]
     lea rax, [sigusr1_handler]
     mov [rdi], rax                        ; sa_handler
-    mov qword [rdi + 8], SA_RESTORER | SA_RESTART
+    ; Deliberately NO SA_RESTART: we want SIGUSR1 to interrupt the
+    ; read() in event_loop with -EINTR so the loop wakes up and drains
+    ; reload_pending. With SA_RESTART the read auto-restarts after the
+    ; handler runs, leaving reload_pending stuck until the next genuine
+    ; X event. The event_loop's .el_read_err path tolerates -EINTR.
+    mov qword [rdi + 8], SA_RESTORER
     lea rax, [sigreturn_trampoline]
     mov [rdi + 16], rax                   ; sa_restorer
     mov qword [rdi + 24], 0               ; sa_mask (no extra blocks)
