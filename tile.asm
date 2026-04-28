@@ -30,6 +30,7 @@
 
 ; Signals + sigaction flags
 %define SIGUSR1         10
+%define SIGUSR2         12
 %define SA_RESTORER     0x04000000
 %define SA_RESTART      0x10000000
 %define EINTR           4
@@ -592,6 +593,13 @@ wm_class_buf:            resb WM_CLASS_BUF_SIZE
 ; loop drains it between events and calls reload_runtime. Keeps the
 ; signal handler tiny — no async-unsafe calls inside it.
 reload_pending:          resb 1
+
+; Restart-recovery coordination. SIGUSR2 sets `restart_pending`; the
+; main event loop sees it and calls action_restart (re-execs tile).
+; Lets the user recover from a stuck-fullscreen-glass scenario via
+; `pkill -USR2 -x tile` from a TTY without logging out via the
+; nuclear Mod4+Shift+q (action_exit).
+restart_pending:         resb 1
 
 ; Logging fd. 0 = unavailable / open() failed. log_write_buf no-ops
 ; in that case so error paths never crash on a missing log file.
@@ -1647,6 +1655,15 @@ x11_flush:
 ; ══════════════════════════════════════════════════════════════════════
 
 event_loop:
+    ; SIGUSR2 → restart in place (re-exec tile). Checked first so a
+    ; user-triggered recovery from a TTY (`pkill -USR2 -x tile`) goes
+    ; through even when reload is also pending. action_restart only
+    ; returns if execve fails; otherwise this call doesn't come back.
+    cmp byte [restart_pending], 0
+    je .el_no_restart
+    mov byte [restart_pending], 0
+    call action_restart
+.el_no_restart:
     ; SIGUSR1 may have asked for a reload while we were busy or
     ; sleeping in read(). Handle it here, between events, where the
     ; X11 connection is in a known state (no half-sent requests).
@@ -5437,6 +5454,14 @@ sigusr1_handler:
     mov byte [reload_pending], 1
     ret
 
+sigusr2_handler:
+    ; Async-safe: just set the flag. The event loop checks it between
+    ; events and calls action_restart (re-execs tile). Recovery hatch
+    ; for stuck-WM scenarios that aren't bad enough to require a full
+    ; gdm logout.
+    mov byte [restart_pending], 1
+    ret
+
 ; Install the SIGUSR1 handler. Uses the kernel sigaction layout (NOT
 ; glibc's). The kernel demands SA_RESTORER + a restorer that issues
 ; rt_sigreturn — without it the signal would corrupt rip on return
@@ -5460,6 +5485,18 @@ install_sigusr1:
     lea rsi, [sigact_buf]
     xor edx, edx
     mov r10, 8                            ; sigsetsize
+    syscall
+    ; Reuse the same sigact_buf (overwrite handler ptr) for SIGUSR2 →
+    ; restart-pending. Same rationale as SIGUSR1 for omitting
+    ; SA_RESTART; flag is drained at the top of event_loop.
+    lea rdi, [sigact_buf]
+    lea rax, [sigusr2_handler]
+    mov [rdi], rax
+    mov rax, SYS_RT_SIGACTION
+    mov rdi, SIGUSR2
+    lea rsi, [sigact_buf]
+    xor edx, edx
+    mov r10, 8
     syscall
     pop rbx
     ret
