@@ -31,6 +31,9 @@
 ; Signals + sigaction flags
 %define SIGUSR1         10
 %define SIGUSR2         12
+%define SYS_FCNTL       72
+%define F_SETFD         2
+%define FD_CLOEXEC      1
 %define SA_RESTORER     0x04000000
 %define SA_RESTART      0x10000000
 %define EINTR           4
@@ -1168,6 +1171,21 @@ x11_connect:
     js .xc_fail
     mov [x11_fd], rax
     mov rbx, rax
+    ; Mark x11_fd FD_CLOEXEC so action_restart's execve auto-closes
+    ; this connection. Without this, the inherited fd kept the old
+    ; client's substructure-redirect grab live against the X server
+    ; even after exec — the new tile process tried to grab it, lost
+    ; ("another window manager is already running"), and exited,
+    ; dropping the user to gdm. CLOEXEC = the kernel closes it for
+    ; us at the moment exec commits, releasing the grab atomically
+    ; without leaving the old tile disconnected if exec fails.
+    push rax
+    mov rax, SYS_FCNTL
+    mov rdi, rbx
+    mov rsi, F_SETFD
+    mov rdx, FD_CLOEXEC
+    syscall
+    pop rax
 
     lea rdi, [sockaddr_buf]
     mov word [rdi], AF_UNIX
