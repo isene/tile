@@ -601,6 +601,19 @@ reload_pending:          resb 1
 ; nuclear Mod4+Shift+q (action_exit).
 restart_pending:         resb 1
 
+; Wall-clock timestamp (ms) of the last fork_exec_string call. The
+; MapRequest handler skips the recent_unmap flicker-break check if
+; the upcoming map is within a few hundred ms of a user-driven
+; spawn — a `bind exec X` action plus a quick MapRequest for the
+; child is by definition not a Gimp-style flicker loop. Without
+; this, killing the focused glass and immediately spawning a fresh
+; one (Mod4+Q → Mod4+Return) caused recent_unmap_check to match
+; the just-killed XID and route the new map through the floating
+; fast-path (MapWindow only, no configure / no track), leaving an
+; un-tiled fullscreen glass on top that workspace switches couldn't
+; unmap.
+last_fork_exec_ms:       resq 1
+
 ; Logging fd. 0 = unavailable / open() failed. log_write_buf no-ops
 ; in that case so error paths never crash on a missing log file.
 log_fd_tile:             resq 1
@@ -1782,6 +1795,24 @@ event_loop:
     ; tile retiles, they unmap, etc. (Reproduced with GIMP's File >
     ; Open dialog. LibreOffice's GTK FileChooser doesn't trigger
     ; this because it accepts whatever geometry the WM gives it.)
+    ;
+    ; Skip the flicker-break entirely when this MapRequest arrived
+    ; within 500 ms of a user-driven fork_exec_string call. That
+    ; window is by definition a fresh user-launched process — not a
+    ; Gimp-style remap loop. Killing the focused glass and spawning
+    ; a fresh one (Mod4+Q → Mod4+Return) was triggering this: the
+    ; killed XID lived in the recent_unmap ring, the new glass got
+    ; the same XID number (X server reuse / old not yet fully gone),
+    ; flicker-break fast-pathed it, no configure happened, glass
+    ; mapped at its original fullscreen geometry, and tile lost
+    ; track of it.
+    push r12
+    call clock_ms
+    mov rcx, rax
+    pop r12
+    sub rcx, [last_fork_exec_ms]
+    cmp rcx, 500
+    jbe .ev_mr_check_transient                  ; recent spawn → skip flicker check
     mov eax, [x11_read_buf + 8]
     call recent_unmap_check
     test eax, eax
@@ -5372,6 +5403,13 @@ fork_exec_string:
     push rbx
     push r12
     mov r12, rdi                 ; save command string
+
+    ; Stamp the spawn time so the upcoming MapRequest can skip the
+    ; recent_unmap flicker-break check (see last_fork_exec_ms above).
+    push r12
+    call clock_ms
+    pop r12
+    mov [last_fork_exec_ms], rax
     ; Debug: log every spawn attempt with PID return value, so the
     ; session log shows exactly what tile tried to launch and whether
     ; fork succeeded.
