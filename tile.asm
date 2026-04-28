@@ -875,6 +875,33 @@ qt_reply_buf:        resb 32 + 1024*4
 ; Code
 ; ══════════════════════════════════════════════════════════════════════
 section .text
+
+; ────── BISECTION DEBUG MACRO ──────
+; Single-char SYS_WRITE marker to fd 2 + log_write_buf to /tmp/tile.log.
+; Use M_LOG 'X' at any code location to log a marker when executed.
+%macro M_LOG 1
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    lea rsi, [rel %%mark_data]
+    mov rdx, 2
+    mov rax, 1
+    mov edi, 2
+    syscall
+    lea rsi, [rel %%mark_data]
+    mov rdx, 2
+    call log_write_buf
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    jmp %%mark_done
+    %%mark_data: db %1, 10
+    %%mark_done:
+%endmacro
 global _start
 
 _start:
@@ -1632,7 +1659,6 @@ adopt_existing_windows:
 .aew_enter_msg: db "tile: adopt enter", 10
 .aew_enter_msg_len equ $ - .aew_enter_msg
 .aew_after_enter:
-
     ; --- QueryTree(root) ---
     ; Send the request directly (no x11_flush needed if write goes
     ; straight to the socket).
@@ -1801,107 +1827,12 @@ adopt_existing_windows:
     pop rcx
     pop rax
 
-    ; Marker: write "AAAA\n" via BOTH fd 2 SYS_WRITE and log_write_buf.
-    push rax
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push r8
-    push r9
-    push r10
-    push r11
-    lea rsi, [rel .aew_aaaa]
-    mov rdx, 5
-    mov rax, SYS_WRITE
-    mov edi, 2
-    syscall
-    lea rsi, [rel .aew_aaaa]
-    mov rdx, 5
-    call log_write_buf
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rax
-    jmp .aew_aaaa_skip
-.aew_aaaa: db "AAAA", 10
-.aew_aaaa_skip:
 
-    ; --- Per-child loop. r12 = i, r13 = current XID. ---
-    ; Debug: announce we made it past the drain.
-    push rax
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    lea rsi, [rel .aew_drain_msg]
-    mov rdx, .aew_drain_msg_len
-    mov rax, SYS_WRITE
-    mov edi, 2
-    syscall
-    call log_write_buf
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rax
-    jmp .aew_drain_msg_skip
-.aew_drain_msg: db "tile: adopt drained, entering iter", 10
-.aew_drain_msg_len equ $ - .aew_drain_msg
-.aew_drain_msg_skip:
     xor r12d, r12d
 .aew_iter:
     cmp r12d, r15d
     jge .aew_after_iter
     mov r13d, [qt_reply_buf + 32 + r12*4]
-
-    ; Debug
-    push rax
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push r8
-    push r9
-    push r10
-    push r11
-    lea rdi, [dkp_buf]
-    mov byte [rdi+0], 't'
-    mov byte [rdi+1], 'i'
-    mov byte [rdi+2], 'l'
-    mov byte [rdi+3], 'e'
-    mov byte [rdi+4], ':'
-    mov byte [rdi+5], ' '
-    mov byte [rdi+6], 'a'
-    mov byte [rdi+7], 'd'
-    mov byte [rdi+8], 'i'
-    mov byte [rdi+9], '='
-    add rdi, 10
-    mov eax, r13d
-    call dbg_u32_dec
-    mov byte [rdi], 10
-    inc rdi
-    lea rsi, [dkp_buf]
-    mov rdx, rdi
-    sub rdx, rsi
-    mov rax, SYS_WRITE
-    mov edi, 2
-    syscall
-    call log_write_buf
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rax
 
     ; Skip our own bar window.
     cmp r13d, [bar_window_id]
@@ -1929,46 +1860,7 @@ adopt_existing_windows:
     lea rdi, [tmp_buf + 64]
     call read_reply_or_queue
     test rax, rax
-    jnz .aew_gwa_ok
-    ; Debug: GetWindowAttributes failed.
-    push rax
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push r8
-    push r9
-    push r10
-    push r11
-    lea rdi, [dkp_buf]
-    mov byte [rdi+0], 't'
-    mov byte [rdi+1], 'i'
-    mov byte [rdi+2], 'l'
-    mov byte [rdi+3], 'e'
-    mov byte [rdi+4], ':'
-    mov byte [rdi+5], ' '
-    mov byte [rdi+6], 'g'
-    mov byte [rdi+7], 'w'
-    mov byte [rdi+8], 'a'
-    mov byte [rdi+9], '?'
-    mov byte [rdi+10], 10
-    lea rsi, [dkp_buf]
-    mov rdx, 11
-    mov rax, SYS_WRITE
-    mov edi, 2
-    syscall
-    call log_write_buf
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rax
-    jmp .aew_next
-.aew_gwa_ok:
+    jz .aew_next                          ; window died, or timeout
 
     ; Drain trailing 12 bytes of the 44-byte GetWindowAttributes reply
     ; before any further X requests, otherwise the next reply parse
