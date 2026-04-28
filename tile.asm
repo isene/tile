@@ -593,6 +593,10 @@ wm_class_buf:            resb WM_CLASS_BUF_SIZE
 ; signal handler tiny — no async-unsafe calls inside it.
 reload_pending:          resb 1
 
+; Logging fd. 0 = unavailable / open() failed. log_write_buf no-ops
+; in that case so error paths never crash on a missing log file.
+log_fd_tile:             resq 1
+
 ; sigaction(2) struct used to install the SIGUSR1 handler. Layout is
 ; the kernel's struct sigaction (not glibc's): handler ptr at +0,
 ; sa_flags at +8, sa_restorer at +16, sa_mask at +24 (8 bytes for the
@@ -848,6 +852,12 @@ _start:
     lea rcx, [rsi + rax*8]
     mov [envp], rcx
 
+    ; Open /tmp/tile.log so config warnings, X errors, and any future
+    ; runtime diagnostics survive even when tile is launched under
+    ; gdm-x-session (which redirects stderr off-screen). Cold path:
+    ; only error/warning sites mirror their stderr writes here.
+    call log_open_tile
+
     call parse_display
     call read_xauthority
 
@@ -941,6 +951,7 @@ _start:
     lea rsi, [err_x11]
     mov rdx, err_x11_len
     syscall
+    call log_write_buf
     jmp .die
 
 .die_redirect:
@@ -949,6 +960,7 @@ _start:
     lea rsi, [err_redirect]
     mov rdx, err_redirect_len
     syscall
+    call log_write_buf
 
 .die:
     mov rax, SYS_EXIT
@@ -1583,6 +1595,41 @@ x11_buffer:
     pop rbx
     ret
 
+; ──────────────────────────────────────────────────────────────────────
+; Logging — see log_open_tile / log_write_buf. fd=0 is the "log file
+; unavailable" sentinel (kernel never returns 0 from open() with stdin
+; still attached). All sites are cold (existing stderr-write paths
+; only), so no measurable cost on the steady-state event loop.
+; ──────────────────────────────────────────────────────────────────────
+log_open_tile:
+    mov rax, SYS_OPEN
+    lea rdi, [log_path_tile]
+    mov rsi, 0x441                       ; O_WRONLY | O_CREAT | O_APPEND
+    mov rdx, 0o644
+    syscall
+    test rax, rax
+    js .lo_done
+    mov [log_fd_tile], rax
+.lo_done:
+    ret
+
+; rsi=buf, rdx=len. Preserves rax/rdi/rsi/rdx so callers can chain
+; this immediately after a write(2) to fd 2.
+log_write_buf:
+    cmp qword [log_fd_tile], 0
+    jle .lwb_done
+    push rax
+    push rdi
+    mov rdi, [log_fd_tile]
+    mov rax, SYS_WRITE
+    syscall
+    pop rdi
+    pop rax
+.lwb_done:
+    ret
+
+log_path_tile: db "/tmp/tile.log", 0
+
 x11_flush:
     mov rdx, [x11_write_pos]
     test rdx, rdx
@@ -1818,6 +1865,7 @@ event_loop:
     mov rax, SYS_WRITE
     mov edi, 2
     syscall
+    call log_write_buf
     pop r11
     pop r10
     pop r9
@@ -2030,6 +2078,7 @@ dbg_keypress:
     mov rax, SYS_WRITE
     mov edi, 2
     syscall
+    call log_write_buf
     pop rcx
     pop rdx
     pop rax
@@ -2074,6 +2123,7 @@ dbg_dump_outputs:
     lea rsi, [dkp_buf]
     mov edx, 16
     syscall
+    call log_write_buf
     ; Per-output: "  out N x=NNN y=NNN w=NNNN h=NNNN cur=N\n"
     xor ebx, ebx
 .ddo_loop:
@@ -2129,6 +2179,7 @@ dbg_dump_outputs:
     mov rax, SYS_WRITE
     mov edi, 2
     syscall
+    call log_write_buf
     inc ebx
     jmp .ddo_loop
 .ddo_done:
@@ -2212,6 +2263,7 @@ dbg_dump_binds:
     mov edi, 2
     lea rsi, [dkp_buf]
     syscall
+    call log_write_buf
     ; Per-entry: write keysym(hex 4) + space + keycode(dec 3) + space +
     ; mod(hex 2) + space + a(dec 2) + space + i(dec 2) + LF
     xor ebx, ebx
@@ -2374,6 +2426,7 @@ dbg_dump_binds:
     mov rax, SYS_WRITE
     mov edi, 2
     syscall
+    call log_write_buf
     inc ebx
     jmp .ddb_loop
 .ddb_done:
@@ -2523,6 +2576,7 @@ configure_client_for_workspace:
     mov rax, SYS_WRITE
     mov edi, 2
     syscall
+    call log_write_buf
     pop r11
     pop r10
     pop r9
@@ -2633,6 +2687,7 @@ dbg_log_mrtag:
     mov rax, SYS_WRITE
     mov edi, 2
     syscall
+    call log_write_buf
     pop r11
     pop r10
     pop r9
@@ -2681,6 +2736,7 @@ dbg_log_mapreq:
     mov rax, SYS_WRITE
     mov edi, 2
     syscall
+    call log_write_buf
     pop r11
     pop r10
     pop r9
@@ -2732,6 +2788,7 @@ dbg_log_map:
     mov rax, SYS_WRITE
     mov edi, 2
     syscall
+    call log_write_buf
     pop r11
     pop r10
     pop r9
@@ -2975,6 +3032,7 @@ track_client:
     mov rax, SYS_WRITE
     mov edi, 2
     syscall
+    call log_write_buf
     pop r11
     pop r10
     pop r9
@@ -3157,6 +3215,7 @@ find_client_index:
     mov rax, SYS_WRITE
     mov edi, 2
     syscall
+    call log_write_buf
     pop r11
     pop r10
     pop r9
@@ -5100,6 +5159,7 @@ dispatch_keypress:
     mov rax, SYS_WRITE
     mov edi, 2
     syscall
+    call log_write_buf
     pop rdx
     pop rcx
     pop rsi
@@ -5264,6 +5324,7 @@ fork_exec_string:
     lea rsi, [.fes_pre]
     mov edx, .fes_pre_len
     syscall
+    call log_write_buf
     mov rax, SYS_WRITE
     mov edi, 2
     mov rsi, r12
@@ -5282,6 +5343,7 @@ fork_exec_string:
     lea rsi, [.fes_lf]
     mov edx, 1
     syscall
+    call log_write_buf
     pop rdi
     mov rax, SYS_FORK
     syscall
@@ -5537,6 +5599,7 @@ switch_workspace:
     lea rsi, [dkp_buf]
     mov edx, 19
     syscall
+    call log_write_buf
     pop rdi
     test edi, edi
     jz .sw_done
@@ -5875,6 +5938,7 @@ configure_window_rect:
     mov rax, SYS_WRITE
     mov edi, 2
     syscall
+    call log_write_buf
     pop r11
     pop r10
     pop r9
@@ -7298,6 +7362,7 @@ warn_unknown_config_line:
     lea rsi, [.wucl_pre]
     mov edx, .wucl_pre_len
     syscall
+    call log_write_buf
     ; Walk the line to its NUL or 255 cap.
     mov rdi, r12
     xor ecx, ecx
@@ -7315,12 +7380,14 @@ warn_unknown_config_line:
     mov rsi, r12
     mov edx, ecx
     syscall
+    call log_write_buf
 .wucl_lf_only:
     mov rax, SYS_WRITE
     mov edi, 2
     lea rsi, [.wucl_lf]
     mov edx, 1
     syscall
+    call log_write_buf
     pop r12
     pop rbx
     ret
