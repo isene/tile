@@ -49,6 +49,7 @@
 %define X11_CHANGE_WINDOW_ATTRS 2
 %define X11_GET_WINDOW_ATTRS    3
 %define X11_DESTROY_WINDOW      4
+%define X11_QUERY_TREE          15
 %define X11_REPARENT_WINDOW     7
 %define X11_MAP_WINDOW          8
 %define X11_UNMAP_WINDOW        10
@@ -864,6 +865,11 @@ x11_read_buf:        resb 65536
 x11_write_buf:       resb 65536
 x11_write_pos:       resq 1
 dkp_buf:             resb 64
+; QueryTree reply buffer for adopt_existing_windows. 32-byte fixed
+; header + up to 1024 children × 4 bytes. 1024 is far more than any
+; real X session (~50 top-levels max in normal use). Used only at
+; restart startup; idle thereafter.
+qt_reply_buf:        resb 32 + 1024*4
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Code
@@ -998,13 +1004,20 @@ _start:
     ; SIGUSR1 → reload ~/.tilerc without restarting.
     call install_sigusr1
 
-    ; Run autostart entries from ~/.tilerc — but skip when re-exec'd
-    ; via action_restart (which passes --no-autostart) so we don't
-    ; spawn a duplicate firefox/strip/feh/glass over the user's session.
+    ; Either run autostart (fresh login) or re-adopt existing X clients
+    ; (action_restart). action_restart sets skip_autostart=1 because
+    ; running autostart again would spawn a duplicate firefox/strip/feh/
+    ; glass over the user's session, but the windows from the previous
+    ; tile process are still alive in X — we discover and re-track them
+    ; via QueryTree so workspace switching, stash, and layout cycling
+    ; keep working on them.
     cmp byte [skip_autostart], 0
     jne .skip_autostart_run
     call run_autostart
+    jmp .post_startup
 .skip_autostart_run:
+    call adopt_existing_windows
+.post_startup:
 
     ; Enter event loop.
     jmp event_loop
@@ -1558,27 +1571,499 @@ select_substructure_redirect:
     inc dword [x11_seq]
     ret
 
-; Subscribe to PropertyNotify on a tracked client. Used for late
-; WM_CLASS arrival (e.g. Firefox marionette toplevels) so stash-on-map
-; can fire even when the class wasn't set at MapRequest time. Gated
-; on stash_class_count > 0 by the caller — when no `stash-on-map`
-; rules exist this is never called and costs nothing.
+; ──────────────────────────────────────────────────────────────────────
+; Adopt pre-existing X11 top-level windows after action_restart.
 ;
-; eax = window XID
-select_property_notify:
+; When tile re-execs itself via Mod4+Shift+x or `pkill -USR2 -x tile`,
+; the new process starts with empty client_xids[] / stash_xids[]. All
+; the windows from the previous tile session are still alive (X owns
+; them) but completely untracked — workspace switching, stash, kill
+; via WM, and layout cycling all become broken on them.
+;
+; This function discovers every top-level on root via QueryTree, then
+; for each child:
+;   - skips our own bar window
+;   - reads GetWindowAttributes; skips override-redirect (panels,
+;     popups, wallpaper) and unviewable windows
+;   - mapped clients: apply_assign → track_client → apply_stash_on_map
+;     (so windows matching a stash-on-map rule are immediately re-stashed,
+;     fixing the marionette-FF "ghost" after restart)
+;   - unmapped + matches stash-on-map: pushed to stash_xids LIFO so
+;     `unstash` can bring them back
+;
+; After the sweep, apply_workspace_layout(current_ws) re-flows windows
+; into tile geometry and unmaps anything not on the current workspace.
+;
+; Cold path: only called when skip_autostart != 0 (= action_restart).
+; ──────────────────────────────────────────────────────────────────────
+adopt_existing_windows:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    ; Debug: announce entry.
     push rax
-    lea rdi, [tmp_buf]
-    mov byte [rdi], X11_CHANGE_WINDOW_ATTRS
-    mov byte [rdi+1], 0
-    mov word [rdi+2], 4
-    mov [rdi+4], eax
-    mov dword [rdi+8], CW_EVENT_MASK
-    mov dword [rdi+12], PROPERTY_CHANGE_MASK
-    lea rsi, [tmp_buf]
-    mov rdx, 16
-    call x11_buffer
-    inc dword [x11_seq]
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    lea rsi, [rel .aew_enter_msg]
+    mov rdx, .aew_enter_msg_len
+    mov rax, SYS_WRITE
+    mov edi, 2
+    syscall
+    call log_write_buf
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
     pop rax
+    jmp .aew_after_enter
+.aew_enter_msg: db "tile: adopt enter", 10
+.aew_enter_msg_len equ $ - .aew_enter_msg
+.aew_after_enter:
+
+    ; --- QueryTree(root) ---
+    ; Send the request directly (no x11_flush needed if write goes
+    ; straight to the socket).
+    call x11_flush
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_QUERY_TREE
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov eax, [x11_root_window]
+    mov [rdi+4], eax
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    syscall
+    inc dword [x11_seq]
+
+    ; Drain the QueryTree reply with our own POLL+READ loop so we
+    ; control exactly how much we consume (read_reply_or_queue is
+    ; hard-wired to 32-byte chunks and doesn't drain reply tails —
+    ; we'd lose synchronisation between the 32-byte header and the
+    ; 4N-byte children list). Read up to 4128 bytes (32 fixed + 1024
+    ; children × 4) into qt_reply_buf, looping as long as the kernel
+    ; trickles data in.
+    ;
+    ; Events that arrive interleaved (MapNotify, etc.) get drained
+    ; into qt_reply_buf too — we filter on byte 0 == 1 (reply) when
+    ; locating the QueryTree response within the buffer.
+    xor ebx, ebx                          ; bytes drained so far
+    lea r14, [qt_reply_buf]
+.aew_qt_drain:
+    cmp ebx, 32                           ; minimum: 32-byte fixed reply
+    jge .aew_qt_drain_more_check
+    jmp .aew_qt_poll
+.aew_qt_drain_more_check:
+    ; After 32 bytes we know reply-length; compute total bytes wanted.
+    mov eax, [qt_reply_buf + 4]           ; reply-length in 4-byte units
+    shl eax, 2                            ; bytes after fixed 32
+    add eax, 32
+    cmp ebx, eax
+    jge .aew_qt_drained
+.aew_qt_poll:
+    sub rsp, 16
+    mov eax, [x11_fd]
+    mov [rsp + 0], eax
+    mov word [rsp + 4], 1                 ; POLLIN
+    mov word [rsp + 6], 0
+    mov rax, SYS_POLL
+    lea rdi, [rsp]
+    mov esi, 1
+    mov edx, 100
+    syscall
+    add rsp, 16
+    test rax, rax
+    jle .aew_qt_drained                   ; timeout — work with what we have
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    mov rsi, r14
+    mov edx, 4096                         ; up to 4KB per call
+    syscall
+    test rax, rax
+    jle .aew_qt_drained
+    add r14, rax
+    add ebx, eax
+    cmp ebx, 4128                         ; cap
+    jge .aew_qt_drained
+    jmp .aew_qt_drain
+.aew_qt_drained:
+
+    ; We have ebx bytes in qt_reply_buf. Find a Reply (byte 0 == 1)
+    ; aligned at a 32-byte boundary; that's our QueryTree response.
+    cmp ebx, 32
+    jl .aew_done                          ; not even one full message
+    xor ecx, ecx                          ; offset
+.aew_qt_find:
+    cmp ecx, ebx
+    jge .aew_done
+    cmp byte [qt_reply_buf + rcx], 1
+    je .aew_qt_found
+    add ecx, 32
+    jmp .aew_qt_find
+.aew_qt_found:
+    ; Found reply at offset rcx. Move it to start of qt_reply_buf so
+    ; offsets 16/32 are at fixed positions.
+    test ecx, ecx
+    jz .aew_qt_at_zero
+    ; Memmove qt_reply_buf+rcx → qt_reply_buf, length = ebx - rcx
+    mov edx, ebx
+    sub edx, ecx
+    lea rsi, [qt_reply_buf + rcx]
+    lea rdi, [qt_reply_buf]
+    push rcx
+    mov rcx, rdx
+    rep movsb
+    pop rcx
+.aew_qt_at_zero:
+
+    ; num_children at bytes 16-17 (CARD16 LE) of the QueryTree reply.
+    movzx r15d, word [qt_reply_buf + 16]
+    test r15d, r15d
+    jnz .aew_have_n_nonzero
+    ; Debug: zero children.
+    push rax
+    push rdi
+    lea rsi, [rel .aew_zero_msg]
+    mov rdx, .aew_zero_msg_len
+    mov rax, SYS_WRITE
+    mov edi, 2
+    syscall
+    call log_write_buf
+    pop rdi
+    pop rax
+    jmp .aew_done
+.aew_zero_msg: db "tile: adopt: QueryTree returned 0 children", 10
+.aew_zero_msg_len equ $ - .aew_zero_msg
+.aew_have_n_nonzero:
+    cmp r15d, 1024
+    jle .aew_have_n
+    mov r15d, 1024
+.aew_have_n:
+
+    ; Debug: log adopt count.
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    lea rdi, [dkp_buf]
+    mov byte [rdi+0], 't'
+    mov byte [rdi+1], 'i'
+    mov byte [rdi+2], 'l'
+    mov byte [rdi+3], 'e'
+    mov byte [rdi+4], ':'
+    mov byte [rdi+5], ' '
+    mov byte [rdi+6], 'a'
+    mov byte [rdi+7], 'd'
+    mov byte [rdi+8], 'o'
+    mov byte [rdi+9], 'p'
+    mov byte [rdi+10], 't'
+    mov byte [rdi+11], ' '
+    mov byte [rdi+12], 'N'
+    mov byte [rdi+13], '='
+    add rdi, 14
+    mov eax, r15d
+    call dbg_u32_dec
+    mov byte [rdi], 10
+    inc rdi
+    lea rsi, [dkp_buf]
+    mov rdx, rdi
+    sub rdx, rsi
+    mov rax, SYS_WRITE
+    mov edi, 2
+    syscall
+    call log_write_buf
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+
+    ; Marker: write "AAAA\n" via BOTH fd 2 SYS_WRITE and log_write_buf.
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    lea rsi, [rel .aew_aaaa]
+    mov rdx, 5
+    mov rax, SYS_WRITE
+    mov edi, 2
+    syscall
+    lea rsi, [rel .aew_aaaa]
+    mov rdx, 5
+    call log_write_buf
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    jmp .aew_aaaa_skip
+.aew_aaaa: db "AAAA", 10
+.aew_aaaa_skip:
+
+    ; --- Per-child loop. r12 = i, r13 = current XID. ---
+    ; Debug: announce we made it past the drain.
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    lea rsi, [rel .aew_drain_msg]
+    mov rdx, .aew_drain_msg_len
+    mov rax, SYS_WRITE
+    mov edi, 2
+    syscall
+    call log_write_buf
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    jmp .aew_drain_msg_skip
+.aew_drain_msg: db "tile: adopt drained, entering iter", 10
+.aew_drain_msg_len equ $ - .aew_drain_msg
+.aew_drain_msg_skip:
+    xor r12d, r12d
+.aew_iter:
+    cmp r12d, r15d
+    jge .aew_after_iter
+    mov r13d, [qt_reply_buf + 32 + r12*4]
+
+    ; Debug
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    lea rdi, [dkp_buf]
+    mov byte [rdi+0], 't'
+    mov byte [rdi+1], 'i'
+    mov byte [rdi+2], 'l'
+    mov byte [rdi+3], 'e'
+    mov byte [rdi+4], ':'
+    mov byte [rdi+5], ' '
+    mov byte [rdi+6], 'a'
+    mov byte [rdi+7], 'd'
+    mov byte [rdi+8], 'i'
+    mov byte [rdi+9], '='
+    add rdi, 10
+    mov eax, r13d
+    call dbg_u32_dec
+    mov byte [rdi], 10
+    inc rdi
+    lea rsi, [dkp_buf]
+    mov rdx, rdi
+    sub rdx, rsi
+    mov rax, SYS_WRITE
+    mov edi, 2
+    syscall
+    call log_write_buf
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+
+    ; Skip our own bar window.
+    cmp r13d, [bar_window_id]
+    je .aew_next
+
+    ; --- GetWindowAttributes(r13d) to filter map-state + override-redirect ---
+    ; Some real clients (like glass) ship without WM_CLASS, so we
+    ; can't use a class-presence test as the filter. GetWindowAttributes
+    ; is unambiguous: override-redirect=0 + map-state=Viewable means
+    ; "this is a real top-level the WM should manage". Dead/destroyed
+    ; XIDs error out at this stage and get silently skipped.
+    call x11_flush
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_GET_WINDOW_ATTRS
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov [rdi+4], r13d
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    syscall
+    inc dword [x11_seq]
+
+    lea rdi, [tmp_buf + 64]
+    call read_reply_or_queue
+    test rax, rax
+    jnz .aew_gwa_ok
+    ; Debug: GetWindowAttributes failed.
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    lea rdi, [dkp_buf]
+    mov byte [rdi+0], 't'
+    mov byte [rdi+1], 'i'
+    mov byte [rdi+2], 'l'
+    mov byte [rdi+3], 'e'
+    mov byte [rdi+4], ':'
+    mov byte [rdi+5], ' '
+    mov byte [rdi+6], 'g'
+    mov byte [rdi+7], 'w'
+    mov byte [rdi+8], 'a'
+    mov byte [rdi+9], '?'
+    mov byte [rdi+10], 10
+    lea rsi, [dkp_buf]
+    mov rdx, 11
+    mov rax, SYS_WRITE
+    mov edi, 2
+    syscall
+    call log_write_buf
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    jmp .aew_next
+.aew_gwa_ok:
+
+    ; Drain trailing 12 bytes of the 44-byte GetWindowAttributes reply
+    ; before any further X requests, otherwise the next reply parse
+    ; reads into them and goes off the rails.
+    mov ebx, 12
+    lea r14, [tmp_buf + 64 + 32]
+.aew_drain_attrs:
+    test ebx, ebx
+    jz .aew_attrs_drained
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    mov rsi, r14
+    mov edx, ebx
+    syscall
+    test rax, rax
+    jle .aew_next
+    add r14, rax
+    sub ebx, eax
+    jmp .aew_drain_attrs
+.aew_attrs_drained:
+
+    ; override-redirect at offset 27 → skip (panels, wallpaper, popups).
+    movzx eax, byte [tmp_buf + 64 + 27]
+    test eax, eax
+    jnz .aew_next
+
+    ; map-state at offset 26: 2=Viewable, 0=Unmapped, 1=Unviewable.
+    ; Viewable: adopt as a normal client.
+    ; Unmapped + matches stash-on-map: re-add to stash_xids so user
+    ;   can `unstash` (rare; would only happen if the WS layout had a
+    ;   stashed window pre-restart, but our stash_xids[] is wiped).
+    ; Anything else: skip.
+    movzx eax, byte [tmp_buf + 64 + 26]
+    cmp eax, 2
+    je .aew_mapped
+    test eax, eax
+    jnz .aew_next                         ; Unviewable
+
+    ; Unmapped — try stash-on-map match.
+    cmp dword [stash_class_count], 0
+    je .aew_next
+    mov edi, r13d
+    call read_wm_class
+    test rax, rax
+    jz .aew_next
+    mov r14, rax
+    xor ebx, ebx
+.aew_um_match:
+    cmp ebx, [stash_class_count]
+    jge .aew_next
+    movzx eax, word [stash_class + rbx*2]
+    lea rsi, [arg_pool + rax]
+    mov rdi, r14
+    call str_eq
+    test eax, eax
+    jnz .aew_um_push
+    inc ebx
+    jmp .aew_um_match
+.aew_um_push:
+    mov eax, [stash_count]
+    cmp eax, MAX_STASH
+    jge .aew_next
+    mov [stash_xids + rax*4], r13d
+    inc dword [stash_count]
+    jmp .aew_next
+
+.aew_mapped:
+    ; Viewable: adopt as a regular tracked client.
+    mov edi, r13d
+    call apply_assign
+    mov [pending_assign_ws], al
+    mov eax, r13d
+    call track_client
+    mov byte [pending_assign_ws], 0
+    mov edi, r13d
+    call apply_stash_on_map
+
+.aew_next:
+    inc r12d
+    jmp .aew_iter
+
+.aew_after_iter:
+    ; Re-flow tile's layout for the current workspace and unmap
+    ; everything that ended up on a different workspace.
+    movzx eax, byte [current_ws]
+    call apply_workspace_layout
+    call render_bar
+    call x11_flush
+
+.aew_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; After flushing the substructure-redirect request, read once with a short
@@ -1830,8 +2315,6 @@ event_loop:
     je .ev_destroy_notify
     cmp al, EV_EXPOSE
     je .ev_expose
-    cmp al, EV_PROPERTY_NOTIFY
-    je .ev_property_notify
     ; RandR ScreenChangeNotify? Only check if RandR was successfully set
     ; up at startup (otherwise randr_event_base could collide with 0).
     cmp byte [randr_present], 0
@@ -2117,27 +2600,6 @@ event_loop:
 .ev_destroy_notify:
     mov eax, [x11_read_buf + 8]
     call client_closed
-    jmp event_loop
-
-.ev_property_notify:
-    ; Late stash-on-map retry. PropertyNotify layout:
-    ;   bytes 4-7 = window XID, bytes 8-11 = atom (XA_WM_CLASS = 67).
-    ; Filter: only act on WM_CLASS changes; no-op when no stash-on-map
-    ; rules exist (we wouldn't have subscribed in that case, but check
-    ; defensively in case of leftover events from a reload).
-    mov eax, [x11_read_buf + 8]            ; atom
-    cmp eax, 67                            ; XA_WM_CLASS
-    jne event_loop
-    cmp dword [stash_class_count], 0
-    je event_loop
-    mov edi, [x11_read_buf + 4]            ; window XID
-    ; Only retry on currently-tracked clients — stash already untracks.
-    mov eax, edi
-    call find_client_index
-    cmp eax, -1
-    je event_loop
-    mov edi, [x11_read_buf + 4]
-    call apply_stash_on_map
     jmp event_loop
 
 .ev_key_press:
@@ -3198,18 +3660,6 @@ track_client:
     movzx eax, cl
     dec eax
     inc byte [workspace_populated + rax]
-
-    ; Subscribe to PropertyNotify on this client — but only when there
-    ; is at least one `stash-on-map` rule to retry. Most apps ship
-    ; WM_CLASS in the order ICCCM mandates (set before MapWindow), but
-    ; Firefox + GTK sometimes set it asynchronously around mapping; if
-    ; apply_stash_on_map at MapRequest time saw an empty class, we
-    ; want a second chance via PropertyNotify(WM_CLASS).
-    cmp dword [stash_class_count], 0
-    je .tc_no_propnotify
-    mov eax, r12d
-    call select_property_notify
-.tc_no_propnotify:
 
     ; Paint the new client's border with the unfocused colour. If it
     ; ends up focused (typical case for a fresh map), set_input_focus
