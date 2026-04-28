@@ -242,6 +242,9 @@ tray_atom_xembed_info: resd 1          ; _XEMBED_INFO
 tray_atom_manager:   resd 1            ; MANAGER
 tray_icons:          resd MAX_TRAY_ICONS
 tray_icon_count:     resd 1
+
+; Logging fd — see log_open_strip / log_write_buf in .text.
+log_fd_strip:        resq 1
 tray_icon_size:      resd 1            ; px (square)
 tray_padding:        resd 1            ; px between icons
 
@@ -306,11 +309,16 @@ _start:
     lea rcx, [rsi + rax*8]
     mov [envp], rcx
 
+    ; Open /tmp/strip.log so X server / tray / segment errors land in
+    ; a tail-able file (strip otherwise has no stderr surface visible
+    ; — it's started silently from .tilerc's `exec strip`).
+    call log_open_strip
+
     call parse_display
     call read_xauthority
     call x11_connect
     test rax, rax
-    jnz .die
+    jnz .die_x11
     call x11_parse_setup
 
     ; Defaults.
@@ -356,6 +364,17 @@ _start:
     call seed_next_runs
 
     jmp main_loop
+
+.die_x11:
+    lea rsi, [.die_x11_msg]
+    mov rdx, .die_x11_msg_len
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    syscall
+    call log_write_buf
+    jmp .die
+.die_x11_msg: db "strip: cannot connect to X server", 10
+.die_x11_msg_len equ $ - .die_x11_msg
 
 .die:
     mov rax, SYS_EXIT
@@ -3168,6 +3187,41 @@ alloc_xid:
     and eax, [x11_rid_mask]
     or eax, [x11_rid_base]
     ret
+
+; ──────────────────────────────────────────────────────────────────────
+; Logging — /tmp/strip.log gives strip a place to record startup
+; failures, X errors, and tray-icon issues that would otherwise
+; be invisible (strip is launched from .tilerc with no terminal).
+; Cold path; no cost on the redraw / segment-refresh hot loops.
+; ──────────────────────────────────────────────────────────────────────
+log_open_strip:
+    mov rax, SYS_OPEN
+    lea rdi, [log_path_strip]
+    mov rsi, 0x441                       ; O_WRONLY | O_CREAT | O_APPEND
+    mov rdx, 0o644
+    syscall
+    test rax, rax
+    js .lo_done
+    mov [log_fd_strip], rax
+.lo_done:
+    ret
+
+; rsi=buf, rdx=len. Preserves rax/rdi/rsi/rdx so callers can chain
+; this immediately after a write(2) to fd 2.
+log_write_buf:
+    cmp qword [log_fd_strip], 0
+    jle .lwb_done
+    push rax
+    push rdi
+    mov rdi, [log_fd_strip]
+    mov rax, SYS_WRITE
+    syscall
+    pop rdi
+    pop rax
+.lwb_done:
+    ret
+
+log_path_strip: db "/tmp/strip.log", 0
 
 x11_buffer:
     push rbx
