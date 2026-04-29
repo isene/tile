@@ -48,6 +48,7 @@
 %define X11_CREATE_WINDOW       1
 %define X11_CHANGE_WINDOW_ATTRS 2
 %define X11_GET_WINDOW_ATTRS    3
+%define X11_GET_GEOMETRY        14
 %define X11_DESTROY_WINDOW      4
 %define X11_QUERY_TREE          15
 %define X11_REPARENT_WINDOW     7
@@ -157,6 +158,7 @@
 %define ACT_EXEC_HERE   13
 %define ACT_RELOAD      14
 %define ACT_RESTART     15
+%define ACT_GATHER      16
 
 %define MAX_STASH       8
 
@@ -436,6 +438,8 @@ action_table:
     db ACT_RELOAD, 0
     db "restart", 0
     db ACT_RESTART, 0
+    db "gather", 0
+    db ACT_GATHER, 0
     db 0                       ; terminator
 
 ; layout arg keyword table: `layout tabbed | split-h | split-v | toggle`.
@@ -671,6 +675,16 @@ cfg_border_width:        resb 1
 cfg_border_focused:      resd 1
 cfg_border_unfocused:    resd 1
 focused_xid:             resd 1
+
+; Transient/dialog focus tracking. When MapRequest for a transient or
+; EWMH dialog window arrives, we map+raise+focus it so GTK modal
+; dialogs (five-or-more high-score, GIMP confirm-quit, libreoffice
+; file dialogs, etc.) actually receive keystrokes. transient_focused_xid
+; remembers the dialog XID we routed focus to; transient_prev_focus_xid
+; remembers what was focused before, so UnmapNotify/DestroyNotify on
+; the dialog can restore the parent's focus.
+transient_focused_xid:    resd 1
+transient_prev_focus_xid: resd 1
 
 ; Master/stack layout: master takes cfg_master_ratio percent of the
 ; workspace's width on the left; the remaining clients stack as equal-
@@ -1838,6 +1852,17 @@ adopt_existing_windows:
     cmp r13d, [bar_window_id]
     je .aew_next
 
+    ; Idempotency: if this XID is already in client_xids[], skip.
+    ; adopt_existing_windows is now called from two paths:
+    ;   - action_restart (post-execve, client_xids empty → no skips)
+    ;   - action_gather (mid-session, client_xids populated → skip the
+    ;     already-tracked windows so we don't double-track them as
+    ;     duplicate tabs on the user's current workspace).
+    mov eax, r13d
+    call find_client_index
+    cmp eax, -1
+    jne .aew_next
+
     ; --- GetWindowAttributes(r13d) to filter map-state + override-redirect ---
     ; Some real clients (like glass) ship without WM_CLASS, so we
     ; can't use a class-presence test as the filter. GetWindowAttributes
@@ -1887,30 +1912,95 @@ adopt_existing_windows:
     test eax, eax
     jnz .aew_next
 
-    ; map-state at offset 26: 2=Viewable, 0=Unmapped, 1=Unviewable.
-    ; Viewable: adopt as a normal client.
-    ; Unmapped + matches stash-on-map: re-add to stash_xids so user
-    ;   can `unstash` (rare; would only happen if the WS layout had a
-    ;   stashed window pre-restart, but our stash_xids[] is wiped).
-    ; Anything else: skip.
-    movzx eax, byte [tmp_buf + 64 + 26]
+    ; Save map-state into r14b (rax/rdx scratch is fine; r14 is free
+    ; after .aew_drain_attrs finished) so the upcoming GetGeometry can
+    ; reuse tmp_buf+64 without losing the GWA data.
+    movzx r14d, byte [tmp_buf + 64 + 26]
+
+    ; --- GetGeometry filter: drop client-leader / helper windows ---
+    ; Firefox / GTK apps create a 10x10 group-leader window per process
+    ; that's a child of root but isn't a real toplevel. Same for
+    ; ibus / nm-applet / udiskie / etc. They're _NET_WM_WINDOW_TYPE_NORMAL,
+    ; not override-redirect, often Viewable, and apply_assign matches
+    ; their WM_CLASS — so without a geometry filter adopt happily
+    ; tracks them and the user sees them as empty tabs after restart.
+    ; Anything narrower than 100 px in either dimension can't be a real
+    ; window the user wants to interact with.
+    call x11_flush
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_GET_GEOMETRY
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov [rdi+4], r13d
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    syscall
+    inc dword [x11_seq]
+    lea rdi, [tmp_buf + 64]
+    call read_reply_or_queue
+    test rax, rax
+    jz .aew_next                          ; window died between QueryTree and now
+    ; GetGeometry reply: 32 bytes, no trailing data. width @ +16, height @ +18.
+    movzx eax, word [tmp_buf + 64 + 16]
+    cmp eax, 100
+    jl .aew_next
+    movzx eax, word [tmp_buf + 64 + 18]
+    cmp eax, 100
+    jl .aew_next
+
+    ; map-state was saved in r14b. 2=Viewable, 0=Unmapped, 1=Unviewable.
+    ; Viewable: adopt as a normal client (path below).
+    ; Unmapped: under TABBED layout the previous tile already unmapped
+    ;   any non-active client on every workspace, so a window owned by
+    ;   another client (firefox on WS7 while user was on WS1) shows up
+    ;   here as Unmapped even though it should be re-adopted onto its
+    ;   home workspace. If apply_assign matches its WM_CLASS, route it
+    ;   there (user re-finds it on workspace switch). Otherwise check
+    ;   stash-on-map. Failing both, skip.
+    ; Unviewable: skip.
+    movzx eax, r14b
     cmp eax, 2
     je .aew_mapped
-    test eax, eax
-    jnz .aew_next                         ; Unviewable
+    cmp eax, 1
+    je .aew_next                          ; Unviewable
 
-    ; Unmapped — try stash-on-map match.
+    ; Unmapped + non-trivial size — preserve the window across restart so
+    ; the user doesn't lose work. Routing priority:
+    ;   1. assign rule by WM_CLASS  → matched workspace
+    ;   2. stash-on-map by WM_CLASS → push to stash_xids (no track)
+    ;   3. fallback                 → track on current_ws as a tab the
+    ;      user can manually move (Mod4+Shift+1..0). Better than dropping
+    ;      the window: it stays alive, just lives on the wrong ws until
+    ;      the user reshuffles. Without this fallback, every glass /
+    ;      Pointer / Kastrup instance on a hidden workspace at restart
+    ;      time would silently disappear from tile's tab strip.
+    xor ebx, ebx                          ; ebx = pending_assign_ws (0 = current_ws)
+    cmp dword [assign_count], 0
+    je .aew_um_try_stash
+    mov edi, r13d
+    call apply_assign                     ; eax = ws (1..10) or 0
+    test eax, eax
+    jz .aew_um_try_stash
+    mov ebx, eax                          ; assign matched; route to ws
+    jmp .aew_um_track
+
+.aew_um_try_stash:
+    ; Stash-on-map check: if the class matches a stash rule, push to
+    ; stash_xids LIFO and don't track (user gets it back via :unstash).
     cmp dword [stash_class_count], 0
-    je .aew_next
+    je .aew_um_track                      ; no stash rules → fallback track
     mov edi, r13d
     call read_wm_class
     test rax, rax
-    jz .aew_next
+    jz .aew_um_track                      ; no WM_CLASS → can't stash, fallback track
     mov r14, rax
+    push rbx
     xor ebx, ebx
 .aew_um_match:
     cmp ebx, [stash_class_count]
-    jge .aew_next
+    jge .aew_um_match_done
     movzx eax, word [stash_class + rbx*2]
     lea rsi, [arg_pool + rax]
     mov rdi, r14
@@ -1920,11 +2010,39 @@ adopt_existing_windows:
     inc ebx
     jmp .aew_um_match
 .aew_um_push:
+    pop rbx                               ; restore pending_assign_ws (0 here)
     mov eax, [stash_count]
     cmp eax, MAX_STASH
-    jge .aew_next
+    jge .aew_um_track                     ; stash full → fallback track
     mov [stash_xids + rax*4], r13d
     inc dword [stash_count]
+    jmp .aew_next
+.aew_um_match_done:
+    pop rbx                               ; restore pending_assign_ws
+
+.aew_um_track:
+    ; ebx = pending_assign_ws (0 = current_ws, otherwise the assign target).
+    mov [pending_assign_ws], bl
+    mov eax, r13d
+    call track_client
+    mov byte [pending_assign_ws], 0
+    ; Set ws_active_xid for this workspace if not already set, so
+    ; apply_workspace_layout maps the client when its workspace becomes
+    ; visible (otherwise TABBED layout sees ws_active_xid=0 and unmaps
+    ; everything — that's how the user lost windows pre-fix).
+    mov eax, r13d
+    call find_client_index
+    cmp eax, -1
+    je .aew_next
+    movzx ebx, byte [client_ws + rax]
+    test ebx, ebx
+    jz .aew_next
+    cmp ebx, WS_COUNT
+    jg .aew_next
+    dec ebx
+    cmp dword [ws_active_xid + rbx*4], 0
+    jne .aew_next
+    mov [ws_active_xid + rbx*4], r13d
     jmp .aew_next
 
 .aew_mapped:
@@ -1935,8 +2053,30 @@ adopt_existing_windows:
     mov eax, r13d
     call track_client
     mov byte [pending_assign_ws], 0
+
     mov edi, r13d
     call apply_stash_on_map
+    test eax, eax
+    jnz .aew_next                          ; stashed → don't make it active
+
+    ; Make this client the active tab on its workspace if no active is
+    ; set yet. Without this, ws_active_xid stays 0 and the upcoming
+    ; apply_workspace_layout call (TABBED layout) will unmap every
+    ; client because none match XID=0 — losing every adopted window
+    ; on the user's screen the moment tile reflows.
+    mov eax, r13d                          ; find_client_index reads eax
+    call find_client_index
+    cmp eax, -1
+    je .aew_next
+    movzx ebx, byte [client_ws + rax]      ; ws of newly tracked client
+    test ebx, ebx
+    jz .aew_next
+    cmp ebx, WS_COUNT
+    jg .aew_next
+    dec ebx                                ; ws → index
+    cmp dword [ws_active_xid + rbx*4], 0
+    jne .aew_next                          ; already set
+    mov [ws_active_xid + rbx*4], r13d
 
 .aew_next:
     inc r12d
@@ -2288,6 +2428,54 @@ event_loop:
     call x11_flush
     jmp event_loop
 .ev_mr_check_transient:
+    ; Tiny-helper filter: GTK / X11 group leader windows (firefox's hidden
+    ; "Firefox" 10x10 leader, udiskie / nm-applet / ibus stubs, copyq's
+    ; 1x1 selection-owner shim, etc.) request a Map at autostart time but
+    ; aren't real top-levels. Without this filter they got tracked as tabs
+    ; on current_ws, polluting the strip with 10+ "ghost tabs". Just grant
+    ; the Map (the X server / app needs the window mapped for group state)
+    ; but skip tracking. Anything < 100 px in either dimension can't be a
+    ; real interactive window; same threshold as adopt's GetGeometry
+    ; filter so behaviour is consistent across boot vs. action_restart.
+    call x11_flush
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_GET_GEOMETRY
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov eax, [x11_read_buf + 8]
+    mov [rdi+4], eax
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    syscall
+    inc dword [x11_seq]
+    lea rdi, [tmp_buf + 64]
+    call read_reply_or_queue
+    test rax, rax
+    jz .ev_mr_real_transient_check       ; bail through (window died etc.)
+    movzx eax, word [tmp_buf + 64 + 16]  ; width
+    cmp eax, 100
+    jl .ev_mr_tiny
+    movzx eax, word [tmp_buf + 64 + 18]  ; height
+    cmp eax, 100
+    jl .ev_mr_tiny
+    jmp .ev_mr_real_transient_check
+.ev_mr_tiny:
+    ; Tiny: just MapWindow, don't track, don't focus.
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_MAP_WINDOW
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov eax, [x11_read_buf + 8]
+    mov [rdi+4], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    call x11_buffer
+    inc dword [x11_seq]
+    call x11_flush
+    jmp event_loop
+.ev_mr_real_transient_check:
     ; Transient / dialog popups (Gimp save-changes prompt, GTK
     ; FileChooser, etc.) signal their floating role via
     ; WM_TRANSIENT_FOR or _NET_WM_WINDOW_TYPE_DIALOG/UTILITY/etc.
@@ -2309,6 +2497,7 @@ event_loop:
     call is_transient_window
     test eax, eax
     jz .ev_mr_not_transient
+    ; Map the dialog at whatever geometry the app asked for.
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_MAP_WINDOW
     mov byte [rdi+1], 0
@@ -2319,6 +2508,37 @@ event_loop:
     mov rdx, 8
     call x11_buffer
     inc dword [x11_seq]
+    ; Raise the dialog above its parent (StackMode = Above = 0). Without
+    ; this, the parent's fullscreen geometry can paint over a smaller
+    ; centred dialog, so the modal dialog ends up invisible while the
+    ; parent stops responding to input — exactly the five-or-more
+    ; high-score lockup symptom.
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CONFIGURE_WINDOW
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4                    ; 3 header + 1 value
+    mov eax, [x11_read_buf + 8]
+    mov [rdi+4], eax                       ; window
+    mov word [rdi+8], CFG_STACK
+    mov word [rdi+10], 0
+    mov dword [rdi+12], 0                  ; stack-mode = Above
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    ; Remember the dialog and the previously-focused window. When the
+    ; dialog is unmapped/destroyed we restore focus to whatever was
+    ; focused before — typically the GTK app that owns the modal.
+    mov eax, [focused_xid]
+    mov [transient_prev_focus_xid], eax
+    mov eax, [x11_read_buf + 8]
+    mov [transient_focused_xid], eax
+    ; Hand keyboard focus to the dialog. Without this, GTK's modality
+    ; means the parent ignores all input until the dialog closes — but
+    ; the dialog can't get input because it has no focus, so the whole
+    ; session locks until SIGKILL or Ctrl+Alt+Backspace.
+    mov eax, [x11_read_buf + 8]
+    call set_input_focus
     call x11_flush
     jmp event_loop
 .ev_mr_not_transient:
@@ -2472,6 +2692,15 @@ event_loop:
     jmp event_loop
 
 .ev_unmap_notify:
+    ; Transient-dialog dismissal: if the unmapping XID is the one we
+    ; routed focus to in the MapRequest transient path, hand focus back
+    ; to whatever was focused before. find_client_index won't match
+    ; (transients aren't tracked), so without this restore we'd drop
+    ; the parent on its head.
+    mov eax, [x11_read_buf + 8]
+    call transient_dismiss_check
+    test eax, eax
+    jnz event_loop
     ; If the unmap matches a pending WM-initiated unmap (workspace
     ; switch, move-to), just clear the flag and leave the client in
     ; the stack. Real client-initiated closes get untracked.
@@ -2490,6 +2719,10 @@ event_loop:
     jmp event_loop
 
 .ev_destroy_notify:
+    mov eax, [x11_read_buf + 8]
+    call transient_dismiss_check
+    test eax, eax
+    jnz event_loop
     mov eax, [x11_read_buf + 8]
     call client_closed
     jmp event_loop
@@ -4744,11 +4977,17 @@ is_transient_window:
     call read_reply_or_queue
     test eax, eax
     jz .itw_try_ewmh
-    mov eax, [tmp_buf + 64 + 16]           ; value-length (bytes)
+    ; value-length at offset 16 is in *format units* (X11 spec). For
+    ; WM_TRANSIENT_FOR the format is always 32, so value-length=1 means
+    ; one CARD32 = 4 bytes of payload. Old code treated value-length as
+    ; bytes, saw "1 < 4", drained 1 byte and returned not-transient,
+    ; and left 3 bytes of the property value stuck in the socket
+    ; corrupting subsequent reads. The window only ever has zero or
+    ; one parent XID in this property, so we either have nothing to
+    ; read (length=0) or exactly one CARD32 (length=1 → 4 bytes).
+    mov eax, [tmp_buf + 64 + 16]           ; value-length (format units)
     test eax, eax
     jz .itw_try_ewmh
-    cmp eax, 4
-    jb .itw_drain_to_ewmh
     mov rax, SYS_READ
     mov rdi, [x11_fd]
     lea rsi, [tmp_buf + 96]
@@ -4760,23 +4999,6 @@ is_transient_window:
     test eax, eax
     jnz .itw_yes
     jmp .itw_try_ewmh
-.itw_drain_to_ewmh:
-    push rax
-    mov ecx, eax
-.itw_d2e_loop:
-    test ecx, ecx
-    jz .itw_d2e_done
-    mov rax, SYS_READ
-    mov rdi, [x11_fd]
-    lea rsi, [tmp_buf + 96]
-    mov rdx, 1
-    syscall
-    test rax, rax
-    jle .itw_d2e_done
-    sub ecx, eax
-    jmp .itw_d2e_loop
-.itw_d2e_done:
-    pop rax
 
 .itw_try_ewmh:
     ; --- Pass 2: _NET_WM_WINDOW_TYPE (atom = nwwt_atom, type = ATOM=4). ---
@@ -4805,9 +5027,12 @@ is_transient_window:
     call read_reply_or_queue
     test eax, eax
     jz .itw_no
-    mov ecx, [nwwt_reply_buf + 16]         ; value-length (bytes)
+    ; value-length is in format units; format=32 for XA_ATOM, so multiply
+    ; by 4 to get bytes. Cap at 64 bytes (16 atoms) like before.
+    mov ecx, [nwwt_reply_buf + 16]         ; value-length (format units)
     test ecx, ecx
     jz .itw_no
+    shl ecx, 2                             ; format units → bytes (×4)
     cmp ecx, 64
     jbe .itw_have_len
     mov ecx, 64
@@ -4869,6 +5094,38 @@ is_transient_window:
     mov eax, 1
     pop r12
     pop rbx
+    ret
+
+; eax = XID that just got UnmapNotify or DestroyNotify. If it matches
+; the transient we routed focus to in the MapRequest transient path,
+; restore focus to whatever was focused before (typically the modal's
+; parent) and return 1 so the caller short-circuits the normal client-
+; closed path. Returns 0 otherwise.
+transient_dismiss_check:
+    cmp eax, [transient_focused_xid]
+    jne .tdc_no
+    push rbx
+    mov ebx, [transient_prev_focus_xid]
+    mov dword [transient_focused_xid], 0
+    mov dword [transient_prev_focus_xid], 0
+    ; If the previously-focused XID is gone (destroyed during the
+    ; modal), set_input_focus will fail silently — that's fine, the
+    ; next user keystroke or workspace switch will sort focus out.
+    ; Clear focused_xid first so set_input_focus actually re-issues
+    ; SetInputFocus on the previous window (the early-out at .sif_x
+    ; only checks against current focused_xid).
+    mov dword [focused_xid], 0
+    mov eax, ebx
+    test eax, eax
+    jz .tdc_done
+    call set_input_focus
+    call x11_flush
+.tdc_done:
+    pop rbx
+    mov eax, 1
+    ret
+.tdc_no:
+    xor eax, eax
     ret
 
 ; rdi = window XID. If WM_CLASS class half matches an `assign` table
@@ -5740,6 +5997,8 @@ dispatch_keypress:
     je .dk_reload
     cmp eax, ACT_RESTART
     je .dk_restart
+    cmp eax, ACT_GATHER
+    je .dk_gather
     jmp .dk_done
 .dk_exec:
     test edx, edx
@@ -5844,6 +6103,9 @@ dispatch_keypress:
 .dk_restart:
     call action_restart
     ; only returns on failure
+    jmp .dk_done
+.dk_gather:
+    call action_gather
     jmp .dk_done
 .dk_skip:
     inc ebx
@@ -6036,38 +6298,119 @@ ungrab_all_keys:
 ; x11_fd; if all execve attempts fail just return and keep running on
 ; the existing connection. The kernel will close all fds on a
 ; successful exec anyway.
+; ══════════════════════════════════════════════════════════════════════
+; action_gather — soft-recovery counterpart to action_restart.
+;
+; Walks client_xids[] backwards, sending GetGeometry to each XID; if the
+; reply doesn't arrive within read_reply_or_queue's 100 ms budget the
+; XID is treated as dead and untrack_client'd (ghost cleanup — clears
+; tabs whose underlying X window died without a proper UnmapNotify /
+; DestroyNotify reaching tile, e.g. the application crashed in a way
+; that left its WM_CLASS-bearing top-level orphaned on root).
+;
+; Then calls adopt_existing_windows, which now skips XIDs already in
+; client_xids[] (idempotency check at the top of .aew_iter), so the
+; only effect is to *add* untracked top-levels onto current_ws —
+; recovering lost windows without rebuilding tile state.
+;
+; Bound to a key (e.g. Mod4+Shift+g) via `bind ... gather` in ~/.tilerc.
+; Cheaper than action_restart: no execve, no drop of focused-tab /
+; bg-cycle / stash state. Use this first; reach for restart only when
+; tile itself is in trouble.
+; ══════════════════════════════════════════════════════════════════════
+action_gather:
+    push rbx
+    push r12
+    push r13
+
+    ; --- Phase 1: ghost sweep ---
+    ; Iterate backwards so untrack_client's array shifts don't disturb
+    ; the indices we haven't looked at yet.
+    mov ebx, [client_count]
+.ag_gs_loop:
+    test ebx, ebx
+    jz .ag_gs_done
+    dec ebx
+    mov r13d, [client_xids + rbx*4]
+
+    ; GetGeometry(r13d) — 32-byte fixed reply, no variable section, so
+    ; no draining headache (unlike GetWindowAttributes).
+    call x11_flush
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_GET_GEOMETRY
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov [rdi+4], r13d
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    syscall
+    inc dword [x11_seq]
+
+    lea rdi, [tmp_buf + 64]
+    call read_reply_or_queue
+    test rax, rax
+    jnz .ag_gs_loop                       ; alive — keep tracking it
+
+    ; Dead: no reply within budget. Drop the tab.
+    mov eax, r13d
+    call untrack_client
+    jmp .ag_gs_loop
+
+.ag_gs_done:
+
+    ; --- Phase 2: scan root for untracked top-levels and adopt them ---
+    ; adopt_existing_windows now skips XIDs already in client_xids[],
+    ; so only the strays get added.
+    call adopt_existing_windows
+
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 action_restart:
     ; Build argv = [path, "--no-autostart", NULL] so the re-exec'd tile
     ; doesn't run autostart again (which would spawn a duplicate
     ; firefox/strip/feh/glass over the user's existing session).
+    ;
+    ; Order of execve attempts matters: when the on-disk binary has been
+    ; rebuilt (atomic rename via `cp` or some linkers), /proc/self/exe
+    ; still references the OLD inode the kernel loaded at our launch.
+    ; execve(/proc/self/exe) succeeds but re-loads the stale inode, so
+    ; bug fixes never take effect even after a Mod4+Shift+x. Try the
+    ; symlink path first; that always resolves to whatever's currently
+    ; on disk. /proc/self/exe is the last-resort fallback for the case
+    ; where the symlink itself was deleted.
     sub rsp, 32
     lea rax, [rel naflag_str]
     mov [rsp + 8], rax
     mov qword [rsp + 16], 0
-    ; Attempt 1: /proc/self/exe
-    lea rax, [rel .ar_path1]
+    ; Attempt 1: /home/geir/bin/tile (symlink → fresh on-disk binary)
+    lea rax, [rel .ar_path3]
     mov [rsp], rax
     mov rax, SYS_EXECVE
-    lea rdi, [rel .ar_path1]
+    lea rdi, [rel .ar_path3]
     mov rsi, rsp
     mov rdx, [envp]
     syscall
-    ; Attempt 2: saved argv[0]
+    ; Attempt 2: saved argv[0] (whatever path tile was originally launched as)
     mov rax, [argv0]
     test rax, rax
-    jz .ar_try_path3
+    jz .ar_try_proc_self
     mov [rsp], rax
     mov rax, SYS_EXECVE
     mov rdi, [argv0]
     mov rsi, rsp
     mov rdx, [envp]
     syscall
-.ar_try_path3:
-    ; Attempt 3: /home/geir/bin/tile (the symlink → /home/geir/bin/tile)
-    lea rax, [rel .ar_path3]
+.ar_try_proc_self:
+    ; Attempt 3: /proc/self/exe (last resort; may be a stale inode)
+    lea rax, [rel .ar_path1]
     mov [rsp], rax
     mov rax, SYS_EXECVE
-    lea rdi, [rel .ar_path3]
+    lea rdi, [rel .ar_path1]
     mov rsi, rsp
     mov rdx, [envp]
     syscall
