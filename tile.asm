@@ -3342,10 +3342,52 @@ configure_client_for_workspace:
     mov dword [rdi+20], ecx                ; w
     mov dword [rdi+24], edx                ; h
     mov dword [rdi+28], 0                  ; border-width = 0
+    ; Save w/h across x11_buffer (it clobbers caller-saved rcx/rdx).
+    ; rbx is callee-saved; we already pushed it at function entry, so
+    ; we can stash w in ebx and h via the stack.
+    push rcx                                ; save w
+    push rdx                                ; save h
     lea rsi, [tmp_buf]
     mov rdx, 32
     call x11_buffer
     inc dword [x11_seq]
+    pop rdx                                 ; restore h
+    pop rcx                                 ; restore w
+
+    ; ICCCM 4.1.5: send a synthetic ConfigureNotify so apps that don't
+    ; recheck geometry on the real ConfigureNotify (FortiClient, GTK,
+    ; Java, Electron) still update their internal size.
+    ;
+    ; SendEvent (44 bytes): opcode=25 propagate=0 length=11
+    ;   destination=window, event-mask=0 (deliver to client only),
+    ;   event-body[32] = ConfigureNotify with x/y/w/h matching the
+    ;   ConfigureWindow we just sent.
+    lea rdi, [tmp_buf]
+    mov byte [rdi+0], 25                       ; X11_SEND_EVENT
+    mov byte [rdi+1], 0                        ; propagate=False
+    mov word [rdi+2], 11                       ; length = 11 words
+    mov [rdi+4], r12d                          ; destination window
+    mov dword [rdi+8], 0                       ; event-mask = 0
+    ; ConfigureNotify event body, 32 bytes starting at +12:
+    mov byte [rdi+12], 22 | 0x80               ; event=ConfigureNotify, synthetic bit set
+    mov byte [rdi+13], 0                       ; unused
+    mov word [rdi+14], 0                       ; sequence (server fills)
+    mov [rdi+16], r12d                         ; event window
+    mov [rdi+20], r12d                         ; window
+    mov dword [rdi+24], 0                      ; above-sibling = None
+    mov word [rdi+28], r14w                    ; x
+    mov word [rdi+30], r15w                    ; y
+    mov word [rdi+32], cx                      ; width  (restored)
+    mov word [rdi+34], dx                      ; height (restored)
+    mov word [rdi+36], 0                       ; border-width
+    mov byte [rdi+38], 0                       ; override-redirect = False
+    mov byte [rdi+39], 0                       ; unused
+    mov dword [rdi+40], 0                      ; padding
+    lea rsi, [tmp_buf]
+    mov rdx, 44
+    call x11_buffer
+    inc dword [x11_seq]
+
     pop r15
     pop r14
     pop r13
