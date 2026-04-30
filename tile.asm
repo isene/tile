@@ -2497,6 +2497,8 @@ event_loop:
     call is_transient_window
     test eax, eax
     jz .ev_mr_not_transient
+    cmp eax, 2
+    je .ev_mr_menu
     ; Map the dialog at whatever geometry the app asked for.
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_MAP_WINDOW
@@ -2539,6 +2541,32 @@ event_loop:
     ; session locks until SIGKILL or Ctrl+Alt+Backspace.
     mov eax, [x11_read_buf + 8]
     call set_input_focus
+    call x11_flush
+    jmp event_loop
+.ev_mr_menu:
+    ; POPUP_MENU / DROPDOWN_MENU / MENU / TOOLTIP / NOTIFICATION:
+    ; Just MapWindow and let the app/X server stack it. NO ConfigureWindow
+    ; raise (the X server already stacks override-redirect-style menus
+    ; correctly; for non-OR popups, GTK/Electron set their own stacking
+    ; via _NET_WM_STATE_ABOVE before mapping). NO SetInputFocus —
+    ; Chromium / Electron native context menus dismiss the moment the
+    ; parent window receives FocusOut, and tile shifting focus to the
+    ; popup is exactly what triggers that. Slack right-click spell-check
+    ; was the trigger case: popup flashed for ~1 frame and vanished.
+    ;
+    ; Don't record transient_focused_xid either — its purpose is to
+    ; restore parent focus on dismissal, but we never stole focus, so
+    ; there is nothing to restore.
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_MAP_WINDOW
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov eax, [x11_read_buf + 8]
+    mov [rdi+4], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    call x11_buffer
+    inc dword [x11_seq]
     call x11_flush
     jmp event_loop
 .ev_mr_not_transient:
@@ -4986,13 +5014,19 @@ read_wm_class:
     pop rbx
     ret
 
-; rdi = window XID. Returns rax=1 if the window should NOT be tiled —
-; i.e. it's a transient (WM_TRANSIENT_FOR) OR has an EWMH window-type
-; that signifies a floating role (DIALOG, UTILITY, TOOLBAR, SPLASH,
-; MENU, POPUP_MENU, DROPDOWN_MENU, NOTIFICATION, TOOLTIP). Apps split
-; roughly 50/50 between the two conventions: GTK/Qt apps like Gimp
-; use _NET_WM_WINDOW_TYPE_UTILITY for tool palettes; xterm-style
-; apps use WM_TRANSIENT_FOR for dialogs. We honour both.
+; rdi = window XID. Returns:
+;   rax = 0  → tile this window normally
+;   rax = 1  → MODAL float: WM_TRANSIENT_FOR, DIALOG, UTILITY, TOOLBAR,
+;              SPLASH. Map + raise + hand keyboard focus to it (GTK
+;              FileChooser, Gimp save-changes prompt, etc. need this).
+;   rax = 2  → MENU/POPOVER float: POPUP_MENU, DROPDOWN_MENU, MENU,
+;              TOOLTIP, NOTIFICATION. Map only — DO NOT raise via
+;              ConfigureWindow and DO NOT call SetInputFocus. Chromium /
+;              Electron native context menus (Slack right-click
+;              spell-check, vscode, discord) dismiss themselves the
+;              instant their parent receives FocusOut, so any focus
+;              shift = popup flashes briefly and disappears. Tooltips
+;              similarly don't want focus.
 is_transient_window:
     push rbx
     push r12
@@ -5114,15 +5148,15 @@ is_transient_window:
     cmp eax, [nwwt_splash_atom]
     je .itw_yes
     cmp eax, [nwwt_menu_atom]
-    je .itw_yes
+    je .itw_menu
     cmp eax, [nwwt_popup_atom]
-    je .itw_yes
+    je .itw_menu
     cmp eax, [nwwt_drop_atom]
-    je .itw_yes
+    je .itw_menu
     cmp eax, [nwwt_notif_atom]
-    je .itw_yes
+    je .itw_menu
     cmp eax, [nwwt_tooltip_atom]
-    je .itw_yes
+    je .itw_menu
     jmp .itw_match_loop
 
 .itw_no_pop1:
@@ -5134,6 +5168,11 @@ is_transient_window:
     ret
 .itw_yes:
     mov eax, 1
+    pop r12
+    pop rbx
+    ret
+.itw_menu:
+    mov eax, 2
     pop r12
     pop rbx
     ret
