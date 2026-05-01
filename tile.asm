@@ -2753,6 +2753,10 @@ event_loop:
     jnz event_loop
     mov eax, [x11_read_buf + 8]
     call client_closed
+    ; XID is gone for good — purge any flicker-break ring entries so
+    ; X server reuse doesn't fast-path the next innocent client.
+    mov eax, [x11_read_buf + 8]
+    call recent_unmap_clear
     jmp event_loop
 
 .ev_key_press:
@@ -5699,6 +5703,28 @@ recent_unmap_record:
     pop rsi
     pop rdi
     pop rbx
+    ret
+
+; Clear all ring entries matching eax (XID). Called on DestroyNotify
+; to invalidate stale flicker-break entries when the X server reuses
+; an XID for a different client. Without this, a fresh process whose
+; window happens to land on a recently-destroyed XID gets fast-pathed
+; through the floating-map branch, and tile never configures it —
+; the new window stays at the previous geometry. Reproducible by
+; killing the focused glass and spawning kitty: the X server reused
+; the destroyed XID, kitty's MapRequest hit the ring, kitty mapped
+; at its default 80×24 in the upper-left corner with no resize.
+recent_unmap_clear:
+    push rcx
+    mov ecx, RECENT_UNMAP_SLOTS - 1
+.ruc2_loop:
+    cmp [recent_unmap_xids + rcx*4], eax
+    jne .ruc2_skip
+    mov dword [recent_unmap_xids + rcx*4], 0
+.ruc2_skip:
+    dec ecx
+    jns .ruc2_loop
+    pop rcx
     ret
 
 ; Did this XID unmap recently? eax = XID. Returns 1 in eax if yes
