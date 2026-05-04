@@ -1356,7 +1356,7 @@ x11_connect:
     syscall
 
     ; Read connection setup reply
-    xor r12, r12
+    xor r12d, r12d
 .xc_read:
     mov rax, SYS_READ
     mov rdi, [x11_fd]
@@ -2345,8 +2345,6 @@ event_loop:
     je .ev_unmap_notify
     cmp al, EV_DESTROY_NOTIFY
     je .ev_destroy_notify
-    cmp al, EV_MAP_NOTIFY
-    je .ev_map_notify
     cmp al, EV_EXPOSE
     je .ev_expose
     ; RandR ScreenChangeNotify? Only check if RandR was successfully set
@@ -2356,7 +2354,7 @@ event_loop:
     cmp al, byte [randr_event_base]
     je .ev_rr_screen_change
 .el_unknown:
-    ; Ignore anything else (ConfigureNotify, errors, replies).
+    ; Ignore anything else (MapNotify, ConfigureNotify, errors, replies).
     jmp event_loop
 
 .ev_rr_screen_change:
@@ -2759,88 +2757,6 @@ event_loop:
     ; X server reuse doesn't fast-path the next innocent client.
     mov eax, [x11_read_buf + 8]
     call recent_unmap_clear
-    jmp event_loop
-
-.ev_map_notify:
-    ; Rescue path for top-level windows that mapped without going
-    ; through MapRequest (firefox crash-restore from a -no-remote
-    ; instance, override-redirect→False transitions, second-X-client
-    ; oddities). Symptom without this branch: such a window renders
-    ; on every empty workspace because tile never tracked it and so
-    ; never unmaps it on workspace switch. User has to Mod4+Shift+x
-    ; (restart → adopt_existing_windows) to recover.
-    ;
-    ; MapNotify layout: window CARD32 @+8, override-redirect BOOL @+12.
-    mov r12d, [x11_read_buf + 8]
-    cmp byte [x11_read_buf + 12], 0
-    jne event_loop                        ; override-redirect — panels, popups, rofi
-    cmp r12d, [bar_window_id]
-    je event_loop                         ; our own bar window
-    mov eax, r12d
-    call find_client_index
-    cmp eax, -1
-    jne event_loop                        ; already tracked: normal MapRequest path,
-                                          ; or workspace-switch SendMapWindow echo
-
-    ; Geometry filter mirrors adopt_existing_windows: drop sub-100px
-    ; client-leader / IPC helper windows (firefox / GTK create 1x1 and
-    ; 10x10 root children that aren't real toplevels).
-    call x11_flush
-    lea rdi, [tmp_buf]
-    mov byte [rdi], X11_GET_GEOMETRY
-    mov byte [rdi+1], 0
-    mov word [rdi+2], 2
-    mov [rdi+4], r12d
-    mov rax, SYS_WRITE
-    mov rdi, [x11_fd]
-    lea rsi, [tmp_buf]
-    mov rdx, 8
-    syscall
-    inc dword [x11_seq]
-    lea rdi, [tmp_buf + 64]
-    call read_reply_or_queue
-    test rax, rax
-    jz event_loop                         ; window died or reply timeout
-    movzx eax, word [tmp_buf + 64 + 16]
-    cmp eax, 100
-    jl event_loop
-    movzx eax, word [tmp_buf + 64 + 18]
-    cmp eax, 100
-    jl event_loop
-
-    ; Adopt — same sequence as adopt_existing_windows .aew_mapped path.
-    mov edi, r12d
-    call apply_assign
-    mov [pending_assign_ws], al
-    mov eax, r12d
-    call track_client
-    mov byte [pending_assign_ws], 0
-    mov edi, r12d
-    call apply_stash_on_map
-    test eax, eax
-    jnz event_loop                        ; matched stash-on-map — done
-
-    ; Make adopted window the active tab if its workspace has none yet.
-    ; Without this, TABBED layout sees ws_active_xid=0 and unmaps every
-    ; client on that workspace.
-    mov eax, r12d
-    call find_client_index
-    cmp eax, -1
-    je .ev_mn_relayout
-    movzx ebx, byte [client_ws + rax]
-    test ebx, ebx
-    jz .ev_mn_relayout
-    cmp ebx, WS_COUNT
-    jg .ev_mn_relayout
-    dec ebx
-    cmp dword [ws_active_xid + rbx*4], 0
-    jne .ev_mn_relayout
-    mov [ws_active_xid + rbx*4], r12d
-.ev_mn_relayout:
-    movzx eax, byte [current_ws]
-    call apply_workspace_layout
-    call render_bar
-    call x11_flush
     jmp event_loop
 
 .ev_key_press:
@@ -4370,7 +4286,7 @@ xinerama_query_screens:
     jz .xqs_fail
 
     ; Read screen-info bytes into x11_read_buf + 32
-    xor r12, r12
+    xor r12d, r12d
 .xqs_read:
     cmp r12, rdx
     jge .xqs_parse
@@ -4623,7 +4539,7 @@ rediscover_outputs:
     jz .rdo_done
 
     ; Drain the reply data (no events interleave inside a reply payload).
-    xor r14, r14
+    xor r14d, r14d
 .rdo_read:
     cmp r14, rdx
     jge .rdo_parse
@@ -7889,7 +7805,7 @@ read_tpgid:
     ; The comm field is parenthesised and may itself contain '(' / ')'.
     lea rbx, [tmp_buf + 2048]
     mov rcx, r13
-    xor rdi, rdi                          ; rdi = position of last ')' or 0
+    xor edi, edi                          ; rdi = position of last ')' or 0
 .rt_scan:
     test rcx, rcx
     jz .rt_after_scan
@@ -8239,7 +8155,7 @@ load_config:
     js .lc_defaults
     mov rbx, rax                 ; fd
 
-    xor r12, r12                 ; bytes read
+    xor r12d, r12d                 ; bytes read
 .lc_read:
     mov rax, SYS_READ
     mov rdi, rbx
@@ -9115,7 +9031,7 @@ parse_chord:
     push r13
     push r14
     mov r12, rdi                 ; current token start
-    xor r13, r13                 ; modifier accumulator
+    xor r13d, r13d                 ; modifier accumulator
     mov r14, rdi                 ; scan pointer
 .pc_scan:
     movzx eax, byte [r14]
