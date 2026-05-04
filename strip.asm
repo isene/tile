@@ -1184,7 +1184,6 @@ render_segment_sgr:
     ; Flush the run preceding this ESC.
     mov ecx, r15d
     sub ecx, ebp
-    test ecx, ecx
     jz .rss_no_flush
     mov edi, r12d
     mov esi, [font_baseline_var]
@@ -1250,7 +1249,6 @@ render_segment_sgr:
 .rss_flush_final:
     mov ecx, r15d
     sub ecx, ebp
-    test ecx, ecx
     jz .rss_done
     mov edi, r12d
     mov esi, [font_baseline_var]
@@ -3111,7 +3109,7 @@ x11_connect:
     mov rax, SYS_WRITE
     mov rdi, [x11_fd]
     syscall
-    xor r12, r12
+    xor r12d, r12d
 .xc_read:
     mov rax, SYS_READ
     mov rdi, [x11_fd]
