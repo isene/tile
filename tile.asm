@@ -249,6 +249,10 @@ wm_delete_str:    db "WM_DELETE_WINDOW"
 wm_delete_len     equ 16
 tile_shell_pid_str: db "_TILE_SHELL_PID"
 tile_shell_pid_len equ 15
+net_current_desktop_str: db "_NET_CURRENT_DESKTOP"
+net_current_desktop_len  equ $ - net_current_desktop_str
+tile_bar_state_str:      db "_TILE_BAR_STATE"
+tile_bar_state_len       equ $ - tile_bar_state_str
 net_active_window_str: db "_NET_ACTIVE_WINDOW"
 net_active_window_len equ 18
 
@@ -808,6 +812,8 @@ wm_protocols_atom:   resd 1
 wm_delete_atom:      resd 1
 tile_shell_pid_atom: resd 1
 net_active_window_atom: resd 1
+net_current_desktop_atom: resd 1
+tile_bar_state_atom:    resd 1
 
 ; EWMH window-type atoms (resolved at startup; 0 if unresolved means
 ; the X server has never seen the atom, which implies no window has
@@ -4859,6 +4865,16 @@ intern_wm_atoms:
     syscall
     mov eax, [x11_read_buf + 8]
     mov [net_active_window_atom], eax
+
+    ; --- _NET_CURRENT_DESKTOP + _TILE_BAR_STATE for strip ---
+    lea rdi, [net_current_desktop_str]
+    mov esi, net_current_desktop_len
+    call intern_one_atom
+    mov [net_current_desktop_atom], eax
+    lea rdi, [tile_bar_state_str]
+    mov esi, tile_bar_state_len
+    call intern_one_atom
+    mov [tile_bar_state_atom], eax
 
     ; --- EWMH window-type atoms ---
     ; Intern the property atom + the float-class type atoms in one
@@ -9831,6 +9847,12 @@ dim_color_apply:
 create_bar:
     push rbx
     push r12
+    ; bar_height = 0 → strip handles the bar entirely; skip window
+    ; creation. bar_window_id stays 0 so render_bar / map_bar are
+    ; no-ops too.
+    movzx eax, word [bar_height]
+    test eax, eax
+    je .cb_skip
     call alloc_xid
     mov [bar_window_id], eax
     mov r12d, eax                         ; window XID
@@ -9900,6 +9922,7 @@ create_bar:
     ; Map the bar window.
     mov eax, r12d
     call send_map_window
+.cb_skip:
     pop r12
     pop rbx
     ret
@@ -10211,6 +10234,141 @@ client_color_to_pixel:
     mov eax, [cfg_tab_default]
     ret
 
+; Publish bar state to root window props so strip's @workspaces
+; builtin can render the workspace pips + per-WS layout. Properties:
+;   _NET_CURRENT_DESKTOP (CARD32) = current_ws - 1 (0-indexed per ICCCM)
+;   _TILE_BAR_STATE      (CARD8 byte array, 20 bytes):
+;       bytes 0..9   = workspace_populated[0..9] (client count per WS)
+;       bytes 10..19 = ws_layout[0..9] (LAYOUT_TABBED=0, LAYOUT_SPLIT=1)
+; Skipped silently if atoms aren't interned yet (early init paths).
+publish_bar_state:
+    push rbx
+    push r12
+    mov eax, [net_current_desktop_atom]
+    test eax, eax
+    jz .pbs_done
+
+    ; ChangeProperty(root, _NET_CURRENT_DESKTOP, type=CARDINAL=6,
+    ;                format=32, mode=Replace, data=current_ws-1).
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_PROPERTY
+    mov byte [rdi+1], 0                    ; mode = Replace
+    mov word [rdi+2], 7                    ; length = 6 base + 1 value word
+    mov ebx, [x11_root_window]
+    mov [rdi+4], ebx
+    mov [rdi+8], eax                       ; property atom
+    mov dword [rdi+12], 6                  ; type = CARDINAL
+    mov byte [rdi+16], 32                  ; format = 32
+    mov byte [rdi+17], 0
+    mov byte [rdi+18], 0
+    mov byte [rdi+19], 0
+    mov dword [rdi+20], 1                  ; value-length (32-bit units)
+    movzx eax, byte [current_ws]
+    test eax, eax
+    jz .pbs_zero_idx
+    dec eax                                ; 1-based → 0-based
+.pbs_zero_idx:
+    mov [rdi+24], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 28
+    call x11_buffer
+    inc dword [x11_seq]
+
+    ; ChangeProperty(root, _TILE_BAR_STATE, type=CARDINAL, format=8,
+    ;                length=20, data=populated[0..9]||layout[0..9]).
+    mov eax, [tile_bar_state_atom]
+    test eax, eax
+    jz .pbs_done
+
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_PROPERTY
+    mov byte [rdi+1], 0
+    ; Property layout: 22 bytes (CARD8 array, format=8):
+    ;   bytes 0..9   = workspace_populated[0..9]
+    ;   bytes 10..19 = ws_layout[0..9]
+    ;   byte  20     = tab_count on current_ws (= workspace_populated[current-1])
+    ;   byte  21     = tab_index of active tab on current_ws (1-based, 0=none)
+    ; 22 data bytes pad to 24 bytes wire = 6 words. + 6 base words = 12 words.
+    mov word [rdi+2], 12
+    mov [rdi+4], ebx                       ; root window
+    mov [rdi+8], eax                       ; property atom
+    mov dword [rdi+12], 6                  ; type = CARDINAL
+    mov byte [rdi+16], 8                   ; format = 8 (byte array)
+    mov byte [rdi+17], 0
+    mov byte [rdi+18], 0
+    mov byte [rdi+19], 0
+    mov dword [rdi+20], 22                 ; value-length (bytes)
+    ; Copy 10 bytes of populated counts.
+    xor ecx, ecx
+.pbs_pop_loop:
+    cmp ecx, WS_COUNT
+    jge .pbs_pop_done
+    movzx eax, byte [workspace_populated + rcx]
+    mov [rdi + 24 + rcx], al
+    inc ecx
+    jmp .pbs_pop_loop
+.pbs_pop_done:
+    ; Copy 10 bytes of layout flags.
+    xor ecx, ecx
+.pbs_lay_loop:
+    cmp ecx, WS_COUNT
+    jge .pbs_lay_done
+    movzx eax, byte [ws_layout + rcx]
+    mov [rdi + 34 + rcx], al
+    inc ecx
+    jmp .pbs_lay_loop
+.pbs_lay_done:
+    ; Tab count on current_ws (byte 20).
+    movzx ecx, byte [current_ws]
+    test ecx, ecx
+    jz .pbs_no_current
+    cmp ecx, WS_COUNT
+    ja .pbs_no_current
+    movzx eax, byte [workspace_populated + rcx - 1]
+    mov [rdi + 44], al
+    ; Tab index = position of ws_active_xid[current_ws-1] among
+    ; client_xids[] entries with client_ws == current_ws (1-based).
+    mov eax, [ws_active_xid + rcx*4 - 4]
+    test eax, eax
+    jz .pbs_no_active
+    mov r10d, eax                          ; needle = active xid
+    movzx r11d, cl                         ; ws (1-based)
+    xor edx, edx                           ; counter
+    xor ecx, ecx                           ; client iterator
+.pbs_idx_loop:
+    cmp ecx, [client_count]
+    jge .pbs_idx_done
+    movzx eax, byte [client_ws + rcx]
+    cmp eax, r11d
+    jne .pbs_idx_next
+    inc edx                                ; this is the Nth client on current_ws
+    cmp [client_xids + rcx*4], r10d
+    je .pbs_idx_have
+.pbs_idx_next:
+    inc ecx
+    jmp .pbs_idx_loop
+.pbs_idx_have:
+    mov [rdi + 45], dl
+    jmp .pbs_send
+.pbs_idx_done:
+.pbs_no_active:
+    mov byte [rdi + 45], 0
+    jmp .pbs_send
+.pbs_no_current:
+    mov byte [rdi + 44], 0
+    mov byte [rdi + 45], 0
+.pbs_send:
+    ; Pad bytes 22..23 with zero (X11 properties are word-aligned).
+    mov word [rdi + 46], 0
+    lea rsi, [tmp_buf]
+    mov rdx, 48                            ; 24 base + 24 padded data
+    call x11_buffer
+    inc dword [x11_seq]
+.pbs_done:
+    pop r12
+    pop rbx
+    ret
+
 ; Render the entire bar: clear, draw workspace squares, gap, tab squares.
 render_bar:
     push rbx
@@ -10218,8 +10376,15 @@ render_bar:
     push r13
     push r14
     push r15
+    ; Publish bar state to root for strip's @workspaces builtin. Done
+    ; on every render_bar call so strip stays in sync regardless of
+    ; whether tile is also drawing the bar locally (bar_height > 0).
+    call publish_bar_state
     cmp dword [bar_window_id], 0
     je .rb_done                           ; bar not created yet
+    movzx eax, word [bar_height]
+    test eax, eax
+    je .rb_done                           ; bar_height = 0 → strip handles it
 
     ; Clear the whole bar with bar_bg.
     mov eax, [cfg_bar_bg]
