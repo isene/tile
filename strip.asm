@@ -466,6 +466,17 @@ main_loop:
 
     call drain_ready_fds
     call refresh_due_segments
+    ; Always pull root property state once per poll wake. PropertyNotify-
+    ; driven refetch alone misses updates that arrive while strip is in a
+    ; sync GetProperty round-trip (the discarded events are lost), and
+    ; subsequent property changes from the same publisher land at the
+    ; server but never fire a fresh wake-up because their PropertyNotify
+    ; was eaten. Pulling here is cheap (2 sync round-trips per poll wake,
+    ; ~0.3ms) and the indicator stays in sync without polling on a timer.
+    cmp dword [ws_seg_idx], -1
+    je .ml_no_ws_pull
+    call ws_refetch_state
+.ml_no_ws_pull:
     call render_strip
     jmp main_loop
 
@@ -619,33 +630,23 @@ drain_ready_fds:
     je .drf_x11_property
     jmp .drf_next
 .drf_x11_property:
-    ; PropertyNotify: window @ +4, atom @ +8.
+    ; PropertyNotify: window @ +4. Any property change on root is a
+    ; hint to refetch BOTH @wintitle and @workspaces state. The
+    ; atom-specific dispatch we used previously was unreliable
+    ; because each handler's sync GetProperty discards subsequent
+    ; X events from the queue — including PropertyNotify for atoms
+    ; we'd otherwise dispatch on. Refetching both unconditionally
+    ; costs 2-4 extra syscalls per root PropertyNotify and removes
+    ; the whole class of "stale after WS switch / focus change" bugs.
     mov eax, [x11_read_buf + 4]           ; window
     cmp eax, [x11_root_window]
     jne .drf_prop_check_active
-    ; Root property changed. Sync GetProperty inside the handlers
-    ; discards X events queued behind the current one — to stay
-    ; consistent we refresh BOTH @wintitle (on active-window change)
-    ; AND @workspaces (on any of the three watched atoms). Costs
-    ; 2-4 extra syscalls per focus change.
-    mov ecx, [x11_read_buf + 8]           ; atom
     cmp dword [wt_seg_idx], -1
     je .drf_prop_no_wt
-    cmp ecx, [wt_atom_net_active]
-    jne .drf_prop_no_wt
     call wt_on_active_changed
 .drf_prop_no_wt:
     cmp dword [ws_seg_idx], -1
     je .drf_next
-    ; Re-read the atom — wt_on_active_changed clobbered ecx.
-    mov ecx, [x11_read_buf + 8]
-    cmp ecx, [wt_atom_net_active]
-    je .drf_prop_ws_refresh
-    cmp ecx, [ws_atom_current]
-    je .drf_prop_ws_refresh
-    cmp ecx, [ws_atom_state]
-    jne .drf_next
-.drf_prop_ws_refresh:
     call ws_refetch_state
     jmp .drf_next
 .drf_prop_check_active:
@@ -653,6 +654,9 @@ drain_ready_fds:
     je .drf_next                          ; @wintitle not configured
     cmp eax, [wt_active_xid]
     jne .drf_next
+    mov ecx, [x11_read_buf + 8]           ; load atom (the root branch
+                                           ; loaded it AFTER the root
+                                           ; check, so ecx is unset here).
     cmp ecx, [wt_atom_net_wm_name]
     je .drf_prop_refetch
     cmp ecx, ATOM_WM_NAME

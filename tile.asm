@@ -150,7 +150,6 @@
 %define ACT_MOVE_TO     5
 %define ACT_FOCUS       6
 %define ACT_MOVE_TAB    7
-%define ACT_TAB_COLOR   8
 %define ACT_STASH       9
 %define ACT_UNSTASH     10
 %define ACT_LAYOUT      11
@@ -426,8 +425,6 @@ action_table:
     db ACT_FOCUS, 0
     db "move-tab", 0
     db ACT_MOVE_TAB, 0
-    db "tab-color-cycle", 0
-    db ACT_TAB_COLOR, 0
     db "stash", 0
     db ACT_STASH, 0
     db "unstash", 0
@@ -584,6 +581,15 @@ cfg_ws_dim_factor:       resb 1
 assign_class:            resw MAX_ASSIGNS
 assign_ws:               resb MAX_ASSIGNS
 assign_count:            resd 1
+
+; `skip <class>` rules — windows whose WM_CLASS matches are MapWindow'd
+; so the app sees its own window appear, but never tracked by tile.
+; They don't show in the strip, don't get configured for a workspace,
+; don't take a tab slot. Used for clipboard helpers (CopyQ), tray
+; previews, and similar that need a top-level but shouldn't tile.
+%define MAX_SKIPS 16
+skip_class:              resw MAX_SKIPS
+skip_count:              resd 1
 
 ; Per-class stash-on-map list. Same shape as assign_*, but no ws
 ; payload: any new client whose class matches this list is immediately
@@ -1982,14 +1988,19 @@ adopt_existing_windows:
 
     ; Unmapped + non-trivial size — preserve the window across restart so
     ; the user doesn't lose work. Routing priority:
-    ;   1. assign rule by WM_CLASS  → matched workspace
-    ;   2. stash-on-map by WM_CLASS → push to stash_xids (no track)
-    ;   3. fallback                 → track on current_ws as a tab the
+    ;   1. skip rule by WM_CLASS    → don't track (just leaves it alone)
+    ;   2. assign rule by WM_CLASS  → matched workspace
+    ;   3. stash-on-map by WM_CLASS → push to stash_xids (no track)
+    ;   4. fallback                 → track on current_ws as a tab the
     ;      user can manually move (Mod4+Shift+1..0). Better than dropping
     ;      the window: it stays alive, just lives on the wrong ws until
     ;      the user reshuffles. Without this fallback, every glass /
     ;      Pointer / Kastrup instance on a hidden workspace at restart
     ;      time would silently disappear from tile's tab strip.
+    mov edi, r13d
+    call apply_skip
+    test eax, eax
+    jnz .aew_next                          ; skipped — leave alone
     xor ebx, ebx                          ; ebx = pending_assign_ws (0 = current_ws)
     cmp dword [assign_count], 0
     je .aew_um_try_stash
@@ -2060,7 +2071,12 @@ adopt_existing_windows:
     jmp .aew_next
 
 .aew_mapped:
-    ; Viewable: adopt as a regular tracked client.
+    ; Viewable: adopt as a regular tracked client. Skip-class rule
+    ; takes priority — we leave the window mapped but untracked.
+    mov edi, r13d
+    call apply_skip
+    test eax, eax
+    jnz .aew_next                          ; skipped — leave mapped, no track
     mov edi, r13d
     call apply_assign
     mov [pending_assign_ws], al
@@ -2400,6 +2416,30 @@ event_loop:
     ; Debug: log map-req arrival with the XID
     mov eax, [x11_read_buf + 8]
     call dbg_log_mapreq
+    ; Already-tracked check: if this XID is already in client_xids[],
+    ; this is a re-map of an existing client (e.g. GIMP's first-run
+    ; plug-in scan unmaps its splash and remaps the main window
+    ; minutes later, after the recent_unmap ring has expired). Skip
+    ; track_client and just send MapWindow — the client is already
+    ; bound to its workspace and will get re-tiled on the next layout
+    ; pass.
+    mov eax, [x11_read_buf + 8]
+    call find_client_index
+    cmp eax, -1
+    je .ev_mr_not_tracked
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_MAP_WINDOW
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov eax, [x11_read_buf + 8]
+    mov [rdi+4], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    call x11_buffer
+    inc dword [x11_seq]
+    call x11_flush
+    jmp event_loop
+.ev_mr_not_tracked:
     ; Flicker break: if this XID unmapped within the last
     ; RECENT_UNMAP_WINDOW_MS (1.5 s), treat the new map as floating.
     ; This catches windows whose own geometry hints fight tile's
@@ -2584,6 +2624,28 @@ event_loop:
     call x11_flush
     jmp event_loop
 .ev_mr_not_transient:
+    ; Skip rule: if WM_CLASS matches a `skip <class>` line, just send
+    ; MapWindow so the app's surface appears, but never track. CopyQ's
+    ; clipboard preview is the motivating case — top-level normal
+    ; window, full-size, that we don't want in the tab strip.
+    mov edi, [x11_read_buf + 8]
+    call apply_skip
+    test eax, eax
+    jz .ev_mr_no_skip
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_MAP_WINDOW
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov eax, [x11_read_buf + 8]
+    mov [rdi+4], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    call x11_buffer
+    inc dword [x11_seq]
+    call x11_flush
+    jmp event_loop
+.ev_mr_no_skip:
+
     ; New client. Two optional config-driven detours before the default
     ; "land on current workspace, become active tab" path:
     ;   1. `assign <class> <ws>`   → route to <ws> instead of current
@@ -4005,6 +4067,12 @@ untrack_client:
     jmp .uc_shift
 .uc_dec:
     dec dword [client_count]
+    ; Restart the scan in case the same XID has more than one slot
+    ; (defensive against the duplicate-track bug from GIMP first-run
+    ; plug-in scans before the ev_map_request "already tracked" fix
+    ; was in place — leftover ghost entries can persist across reload).
+    xor ebx, ebx
+    jmp .uc_find
 .uc_done:
     pop r12
     pop rbx
@@ -4093,6 +4161,52 @@ find_client_index:
 ; eax = window XID. UnmapWindow request. Preserves rax across the
 ; x11_buffer call (see send_map_window comment).
 send_unmap_window:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    mov r10d, eax
+    lea rdi, [dkp_buf]
+    mov byte [rdi+0], 't'
+    mov byte [rdi+1], 'i'
+    mov byte [rdi+2], 'l'
+    mov byte [rdi+3], 'e'
+    mov byte [rdi+4], ':'
+    mov byte [rdi+5], ' '
+    mov byte [rdi+6], 'u'
+    mov byte [rdi+7], 'n'
+    mov byte [rdi+8], 'm'
+    mov byte [rdi+9], ' '
+    mov byte [rdi+10], 'x'
+    mov byte [rdi+11], 'i'
+    mov byte [rdi+12], 'd'
+    mov byte [rdi+13], '='
+    add rdi, 14
+    mov eax, r10d
+    call dbg_u32_dec
+    mov byte [rdi], 10
+    inc rdi
+    lea rsi, [dkp_buf]
+    mov rdx, rdi
+    sub rdx, rsi
+    mov rax, SYS_WRITE
+    mov edi, 2
+    syscall
+    call log_write_buf
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
     push rax
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_UNMAP_WINDOW
@@ -5169,7 +5283,7 @@ is_transient_window:
     ; Skipped if startup atom-intern failed for some reason.
     mov eax, [nwwt_atom]
     test eax, eax
-    jz .itw_no
+    jz .itw_try_fixed_size
     call x11_flush
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_GET_PROPERTY
@@ -5190,12 +5304,12 @@ is_transient_window:
     lea rdi, [nwwt_reply_buf]
     call read_reply_or_queue
     test eax, eax
-    jz .itw_no
+    jz .itw_try_fixed_size
     ; value-length is in format units; format=32 for XA_ATOM, so multiply
     ; by 4 to get bytes. Cap at 64 bytes (16 atoms) like before.
     mov ecx, [nwwt_reply_buf + 16]         ; value-length (format units)
     test ecx, ecx
-    jz .itw_no
+    jz .itw_try_fixed_size
     shl ecx, 2                             ; format units → bytes (×4)
     cmp ecx, 64
     jbe .itw_have_len
@@ -5222,7 +5336,7 @@ is_transient_window:
     xor ebx, ebx                           ; offset
 .itw_match_loop:
     cmp ebx, ecx
-    jge .itw_no
+    jge .itw_try_fixed_size
     mov eax, [nwwt_reply_buf + 32 + rbx]
     add ebx, 4
     test eax, eax
@@ -5249,6 +5363,77 @@ is_transient_window:
 
 .itw_no_pop1:
     pop rcx
+.itw_try_fixed_size:
+    ; --- Pass 3: WM_NORMAL_HINTS — fixed-size hint (PMinSize & PMaxSize
+    ; both set, with min_w==max_w and min_h==max_h). Apps that pin
+    ; themselves to a single size (Discord Updater 300×350, some
+    ; preference panels, etc.) are popups even when WM_TRANSIENT_FOR is
+    ; unset and _NET_WM_WINDOW_TYPE is NORMAL. Force-tiling them to full
+    ; workspace size leaves them invisible because the app refuses to
+    ; resize past its hint and instead just stays at its requested
+    ; geometry, often offscreen relative to the maximised tile.
+    call x11_flush
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_GET_PROPERTY
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 6
+    mov [rdi+4], r12d
+    mov dword [rdi+8], 40                  ; XA_WM_NORMAL_HINTS
+    mov dword [rdi+12], 41                 ; XA_WM_SIZE_HINTS
+    mov dword [rdi+16], 0
+    mov dword [rdi+20], 18                 ; up to 18 CARD32 (72 bytes)
+    mov rdx, 24
+    lea rsi, [tmp_buf]
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    inc dword [x11_seq]
+
+    lea rdi, [tmp_buf + 64]
+    call read_reply_or_queue
+    test eax, eax
+    jz .itw_no
+    mov eax, [tmp_buf + 64 + 16]           ; value-length (format units, 32-bit words)
+    cmp eax, 18
+    jb .itw_no                             ; need full size_hints (legacy + min/max)
+    ; Drain 72 bytes of payload into [tmp_buf + 96 .. +168).
+    push r13
+    mov r13d, 72
+    lea rbx, [tmp_buf + 96]
+.itw_fs_read:
+    test r13d, r13d
+    jz .itw_fs_have
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    mov rsi, rbx
+    movsxd rdx, r13d
+    syscall
+    test rax, rax
+    jle .itw_fs_fail
+    add rbx, rax
+    sub r13d, eax
+    jmp .itw_fs_read
+.itw_fs_fail:
+    pop r13
+    jmp .itw_no
+.itw_fs_have:
+    pop r13
+    ; flags @ +0; PMinSize=0x10, PMaxSize=0x20.
+    mov eax, [tmp_buf + 96 + 0]
+    and eax, 0x30
+    cmp eax, 0x30
+    jne .itw_no
+    ; ICCCM SIZE_HINTS layout (CARD32 array):
+    ;   0:flags 1-4:legacy 5:min_w 6:min_h 7:max_w 8:max_h ...
+    ; Byte offsets into [tmp_buf+96]: min_w=20, min_h=24, max_w=28, max_h=32.
+    mov eax, [tmp_buf + 96 + 20]
+    cmp eax, [tmp_buf + 96 + 28]
+    jne .itw_no
+    mov eax, [tmp_buf + 96 + 24]
+    cmp eax, [tmp_buf + 96 + 32]
+    jne .itw_no
+    ; min == max in both dimensions → fixed-size dialog.
+    jmp .itw_yes
 .itw_no:
     xor eax, eax
     pop r12
@@ -5400,6 +5585,44 @@ apply_stash_on_map:
     xor eax, eax
     pop r13
     pop r12
+    pop rbx
+    ret
+
+; rdi = window XID. Returns 1 in eax if WM_CLASS matches a `skip <class>`
+; rule from ~/.tilerc, 0 otherwise. The caller should map the window
+; (let the app see its surface) but skip track_client.
+apply_skip:
+    cmp dword [skip_count], 0
+    jne .ask_have_table
+    xor eax, eax
+    ret
+.ask_have_table:
+    push rbx
+    push r13
+    call read_wm_class
+    test rax, rax
+    jz .ask_no_match
+    mov r13, rax                          ; class string ptr
+    xor ebx, ebx
+.ask_loop:
+    cmp ebx, [skip_count]
+    jge .ask_no_match
+    movzx eax, word [skip_class + rbx*2]
+    lea rsi, [arg_pool + rax]
+    mov rdi, r13
+    call str_eq
+    test eax, eax
+    jnz .ask_match
+    inc ebx
+    jmp .ask_loop
+.ask_match:
+    mov eax, 1
+    pop r13
+    pop rbx
+    ret
+.ask_no_match:
+    xor eax, eax
+    pop r13
     pop rbx
     ret
 
@@ -6172,8 +6395,6 @@ dispatch_keypress:
     je .dk_focus
     cmp eax, ACT_MOVE_TAB
     je .dk_move_tab
-    cmp eax, ACT_TAB_COLOR
-    je .dk_tab_color
     cmp eax, ACT_STASH
     je .dk_stash
     cmp eax, ACT_UNSTASH
@@ -6260,9 +6481,6 @@ dispatch_keypress:
     jne .dk_done
     mov edi, 1
     call move_tab
-    jmp .dk_done
-.dk_tab_color:
-    call tab_color_cycle
     jmp .dk_done
 .dk_stash:
     call action_stash
@@ -6930,6 +7148,46 @@ move_focused_to_workspace:
     movzx eax, byte [current_ws]
     call find_top_of_workspace
     mov r15d, eax                       ; r15 = new top of source
+
+    ; Debug: log "tile: mtw newtop=N\n" so we can see whether
+    ; find_top returned an XID or 0 when source ends up looking blank.
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    lea rdi, [dkp_buf]
+    mov dword [rdi+0], 'tile'
+    mov dword [rdi+4], ': mt'
+    mov dword [rdi+8], 'w ne'
+    mov dword [rdi+12], 'wtop'
+    mov byte  [rdi+16], '='
+    add rdi, 17
+    mov eax, r15d
+    call dbg_u32_dec
+    mov byte [rdi], 10
+    inc rdi
+    lea rsi, [dkp_buf]
+    mov rdx, rdi
+    sub rdx, rsi
+    mov rax, SYS_WRITE
+    mov edi, 2
+    syscall
+    call log_write_buf
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+
     movzx edx, byte [current_ws]
     dec edx
     mov [ws_active_xid + rdx*4], r15d
@@ -6949,17 +7207,26 @@ move_focused_to_workspace:
     movzx edi, byte [current_ws]
     cmp ecx, edi
     jne .mtw_skip_source
-    ; Unmap moving (was visible on source's output).
-    mov byte [client_unmap_expected + r12], 1
-    mov eax, ebx
-    call send_unmap_window
-    ; Map source's new top (if any) and focus it.
+    ; Source's output shows source — refresh visible tab.
+    ; Mirror set_active_tab's TABBED order: configure + map NEW first,
+    ; THEN unmap OLD. The reverse order (unmap old, then map new)
+    ; left a one-frame gap where X stacked the new window below the
+    ; visible region, presenting as "blank desktop" to the user.
     test r15d, r15d
-    jz .mtw_skip_source
+    jz .mtw_source_no_new
+    mov edi, r15d
+    movzx esi, byte [current_ws]
+    call configure_client_for_workspace
     mov eax, r15d
     call send_map_window
     mov eax, r15d
     call set_input_focus
+.mtw_source_no_new:
+    ; Now unmap the moving client. (If r15 was 0 we still need to
+    ; unmap the moving client so the workspace looks empty.)
+    mov byte [client_unmap_expected + r12], 1
+    mov eax, ebx
+    call send_unmap_window
 .mtw_skip_source:
 
     ; Refresh target's output if it shows target.
@@ -8216,6 +8483,7 @@ load_config:
     mov dword [exec_count], 0
     mov dword [assign_count], 0
     mov dword [stash_class_count], 0
+    mov dword [skip_count], 0
     mov qword [config_len], 0
     ; Reset arg_pool so repeated reloads don't leak. The bind_table and
     ; exec_list above are already empty, so no live offsets reference
@@ -8689,6 +8957,11 @@ parse_config_line:
     call .pcl_streq
     test eax, eax
     jnz .pcl_handle_stash_on_map
+    mov rdi, r13
+    lea rsi, [.pcl_kw_skip]
+    call .pcl_streq
+    test eax, eax
+    jnz .pcl_handle_skip
     ; bar / palette settings (key = value)
     call .pcl_skip_ws
     cmp byte [r12], '='
@@ -9046,6 +9319,27 @@ parse_config_line:
     mov byte [cfg_line_recognized], 1
     jmp .pcl_done
 
+.pcl_handle_skip:
+    ; "skip <class>"  — register a WM_CLASS that should never get
+    ; tracked. Window will be mapped (so the app sees its surface)
+    ; but tile won't manage it, configure it, or include it in the
+    ; tab strip. Class string copied into arg_pool.
+    call .pcl_skip_ws
+    mov al, [r12]
+    test al, al
+    je .pcl_done
+    mov rdi, r12
+    call arg_pool_dup
+    test eax, eax
+    jz .pcl_done
+    mov ecx, [skip_count]
+    cmp ecx, MAX_SKIPS
+    jge .pcl_done
+    mov [skip_class + rcx*2], ax
+    inc dword [skip_count]
+    mov byte [cfg_line_recognized], 1
+    jmp .pcl_done
+
 .pcl_blank_or_comment:
     mov byte [cfg_line_recognized], 1
     ; fall through to .pcl_done
@@ -9099,6 +9393,7 @@ parse_config_line:
 .pcl_kw_pin:  db "pin", 0
 .pcl_kw_assign: db "assign", 0
 .pcl_kw_stash_on_map: db "stash-on-map", 0
+.pcl_kw_skip:    db "skip", 0
 
 ; rdi = chord string, e.g. "Mod4+Shift+Return".
 ; Tokens are split by '+'; the chord ends at the first whitespace or NUL.
@@ -10701,33 +10996,6 @@ action_unstash:
 ; Bump the focused tab's colour to the next palette index. Wraps around
 ; back to 0 (= default colour) after the last palette entry, so a tab
 ; cycles default → palette[0] → palette[1] → ... → default.
-tab_color_cycle:
-    push rbx
-    movzx eax, byte [current_ws]
-    test eax, eax
-    jz .tcc_done
-    dec eax
-    mov ebx, [ws_active_xid + rax*4]
-    test ebx, ebx
-    jz .tcc_done
-    mov eax, ebx
-    call find_client_index
-    cmp eax, -1
-    je .tcc_done
-    movzx ecx, byte [client_color + rax]
-    inc ecx
-    movzx edx, byte [cfg_tab_palette_count]
-    cmp ecx, edx
-    jbe .tcc_store
-    xor ecx, ecx                          ; wrap to default
-.tcc_store:
-    mov [client_color + rax], cl
-    call render_bar
-    call x11_flush
-.tcc_done:
-    pop rbx
-    ret
-
 ; ══════════════════════════════════════════════════════════════════════
 ; Utility: integer → ASCII. rax = unsigned value, rdi = buffer.
 ; On return: rdi is advanced past the last digit written, rax = digit count.
