@@ -200,14 +200,16 @@ sgr_palette:
     dd 0xFFFFA500        ; 35 ORANGE (was magenta — repurposed for
                          ;          @workspaces active marker)
     dd 0xFF00CCCC        ; 36 cyan
-    dd 0xFFCCCCCC        ; 37 white
-    dd 0xFF555555        ; 90 bright black (dim grey)
+    dd 0xFFAAAAAA        ; 37 "white" — repurposed to #AAAAAA for the
+                         ; @workspaces populated pip + inactive tab bullet
+    dd 0xFF555555        ; 90 bright black (dim grey) — empty WS pip
     dd 0xFFFF5555        ; 91 bright red
     dd 0xFF55FF55        ; 92 bright green
     dd 0xFFFFFF55        ; 93 bright yellow
     dd 0xFF5555FF        ; 94 bright blue
     dd 0xFFFFA500        ; 95 ORANGE (bright variant — same as 35)
-    dd 0xFF55FFFF        ; 96 bright cyan
+    dd 0xFF777777        ; 96 "bright cyan" — repurposed to #777777 for
+                         ; the @workspaces layout glyph
     dd 0xFFFFFFFF        ; 97 bright white
 
 ; ══════════════════════════════════════════════════════════════════════
@@ -466,17 +468,6 @@ main_loop:
 
     call drain_ready_fds
     call refresh_due_segments
-    ; Always pull root property state once per poll wake. PropertyNotify-
-    ; driven refetch alone misses updates that arrive while strip is in a
-    ; sync GetProperty round-trip (the discarded events are lost), and
-    ; subsequent property changes from the same publisher land at the
-    ; server but never fire a fresh wake-up because their PropertyNotify
-    ; was eaten. Pulling here is cheap (2 sync round-trips per poll wake,
-    ; ~0.3ms) and the indicator stays in sync without polling on a timer.
-    cmp dword [ws_seg_idx], -1
-    je .ml_no_ws_pull
-    call ws_refetch_state
-.ml_no_ws_pull:
     call render_strip
     jmp main_loop
 
@@ -4559,12 +4550,14 @@ ws_publish_segment:
     jz .wps2_finalize
     cmp eax, WS_COUNT
     ja .wps2_finalize
-    ; ' '  ESC [ 9 0 m  <layout>  — bright black = dim grey for layout
+    ; ' '  ESC [ 9 6 m  <layout>  — palette slot 96 repurposed to
+    ; #777777 (medium grey) so the layout glyph reads as distinct from
+    ; the empty WS pip (SGR 90 = #555555).
     mov byte [rdi+0], ' '
     mov byte [rdi+1], 0x1b
     mov byte [rdi+2], '['
     mov byte [rdi+3], '9'
-    mov byte [rdi+4], '0'
+    mov byte [rdi+4], '6'
     mov byte [rdi+5], 'm'
     add rdi, 6
     mov ecx, eax
