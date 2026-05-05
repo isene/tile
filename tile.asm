@@ -778,6 +778,14 @@ client_xids:             resd MAX_CLIENTS
 ;                               treated as the client closing.
 client_ws:               resb MAX_CLIENTS
 client_unmap_expected:   resb MAX_CLIENTS
+; Last w/h sent to this client via configure_client_for_workspace.
+; Used to gate the synthetic ConfigureNotify (ICCCM 4.1.5) so we only
+; emit it when geometry actually changes. Same-size re-configures from
+; workspace switches / tab selection no longer fire a synthetic CN —
+; firefox in particular interprets a storm of same-size synthetic CNs
+; as a resize storm and collapses its tab strip.
+client_last_w:           resw MAX_CLIENTS
+client_last_h:           resw MAX_CLIENTS
 client_count:            resd 1
 
 ; Workspace state.
@@ -3375,8 +3383,6 @@ configure_client_for_workspace:
     mov dword [rdi+24], edx                ; h
     mov dword [rdi+28], 0                  ; border-width = 0
     ; Save w/h across x11_buffer (it clobbers caller-saved rcx/rdx).
-    ; rbx is callee-saved; we already pushed it at function entry, so
-    ; we can stash w in ebx and h via the stack.
     push rcx                                ; save w
     push rdx                                ; save h
     lea rsi, [tmp_buf]
@@ -3386,39 +3392,62 @@ configure_client_for_workspace:
     pop rdx                                 ; restore h
     pop rcx                                 ; restore w
 
-    ; ICCCM 4.1.5: send a synthetic ConfigureNotify so apps that don't
-    ; recheck geometry on the real ConfigureNotify (FortiClient, GTK,
-    ; Java, Electron) still update their internal size.
-    ;
-    ; SendEvent (44 bytes): opcode=25 propagate=0 length=11
-    ;   destination=window, event-mask=0 (deliver to client only),
-    ;   event-body[32] = ConfigureNotify with x/y/w/h matching the
-    ;   ConfigureWindow we just sent.
+    ; Synthetic ConfigureNotify (ICCCM 4.1.5) — gated on actual size
+    ; change. Some toolkits (FortiClient, some GTK apps, Java, Electron)
+    ; only re-read geometry when they see a synthetic CN. Sending one
+    ; on every configure_client_for_workspace call (workspace switch,
+    ; tab selection, restack) made firefox interpret the stream as a
+    ; resize storm and collapse its tab strip. Now: scan client_xids
+    ; for r12d, compare new w/h against client_last_w/h, emit synthetic
+    ; CN only if changed. First configure (slot zero-init) counts as
+    ; a change so initial nudge still happens.
+    xor eax, eax
+    cmp eax, [client_count]
+    jge .ccfw_no_syncn                      ; no tracked clients
+.ccfw_find_loop:
+    cmp [client_xids + rax*4], r12d
+    je .ccfw_check_size
+    inc eax
+    cmp eax, [client_count]
+    jl .ccfw_find_loop
+    jmp .ccfw_no_syncn                      ; XID not tracked (transient)
+.ccfw_check_size:
+    movzx esi, word [client_last_w + rax*2]
+    cmp esi, ecx
+    jne .ccfw_size_changed
+    movzx esi, word [client_last_h + rax*2]
+    cmp esi, edx
+    je .ccfw_no_syncn                       ; unchanged → skip nudge
+.ccfw_size_changed:
+    mov [client_last_w + rax*2], cx
+    mov [client_last_h + rax*2], dx
+
+    ; SendEvent (44 bytes): synthetic ConfigureNotify with current x/y/w/h.
     lea rdi, [tmp_buf]
     mov byte [rdi+0], 25                       ; X11_SEND_EVENT
     mov byte [rdi+1], 0                        ; propagate=False
     mov word [rdi+2], 11                       ; length = 11 words
     mov [rdi+4], r12d                          ; destination window
     mov dword [rdi+8], 0                       ; event-mask = 0
-    ; ConfigureNotify event body, 32 bytes starting at +12:
-    mov byte [rdi+12], 22 | 0x80               ; event=ConfigureNotify, synthetic bit set
-    mov byte [rdi+13], 0                       ; unused
-    mov word [rdi+14], 0                       ; sequence (server fills)
+    mov byte [rdi+12], 22 | 0x80               ; ConfigureNotify | synthetic
+    mov byte [rdi+13], 0
+    mov word [rdi+14], 0
     mov [rdi+16], r12d                         ; event window
     mov [rdi+20], r12d                         ; window
     mov dword [rdi+24], 0                      ; above-sibling = None
     mov word [rdi+28], r14w                    ; x
     mov word [rdi+30], r15w                    ; y
-    mov word [rdi+32], cx                      ; width  (restored)
-    mov word [rdi+34], dx                      ; height (restored)
+    mov word [rdi+32], cx                      ; width
+    mov word [rdi+34], dx                      ; height
     mov word [rdi+36], 0                       ; border-width
-    mov byte [rdi+38], 0                       ; override-redirect = False
-    mov byte [rdi+39], 0                       ; unused
+    mov byte [rdi+38], 0                       ; override-redirect
+    mov byte [rdi+39], 0
     mov dword [rdi+40], 0                      ; padding
     lea rsi, [tmp_buf]
     mov rdx, 44
     call x11_buffer
     inc dword [x11_seq]
+.ccfw_no_syncn:
 
     pop r15
     pop r14
@@ -4112,12 +4141,34 @@ action_kill_focused:
     pop rax
     push rax
     call send_map_window
+    ; Raise the freshly-mapped next-active above the dying window
+    ; (StackMode = Above = 0). MapWindow alone preserves the previous
+    ; stack position, so without this the dying window — currently on
+    ; top because it was active — keeps obscuring the new active until
+    ; either the app destroys (slow / never for apps that ignore
+    ; WM_DELETE) or the user manually focus-cycles. Raising here makes
+    ; the next-active visible the instant we flush, before WM_DELETE
+    ; even reaches the dying app.
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CONFIGURE_WINDOW
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4                      ; 3 header + 1 value
+    mov eax, [rsp]                           ; next-active XID
+    mov [rdi+4], eax
+    mov word [rdi+8], CFG_STACK
+    mov word [rdi+10], 0
+    mov dword [rdi+12], 0                    ; stack-mode = Above
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
     pop rax
     call set_input_focus                     ; also publishes _NET_ACTIVE_WINDOW
     call x11_flush                           ; push to X before WM_DELETE
 .akf_no_premap:
     pop rax                                  ; restore dying XID
 
+    push rax                                 ; save dying XID across kill
     mov ecx, [wm_protocols_atom]
     test ecx, ecx
     jz .akf_force
@@ -4126,19 +4177,36 @@ action_kill_focused:
     jz .akf_force
     mov edi, eax
     call send_delete_message
-    ret
+    jmp .akf_unmap_dying
 .akf_force:
-    push rax
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_KILL_CLIENT
     mov byte [rdi+1], 0
     mov word [rdi+2], 2
-    pop rax
+    mov eax, [rsp]                           ; dying XID
     mov [rdi+4], eax
     lea rsi, [tmp_buf]
     mov rdx, 8
     call x11_buffer
     inc dword [x11_seq]
+.akf_unmap_dying:
+    ; Hide the dying window's pixels NOW. WM_DELETE may take seconds to
+    ; honour (slack/firefox), and some apps ignore it entirely. Until X
+    ; processes the eventual DestroyNotify, the stale pixels otherwise
+    ; cover the freshly mapped + raised next-active. UnmapWindow makes
+    ; the kill feel instant; client_closed still runs once via
+    ; DestroyNotify when the app finally goes away. Filter the
+    ; resulting UnmapNotify via client_unmap_expected so it isn't
+    ; processed as a real client-initiated unmap.
+    mov eax, [rsp]                           ; dying XID
+    call find_client_index
+    cmp eax, -1
+    je .akf_no_filter
+    mov byte [client_unmap_expected + rax], 1
+.akf_no_filter:
+    pop rax                                  ; dying XID
+    call send_unmap_window
+    call x11_flush
 .akf_none:
     ret
 
