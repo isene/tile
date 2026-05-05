@@ -197,7 +197,9 @@ section .bss
 %define SEG_OFF_NEXT_RUN  124      ; uint32 unix seconds
 %define SEG_OFF_PID       128      ; int32 (0 = none)
 %define SEG_OFF_PIPE_FD   132      ; int32 (-1 = none)
-%define SEG_OFF_FLAGS     136      ; uint8 (bit 0: dirty since last render)
+%define SEG_OFF_FLAGS     136      ; uint8 — see SEG_FLAG_* below
+%define SEG_FLAG_DIRTY         0x01      ; output changed since last render
+%define SEG_FLAG_BUILTIN_CLOCK 0x02      ; @clock — bake date/time, no fork
 %define SEG_OFF_DEFAULT_FG 140     ; uint32 (0 = use cfg_fg)
 %define SEG_OFF_GAP_OVR   144      ; uint32 extra pixels before this segment
 %define SEG_OFF_INC_BUF   148      ; staging buffer for in-flight output (96B)
@@ -722,7 +724,7 @@ drain_segment_pipe:
     inc ecx
     jmp .dsp_commit
 .dsp_committed:
-    mov byte [r12 + SEG_OFF_FLAGS], 1
+    or byte [r12 + SEG_OFF_FLAGS], SEG_FLAG_DIRTY
     mov byte [strip_dirty], 1
 .dsp_done:
     pop r14
@@ -794,6 +796,11 @@ refresh_due_segments:
     cmp eax, r13d
     ja .rds_next                          ; future
 .rds_fire:
+    ; Built-in @clock: format directly into the output buffer instead of
+    ; forking. Wake on the NEXT minute boundary (not now+interval) so the
+    ; segment fires at most 1/minute even if striprc says interval=1.
+    test byte [r12 + SEG_OFF_FLAGS], SEG_FLAG_BUILTIN_CLOCK
+    jnz .rds_fire_clock
     mov edi, ebx
     call fork_segment
     ; Schedule next_run.
@@ -805,6 +812,21 @@ refresh_due_segments:
 .rds_set_interval:
     mov eax, r13d
     add eax, ecx
+    mov [r12 + SEG_OFF_NEXT_RUN], eax
+    jmp .rds_next
+.rds_fire_clock:
+    lea rdi, [r12 + SEG_OFF_OUTPUT]
+    call format_clock_into                ; rax = bytes written
+    mov [r12 + SEG_OFF_OUT_LEN], al
+    or byte [r12 + SEG_OFF_FLAGS], SEG_FLAG_DIRTY
+    mov byte [strip_dirty], 1
+    ; next_run = ((now / 60) + 1) * 60 — minute boundary.
+    mov eax, r13d
+    xor edx, edx
+    mov ecx, 60
+    div ecx
+    inc eax
+    imul eax, eax, 60
     mov [r12 + SEG_OFF_NEXT_RUN], eax
 .rds_next:
     inc ebx
@@ -932,7 +954,7 @@ seed_next_runs:
     mov dword [rdi + SEG_OFF_PID], 0
     mov dword [rdi + SEG_OFF_PIPE_FD], -1
     mov byte [rdi + SEG_OFF_OUT_LEN], 0
-    mov byte [rdi + SEG_OFF_FLAGS], 0
+    and byte [rdi + SEG_OFF_FLAGS], ~SEG_FLAG_DIRTY
     inc ebx
     jmp .snr_loop
 .snr_done:
@@ -949,6 +971,315 @@ now_seconds:
     mov rax, [rsp]
     add rsp, 16
     ret
+
+; ══════════════════════════════════════════════════════════════════════
+; Built-in clock segment — format " HH:MM  YYYY-MM-DD WW.D " directly
+; into the caller's output buffer. Replaces forking chasm-bits/clock
+; once per second (86,400 forks/day) with one syscall + arithmetic +
+; ~25 stores once per minute. Date math is Howard Hinnant's
+; civil_from_days; ISO weekday from days-since-epoch (Thursday=1970-01-01);
+; ISO week via ordinal_day. TZ offset is hardcoded CEST per the existing
+; clock asmite (real DST handling was deferred there too).
+;
+; Arg:    rdi = output buffer (caller-allocated, must hold ≥24 bytes).
+; Returns rax = bytes written (24).
+%define CLK_TZ_OFFSET_S 7200                ; CEST = UTC+2
+format_clock_into:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rdi                                ; output base — stays on stack
+    sub rsp, 16                             ; struct timespec
+    mov rax, SYS_CLOCK_GETTIME
+    mov rdi, CLOCK_REALTIME
+    mov rsi, rsp
+    syscall
+    mov rax, [rsp]                          ; tv_sec
+    add rsp, 16                             ; output base now at [rsp]
+    add rax, CLK_TZ_OFFSET_S
+
+    ; Days since epoch + seconds-into-day.
+    mov rcx, 86400
+    xor edx, edx
+    div rcx
+    mov r12, rax                            ; days since epoch
+    mov rax, rdx
+    mov rcx, 3600
+    xor edx, edx
+    div rcx
+    mov r13, rax                            ; hour
+    mov rax, rdx
+    mov rcx, 60
+    xor edx, edx
+    div rcx
+    mov r14, rax                            ; minute
+
+    ; ISO weekday: ((days+3) % 7) + 1.
+    mov rax, r12
+    add rax, 3
+    xor edx, edx
+    mov rcx, 7
+    div rcx
+    mov r15, rdx
+    inc r15
+
+    ; civil_from_days: y/m/d.
+    mov rax, r12
+    add rax, 719468                         ; z
+    xor edx, edx
+    mov rcx, 146097
+    div rcx
+    mov r8, rax                             ; era
+    mov r9, rdx                             ; doe
+
+    mov rax, r9
+    xor edx, edx
+    mov rcx, 1460
+    div rcx
+    mov rsi, rax                            ; doe/1460
+    mov rax, r9
+    xor edx, edx
+    mov rcx, 36524
+    div rcx
+    mov rdi, rax                            ; doe/36524
+    mov rax, r9
+    xor edx, edx
+    mov rcx, 146096
+    div rcx
+    mov r10, rax                            ; doe/146096
+    mov rax, r9
+    sub rax, rsi
+    add rax, rdi
+    sub rax, r10
+    xor edx, edx
+    mov rcx, 365
+    div rcx
+    mov r11, rax                            ; yoe
+
+    mov rax, r8
+    imul rax, 400
+    add rax, r11
+    mov rbx, rax                            ; year (proto)
+
+    mov rax, r11
+    imul rax, 365
+    mov rsi, rax
+    mov rax, r11
+    shr rax, 2
+    add rsi, rax
+    mov rax, r11
+    xor edx, edx
+    mov rcx, 100
+    div rcx
+    sub rsi, rax
+    mov rax, r9
+    sub rax, rsi
+    mov rcx, rax                            ; doy
+
+    mov rax, rcx
+    imul rax, 5
+    add rax, 2
+    xor edx, edx
+    mov rdi, 153
+    div rdi
+    mov r10, rax                            ; mp
+
+    mov rax, r10
+    imul rax, 153
+    add rax, 2
+    xor edx, edx
+    mov rdi, 5
+    div rdi
+    sub rcx, rax
+    inc rcx
+    mov r9, rcx                             ; day
+
+    mov rax, r10
+    cmp rax, 10
+    jl .clk_month_lt10
+    sub rax, 9
+    jmp .clk_month_done
+.clk_month_lt10:
+    add rax, 3
+.clk_month_done:
+    mov r8, rax                             ; month
+
+    cmp r8, 2
+    jg .clk_year_done
+    inc rbx
+.clk_year_done:
+    ; rbx=year r8=month r9=day r13=hour r14=min r15=ISO weekday.
+
+    ; ISO week via ordinal_day.
+    push rbx
+    push r8
+    push r9
+    push r10
+    mov rdi, rbx
+    mov rsi, r8
+    mov rdx, r9
+    call clk_ordinal_day                    ; rax = doy
+    mov rcx, rax
+    pop r10
+    pop r9
+    pop r8
+    pop rbx
+    mov rax, rcx
+    sub rax, r15
+    add rax, 10
+    xor edx, edx
+    mov rcx, 7
+    div rcx
+    mov r12, rax                            ; iso_week
+    cmp r12, 0
+    jne .clk_iw_ok
+    mov r12, 52
+.clk_iw_ok:
+    cmp r12, 53
+    jle .clk_iw_done
+    mov r12, 1
+.clk_iw_done:
+
+    ; Format " HH:MM  YYYY-MM-DD WW.D " — 24 bytes, no trailing newline
+    ; (strip writes from OUT_LEN bytes verbatim).
+    mov rdi, [rsp]                          ; output base
+    mov r11, rdi                            ; remember start
+    mov byte [rdi], ' '
+    inc rdi
+    mov rax, r13
+    call clk_write2
+    mov byte [rdi], ':'
+    inc rdi
+    mov rax, r14
+    call clk_write2
+    mov byte [rdi], ' '
+    mov byte [rdi+1], ' '
+    add rdi, 2
+    mov rax, rbx
+    call clk_write4
+    mov byte [rdi], '-'
+    inc rdi
+    mov rax, r8
+    call clk_write2
+    mov byte [rdi], '-'
+    inc rdi
+    mov rax, r9
+    call clk_write2
+    mov byte [rdi], ' '
+    inc rdi
+    mov rax, r12
+    call clk_write2
+    mov byte [rdi], '.'
+    inc rdi
+    mov rax, r15
+    add al, '0'
+    mov [rdi], al
+    inc rdi
+    mov byte [rdi], ' '
+    inc rdi
+    mov rax, rdi
+    sub rax, r11                            ; bytes written
+    add rsp, 8                              ; release saved output base
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; rax = 0..99, rdi = buffer ptr. Writes 2 zero-padded ASCII digits;
+; advances rdi by 2.
+clk_write2:
+    push rcx
+    push rdx
+    mov rcx, 10
+    xor edx, edx
+    div rcx
+    add al, '0'
+    add dl, '0'
+    mov [rdi], al
+    mov [rdi+1], dl
+    add rdi, 2
+    pop rdx
+    pop rcx
+    ret
+
+; rax = 0..9999, rdi = buffer ptr. Writes 4 zero-padded ASCII digits;
+; advances rdi by 4.
+clk_write4:
+    push rcx
+    push rdx
+    mov rcx, 1000
+    xor edx, edx
+    div rcx
+    add al, '0'
+    mov [rdi], al
+    mov rax, rdx
+    mov rcx, 100
+    xor edx, edx
+    div rcx
+    add al, '0'
+    mov [rdi+1], al
+    mov rax, rdx
+    mov rcx, 10
+    xor edx, edx
+    div rcx
+    add al, '0'
+    add dl, '0'
+    mov [rdi+2], al
+    mov [rdi+3], dl
+    add rdi, 4
+    pop rdx
+    pop rcx
+    ret
+
+; rdi=year, rsi=month (1..12), rdx=day (1..31). Returns rax = doy (1..366).
+clk_ordinal_day:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12, rdi
+    mov r13, rsi
+    mov r14, rdx
+    lea rax, [rel .clk_cum]
+    mov rcx, r13
+    dec rcx
+    mov rbx, [rax + rcx*8]
+    add rbx, r14
+    mov rax, r12
+    xor edx, edx
+    mov rcx, 4
+    div rcx
+    test rdx, rdx
+    jnz .clk_od_done
+    mov rax, r12
+    xor edx, edx
+    mov rcx, 100
+    div rcx
+    test rdx, rdx
+    jnz .clk_od_leap
+    mov rax, r12
+    xor edx, edx
+    mov rcx, 400
+    div rcx
+    test rdx, rdx
+    jnz .clk_od_done
+.clk_od_leap:
+    cmp r13, 3
+    jl .clk_od_done
+    inc rbx
+.clk_od_done:
+    mov rax, rbx
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.clk_cum:
+    dq 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334
 
 ; CreatePixmap matching the strip window dimensions. All rendering
 ; happens to the pixmap; a single CopyArea at the end of render_strip
@@ -1484,7 +1815,7 @@ render_strip:
     imul eax, [char_width_var]
     add r12d, eax
     add r12d, [cfg_gap]
-    mov byte [r13 + SEG_OFF_FLAGS], 0
+    and byte [r13 + SEG_OFF_FLAGS], ~SEG_FLAG_DIRTY
 .rs_next:
     inc ebx
     jmp .rs_loop
@@ -2045,6 +2376,24 @@ register_segment:
     cmp rsi, r13
     jbe .rseg_done                        ; no command
     mov byte [rsi], 0
+
+    ; Built-in detection: command of exactly "@clock" → set the
+    ; SEG_FLAG_BUILTIN_CLOCK bit and skip arg_pool_dup. The refresh
+    ; loop will format the date/time directly into SEG_OFF_OUTPUT
+    ; instead of forking chasm-bits/clock — eliminates 86,400
+    ; forks/day for the time segment alone, and drops strip's wake
+    ; cadence for that segment from 1Hz to 1/min.
+    cmp byte [r13], '@'
+    jne .rseg_real_cmd
+    cmp dword [r13+1], 'cloc'              ; little-endian "cloc"
+    jne .rseg_real_cmd
+    cmp byte [r13+5], 'k'
+    jne .rseg_real_cmd
+    cmp byte [r13+6], 0
+    jne .rseg_real_cmd
+    or byte [r15 + SEG_OFF_FLAGS], SEG_FLAG_BUILTIN_CLOCK
+    jmp .rseg_done
+.rseg_real_cmd:
     mov rdi, r13
     call arg_pool_dup
     mov [r15 + SEG_OFF_CMD_OFF], eax
