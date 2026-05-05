@@ -2553,7 +2553,90 @@ event_loop:
     jz .ev_mr_not_transient
     cmp eax, 2
     je .ev_mr_menu
-    ; Map the dialog at whatever geometry the app asked for.
+    ; Centre the dialog: zenity / Discord installer / GTK alert popups
+    ; routinely come up at (0,0) because they don't set USPosition or
+    ; PPosition in WM_NORMAL_HINTS, leaving the X server to use the
+    ; default. (0,0) is right under the strip bar so the dialog's title
+    ; vanishes behind it. GetGeometry → use the actual dialog size to
+    ; place it on the centre of output 0, vertically nudged below the
+    ; strip so its title stays visible.
+    call x11_flush
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_GET_GEOMETRY
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov eax, [x11_read_buf + 8]
+    mov [rdi+4], eax
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    syscall
+    inc dword [x11_seq]
+    lea rdi, [tmp_buf + 64]
+    call read_reply_or_queue
+    test rax, rax
+    jz .ev_mr_t_no_centre                  ; geometry read failed → just MapWindow
+    movzx ecx, word [tmp_buf + 64 + 16]    ; dialog width
+    movzx edx, word [tmp_buf + 64 + 18]    ; dialog height
+    movzx eax, word [x11_screen_width]
+    sub eax, ecx
+    sar eax, 1                             ; (screen_w - dialog_w) / 2
+    js .ev_mr_t_x_zero
+    jmp .ev_mr_t_have_x
+.ev_mr_t_x_zero:
+    xor eax, eax
+.ev_mr_t_have_x:
+    push rax                               ; centred X
+    movzx eax, word [x11_screen_height]
+    sub eax, edx
+    sar eax, 1                             ; (screen_h - dialog_h) / 2
+    js .ev_mr_t_y_zero
+    movzx ecx, word [cfg_strip_height]
+    cmp eax, ecx
+    jge .ev_mr_t_have_y
+    mov eax, ecx                           ; clamp below strip
+    jmp .ev_mr_t_have_y
+.ev_mr_t_y_zero:
+    movzx eax, word [cfg_strip_height]
+.ev_mr_t_have_y:
+    pop rcx                                ; rcx = X, rax = Y
+    ; ConfigureWindow X | Y | StackMode=Above. Has to precede MapWindow
+    ; so the dialog appears at the centred location on first paint;
+    ; otherwise it flashes at (0,0) for one frame.
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CONFIGURE_WINDOW
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 6                    ; 3 header + 3 values
+    mov edx, [x11_read_buf + 8]
+    mov [rdi+4], edx
+    mov word [rdi+8], CFG_X | CFG_Y | CFG_STACK
+    mov word [rdi+10], 0
+    mov [rdi+12], ecx                      ; X
+    mov [rdi+16], eax                      ; Y
+    mov dword [rdi+20], 0                  ; stack-mode = Above
+    lea rsi, [tmp_buf]
+    mov rdx, 24
+    call x11_buffer
+    inc dword [x11_seq]
+    jmp .ev_mr_t_map
+.ev_mr_t_no_centre:
+    ; Fallback: just stack-above without re-positioning.
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CONFIGURE_WINDOW
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov eax, [x11_read_buf + 8]
+    mov [rdi+4], eax
+    mov word [rdi+8], CFG_STACK
+    mov word [rdi+10], 0
+    mov dword [rdi+12], 0
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+.ev_mr_t_map:
+    ; MapWindow now that geometry is set.
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_MAP_WINDOW
     mov byte [rdi+1], 0
@@ -2562,24 +2645,6 @@ event_loop:
     mov [rdi+4], eax
     lea rsi, [tmp_buf]
     mov rdx, 8
-    call x11_buffer
-    inc dword [x11_seq]
-    ; Raise the dialog above its parent (StackMode = Above = 0). Without
-    ; this, the parent's fullscreen geometry can paint over a smaller
-    ; centred dialog, so the modal dialog ends up invisible while the
-    ; parent stops responding to input — exactly the five-or-more
-    ; high-score lockup symptom.
-    lea rdi, [tmp_buf]
-    mov byte [rdi], X11_CONFIGURE_WINDOW
-    mov byte [rdi+1], 0
-    mov word [rdi+2], 4                    ; 3 header + 1 value
-    mov eax, [x11_read_buf + 8]
-    mov [rdi+4], eax                       ; window
-    mov word [rdi+8], CFG_STACK
-    mov word [rdi+10], 0
-    mov dword [rdi+12], 0                  ; stack-mode = Above
-    lea rsi, [tmp_buf]
-    mov rdx, 16
     call x11_buffer
     inc dword [x11_seq]
     ; Remember the dialog and the previously-focused window. When the
@@ -4228,6 +4293,42 @@ send_unmap_window:
 ; chronologically last-mapped client — wrong once tabs make the active
 ; tab independent of map order.
 action_kill_focused:
+    ; If a transient/dialog is currently focused (zenity progress popup,
+    ; GTK file chooser, etc.), kill THAT instead of the underlying tab.
+    ; transient_focused_xid is set by the .ev_mr_real_transient_check
+    ; path and cleared on the matching UnmapNotify/DestroyNotify, so
+    ; this path only fires while a popup is actually up. Without it
+    ; Mod4+q kills the parent app while the modal child sits on top
+    ; — exactly the "unkillable popup" symptom.
+    mov eax, [transient_focused_xid]
+    test eax, eax
+    jz .akf_no_transient
+    push rax
+    mov ecx, [wm_protocols_atom]
+    test ecx, ecx
+    jz .akf_t_force
+    mov ecx, [wm_delete_atom]
+    test ecx, ecx
+    jz .akf_t_force
+    mov edi, eax
+    call send_delete_message
+    jmp .akf_t_post
+.akf_t_force:
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_KILL_CLIENT
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov eax, [rsp]
+    mov [rdi+4], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    call x11_buffer
+    inc dword [x11_seq]
+.akf_t_post:
+    pop rax
+    call x11_flush
+    ret
+.akf_no_transient:
     movzx ecx, byte [current_ws]
     test ecx, ecx
     jz .akf_none
