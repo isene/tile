@@ -66,8 +66,19 @@
 %define EV_DESTROY_NOTIFY       17
 %define EV_UNMAP_NOTIFY         18
 %define EV_CONFIGURE_NOTIFY     22
+%define EV_PROPERTY_NOTIFY      28
 %define SUBSTRUCTURE_NOTIFY_MASK    0x00080000
 %define STRUCTURE_NOTIFY_MASK       0x00020000
+%define PROPERTY_CHANGE_MASK        0x00400000
+
+; X11 opcodes used by the @wintitle builtin.
+%define X11_CHANGE_WINDOW_ATTR  2
+%define X11_GET_PROPERTY        20
+
+; Predefined X11 atoms.
+%define ATOM_NONE               0
+%define ATOM_STRING             31
+%define ATOM_WM_NAME            39
 
 ; XEMBED / system-tray opcodes.
 %define SYS_TRAY_REQUEST_DOCK   0
@@ -162,6 +173,14 @@ xembed_info_len   equ 12
 manager_str:      db "MANAGER", 0
 manager_len       equ 7
 
+; @wintitle builtin — atom names for InternAtom.
+wt_str_active:    db "_NET_ACTIVE_WINDOW", 0
+wt_len_active     equ 18
+wt_str_wm_name:   db "_NET_WM_NAME", 0
+wt_len_wm_name    equ 12
+wt_str_utf8:      db "UTF8_STRING", 0
+wt_len_utf8       equ 11
+
 ; ANSI SGR → pixel colour lookup. Indexed by (code - 30) for 30..37
 ; (standard 8), (code - 90 + 8) for 90..97 (bright 8). 16 entries.
 ; All include opaque alpha. SGR 0 (reset) is handled specially →
@@ -198,8 +217,9 @@ section .bss
 %define SEG_OFF_PID       128      ; int32 (0 = none)
 %define SEG_OFF_PIPE_FD   132      ; int32 (-1 = none)
 %define SEG_OFF_FLAGS     136      ; uint8 — see SEG_FLAG_* below
-%define SEG_FLAG_DIRTY         0x01      ; output changed since last render
-%define SEG_FLAG_BUILTIN_CLOCK 0x02      ; @clock — bake date/time, no fork
+%define SEG_FLAG_DIRTY            0x01   ; output changed since last render
+%define SEG_FLAG_BUILTIN_CLOCK    0x02   ; @clock — bake date/time, no fork
+%define SEG_FLAG_BUILTIN_WINTITLE 0x04   ; @wintitle — event-driven, no fork
 %define SEG_OFF_DEFAULT_FG 140     ; uint32 (0 = use cfg_fg)
 %define SEG_OFF_GAP_OVR   144      ; uint32 extra pixels before this segment
 %define SEG_OFF_INC_BUF   148      ; staging buffer for in-flight output (96B)
@@ -297,6 +317,21 @@ xauth_data:          resb 16
 xauth_len:           resq 1
 tmp_buf:             resb 4096
 
+; @wintitle builtin state. The segment is event-driven: subscribe to
+; PropertyChangeMask on root for _NET_ACTIVE_WINDOW changes, and on
+; the active window for _NET_WM_NAME changes. Re-fetch the title on
+; either, never poll.
+%define WT_TITLE_MAX        1024
+%define WT_DEFAULT_MAXCHARS 40
+wt_atom_net_active:  resd 1               ; _NET_ACTIVE_WINDOW
+wt_atom_net_wm_name: resd 1               ; _NET_WM_NAME
+wt_atom_utf8_string: resd 1               ; UTF8_STRING
+wt_active_xid:       resd 1               ; current focused window
+wt_seg_idx:          resd 1               ; segment slot, -1 if no @wintitle
+wt_max_chars:        resd 1               ; truncation width in codepoints
+wt_title_len:        resd 1               ; bytes in wt_title_buf
+wt_title_buf:        resb WT_TITLE_MAX
+
 ; ══════════════════════════════════════════════════════════════════════
 ; Code
 ; ══════════════════════════════════════════════════════════════════════
@@ -331,6 +366,8 @@ _start:
     mov dword [arg_pool_pos], 1
     mov byte [arg_pool], 0
     mov dword [segment_count], 0
+    mov dword [wt_seg_idx], -1
+    mov dword [wt_max_chars], WT_DEFAULT_MAXCHARS
 
     ; Seed font config from defaults; striprc may override.
     lea rsi, [default_font_name]
@@ -359,6 +396,7 @@ _start:
     call create_gc
     call map_strip_window
     call tray_setup
+    call wintitle_init                    ; no-op if striprc has no @wintitle
     mov byte [strip_dirty], 1
     call x11_flush
 
@@ -552,6 +590,30 @@ drain_ready_fds:
     je .drf_x11_unmap
     cmp al, EV_CONFIGURE_NOTIFY
     je .drf_x11_configure
+    cmp al, EV_PROPERTY_NOTIFY
+    je .drf_x11_property
+    jmp .drf_next
+.drf_x11_property:
+    ; PropertyNotify: window @ +4, atom @ +8.
+    cmp dword [wt_seg_idx], -1
+    je .drf_next                          ; @wintitle not configured
+    mov eax, [x11_read_buf + 4]           ; window
+    mov ecx, [x11_read_buf + 8]           ; atom
+    cmp eax, [x11_root_window]
+    jne .drf_prop_check_active
+    cmp ecx, [wt_atom_net_active]
+    jne .drf_next
+    call wt_on_active_changed
+    jmp .drf_next
+.drf_prop_check_active:
+    cmp eax, [wt_active_xid]
+    jne .drf_next
+    cmp ecx, [wt_atom_net_wm_name]
+    je .drf_prop_refetch
+    cmp ecx, ATOM_WM_NAME
+    jne .drf_next
+.drf_prop_refetch:
+    call wt_refetch_title
     jmp .drf_next
 .drf_x11_configure:
     ; ConfigureNotify from a child of strip. SubstructureNotifyMask
@@ -796,6 +858,14 @@ refresh_due_segments:
     cmp eax, r13d
     ja .rds_next                          ; future
 .rds_fire:
+    ; Built-in @wintitle: never schedule a refresh — the segment is
+    ; updated only by PropertyNotify events. Park it on a far-future
+    ; next_run so compute_timeout_ms doesn't waste poll budget on it.
+    test byte [r12 + SEG_OFF_FLAGS], SEG_FLAG_BUILTIN_WINTITLE
+    jz .rds_fire_check_clock
+    mov dword [r12 + SEG_OFF_NEXT_RUN], 0xFFFFFFFF
+    jmp .rds_next
+.rds_fire_check_clock:
     ; Built-in @clock: format directly into the output buffer instead of
     ; forking. Wake on the NEXT minute boundary (not now+interval) so the
     ; segment fires at most 1/minute even if striprc says interval=1.
@@ -2377,22 +2447,66 @@ register_segment:
     jbe .rseg_done                        ; no command
     mov byte [rsi], 0
 
-    ; Built-in detection: command of exactly "@clock" → set the
-    ; SEG_FLAG_BUILTIN_CLOCK bit and skip arg_pool_dup. The refresh
-    ; loop will format the date/time directly into SEG_OFF_OUTPUT
-    ; instead of forking chasm-bits/clock — eliminates 86,400
-    ; forks/day for the time segment alone, and drops strip's wake
-    ; cadence for that segment from 1Hz to 1/min.
+    ; Built-in detection. Two recognised commands, both starting with '@':
+    ;   @clock         → bake date/time, fire on minute boundaries
+    ;   @wintitle[:N]  → subscribe to _NET_ACTIVE_WINDOW + _NET_WM_NAME,
+    ;                    no fork ever; optional :N sets max codepoints
+    ;                    (default 40). interval in striprc is ignored.
     cmp byte [r13], '@'
     jne .rseg_real_cmd
+
+    ; @clock?
     cmp dword [r13+1], 'cloc'              ; little-endian "cloc"
-    jne .rseg_real_cmd
+    jne .rseg_try_wintitle
     cmp byte [r13+5], 'k'
-    jne .rseg_real_cmd
+    jne .rseg_try_wintitle
     cmp byte [r13+6], 0
-    jne .rseg_real_cmd
+    jne .rseg_try_wintitle
     or byte [r15 + SEG_OFF_FLAGS], SEG_FLAG_BUILTIN_CLOCK
     jmp .rseg_done
+
+.rseg_try_wintitle:
+    ; @wintitle? Compare bytes 1..8 = "wintitle" (8 chars).
+    cmp dword [r13+1], 'wint'
+    jne .rseg_real_cmd
+    cmp dword [r13+5], 'itle'
+    jne .rseg_real_cmd
+    movzx eax, byte [r13+9]
+    test al, al
+    je .rseg_wt_default                    ; "@wintitle" alone
+    cmp al, ':'
+    jne .rseg_real_cmd
+    ; Parse decimal after the colon.
+    lea rdi, [r13+10]
+    xor eax, eax
+.rseg_wt_dig:
+    movzx ecx, byte [rdi]
+    cmp cl, '0'
+    jb .rseg_wt_done
+    cmp cl, '9'
+    ja .rseg_wt_done
+    sub ecx, '0'
+    imul eax, eax, 10
+    add eax, ecx
+    inc rdi
+    jmp .rseg_wt_dig
+.rseg_wt_done:
+    movzx ecx, byte [rdi]
+    test cl, cl
+    jne .rseg_real_cmd                     ; trailing junk → not a builtin
+    test eax, eax
+    jz .rseg_wt_default
+    cmp eax, WT_TITLE_MAX
+    jbe .rseg_wt_take
+.rseg_wt_default:
+    mov eax, WT_DEFAULT_MAXCHARS
+.rseg_wt_take:
+    mov [wt_max_chars], eax
+    mov eax, [segment_count]
+    mov [wt_seg_idx], eax
+    or byte [r15 + SEG_OFF_FLAGS], SEG_FLAG_BUILTIN_WINTITLE
+    jmp .rseg_done
+
 .rseg_real_cmd:
     mov rdi, r13
     call arg_pool_dup
@@ -3630,4 +3744,472 @@ itoa:
     mov rax, r12
     pop r12
     pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; @wintitle builtin — event-driven focused-window title display.
+;
+; Mechanism: subscribe to PropertyChangeMask on root for
+; _NET_ACTIVE_WINDOW changes, and on the active window for
+; _NET_WM_NAME / WM_NAME changes. PropertyNotify in drain_ready_fds
+; fires wt_on_active_changed (root) or wt_refetch_title (active xid).
+;
+; Replaces the chasm-bits/wintitle asmite (forked once per second,
+; 86,400 forks/day) with a one-time setup + per-event refresh that
+; typically fires <100 times/day.
+; ══════════════════════════════════════════════════════════════════════
+
+; Called once at startup, after tray_setup. No-op if no @wintitle
+; segment was registered.
+wintitle_init:
+    cmp dword [wt_seg_idx], -1
+    je .wti_done
+
+    ; Intern the three atoms we need beyond predefined ATOM_WM_NAME/STRING.
+    lea rdi, [wt_str_active]
+    mov esi, wt_len_active
+    call intern_atom_sync
+    mov [wt_atom_net_active], eax
+    lea rdi, [wt_str_wm_name]
+    mov esi, wt_len_wm_name
+    call intern_atom_sync
+    mov [wt_atom_net_wm_name], eax
+    lea rdi, [wt_str_utf8]
+    mov esi, wt_len_utf8
+    call intern_atom_sync
+    mov [wt_atom_utf8_string], eax
+
+    ; Subscribe to PropertyChangeMask on the root window so we hear
+    ; about _NET_ACTIVE_WINDOW changes (focus moves between top-levels).
+    mov edi, [x11_root_window]
+    mov esi, PROPERTY_CHANGE_MASK
+    call wt_set_event_mask
+
+    ; Initial fetch: ask root who's active, then read that window's title.
+    call wt_on_active_changed
+.wti_done:
+    ret
+
+; Called when root's _NET_ACTIVE_WINDOW property changed. Fetch the
+; new active XID, unsubscribe from the old one, subscribe to the new,
+; then refetch the title.
+wt_on_active_changed:
+    push rbx
+    push r12
+
+    ; Synchronously fetch _NET_ACTIVE_WINDOW from root. The property
+    ; value is one CARD32 = the active window XID (or 0 if none).
+    mov edi, [x11_root_window]
+    mov esi, [wt_atom_net_active]
+    xor edx, edx                          ; AnyPropertyType
+    mov ecx, 1                            ; long-length = 1 (4 bytes)
+    call wt_get_property
+    test eax, eax
+    js .woac_done                         ; reply error
+    mov ecx, [tmp_buf + 16]               ; value-length (in 32-bit units, format=32)
+    test ecx, ecx
+    jz .woac_zero
+    mov ebx, [tmp_buf + 32]               ; first CARD32 = active XID
+    jmp .woac_have
+.woac_zero:
+    xor ebx, ebx
+.woac_have:
+    ; Compare to previous active.
+    mov r12d, [wt_active_xid]
+    cmp r12d, ebx
+    je .woac_done                         ; unchanged
+
+    ; Unsubscribe old (skip root + 0).
+    test r12d, r12d
+    jz .woac_set_new
+    cmp r12d, [x11_root_window]
+    je .woac_set_new
+    mov edi, r12d
+    xor esi, esi                          ; mask = 0
+    call wt_set_event_mask
+
+.woac_set_new:
+    mov [wt_active_xid], ebx
+    test ebx, ebx
+    jz .woac_clear_title
+    cmp ebx, [x11_root_window]
+    je .woac_clear_title
+
+    mov edi, ebx
+    mov esi, PROPERTY_CHANGE_MASK
+    call wt_set_event_mask
+    call wt_refetch_title
+    jmp .woac_done
+
+.woac_clear_title:
+    ; No focused top-level — empty the title and update the segment.
+    mov dword [wt_title_len], 0
+    call wt_publish_segment
+.woac_done:
+    pop r12
+    pop rbx
+    ret
+
+; Refetch _NET_WM_NAME (UTF8) of wt_active_xid; on empty, fall back
+; to WM_NAME (legacy STRING). Updates wt_title_buf/wt_title_len and
+; the segment output.
+wt_refetch_title:
+    mov dword [wt_title_len], 0
+    mov edi, [wt_active_xid]
+    test edi, edi
+    jz .wrt_publish
+    mov esi, [wt_atom_net_wm_name]
+    mov edx, [wt_atom_utf8_string]
+    mov ecx, WT_TITLE_MAX / 4             ; long-length in 32-bit units
+    call wt_get_property
+    test eax, eax
+    js .wrt_publish
+    mov ecx, [tmp_buf + 16]               ; value-length, format=8 → bytes
+    test ecx, ecx
+    jnz .wrt_have_bytes
+
+    ; Fallback: WM_NAME (predefined atom) / STRING.
+    mov edi, [wt_active_xid]
+    mov esi, ATOM_WM_NAME
+    mov edx, ATOM_STRING
+    mov ecx, WT_TITLE_MAX / 4
+    call wt_get_property
+    test eax, eax
+    js .wrt_publish
+    mov ecx, [tmp_buf + 16]
+    test ecx, ecx
+    jz .wrt_publish
+
+.wrt_have_bytes:
+    cmp ecx, WT_TITLE_MAX
+    jbe .wrt_len_ok
+    mov ecx, WT_TITLE_MAX
+.wrt_len_ok:
+    mov [wt_title_len], ecx
+    lea rsi, [tmp_buf + 32]
+    lea rdi, [wt_title_buf]
+.wrt_cp:
+    test ecx, ecx
+    jz .wrt_publish
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec ecx
+    jmp .wrt_cp
+.wrt_publish:
+    call wt_publish_segment
+    ret
+
+; ChangeWindowAttributes(window=edi, value-mask=CWEventMask, mask=esi).
+; Sends 16-byte request (3 header + 1 value).
+wt_set_event_mask:
+    push rbx
+    mov ebx, edi
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_WINDOW_ATTR
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4                   ; length = 4 words
+    mov [rdi+4], ebx
+    mov dword [rdi+8], CW_EVENT_MASK
+    mov [rdi+12], esi
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    pop rbx
+    ret
+
+; Synchronous GetProperty.
+;   edi = window, esi = property atom, edx = type atom (0 = AnyPropertyType),
+;   ecx = long-length (in 32-bit units).
+; Result lands at tmp_buf (32-byte reply header + value bytes from +32).
+;   tmp_buf+16 = value-length in `format` units.
+; Returns rax = 0 on success, negative on X error / read failure.
+wt_get_property:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12d, edi
+    mov r13d, esi
+    mov r14d, edx
+    mov ebx, ecx
+
+    call x11_flush
+
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_GET_PROPERTY
+    mov byte [rdi+1], 0                   ; delete = 0
+    mov word [rdi+2], 6                   ; length = 6 words
+    mov [rdi+4], r12d                     ; window
+    mov [rdi+8], r13d                     ; property atom
+    mov [rdi+12], r14d                    ; type atom
+    mov dword [rdi+16], 0                 ; long-offset = 0
+    mov [rdi+20], ebx                     ; long-length
+    lea rsi, [tmp_buf]
+    mov rdx, 24
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    syscall
+    inc dword [x11_seq]
+
+    ; Drain X events until a reply (1) or error (0). Matches the
+    ; intern_atom_sync pattern: discard events at startup since the
+    ; main loop will re-select them via PropertyChangeMask anyway.
+.wgp_read:
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 32
+    syscall
+    cmp rax, 32
+    jl .wgp_fail
+    movzx eax, byte [tmp_buf]
+    cmp al, 0
+    je .wgp_fail                          ; X error
+    cmp al, 1
+    jne .wgp_event_skip                   ; event — drop and try again
+    ; Reply: bytes 4..7 = additional 32-bit words to read after the
+    ; 32-byte header. Drain them all into tmp_buf+32.
+    mov eax, [tmp_buf + 4]
+    shl eax, 2
+    test eax, eax
+    jz .wgp_ok
+    cmp eax, 4096 - 32
+    jbe .wgp_eax_ok
+    mov eax, 4096 - 32
+.wgp_eax_ok:
+    mov ebx, eax                          ; remaining bytes
+    mov r12d, 32                          ; write offset into tmp_buf
+.wgp_body:
+    test ebx, ebx
+    jz .wgp_ok
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    add rsi, r12
+    mov edx, ebx
+    syscall
+    test rax, rax
+    jle .wgp_fail
+    add r12d, eax
+    sub ebx, eax
+    jmp .wgp_body
+.wgp_ok:
+    xor eax, eax
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.wgp_event_skip:
+    ; 32 bytes already read into tmp_buf as an event packet. Discard.
+    jmp .wgp_read
+.wgp_fail:
+    mov rax, -1
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; Publish the title from wt_title_buf into the @wintitle segment's
+; output buffer with UTF-8-aware truncation/padding to wt_max_chars
+; codepoints, then mark the segment dirty so the bar redraws.
+wt_publish_segment:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    ; Resolve segment record.
+    mov eax, [wt_seg_idx]
+    cmp eax, -1
+    je .wps_done
+    imul rax, rax, SEG_STRIDE_REAL
+    lea r12, [segments + rax]
+    lea r13, [r12 + SEG_OFF_OUTPUT]       ; output buffer
+    mov r14d, [wt_max_chars]              ; codepoint cap
+
+    ; Sanitize wt_title_buf in place: bytes <0x20 → ' '. Keeps the bar
+    ; layout single-line if a window title ever embeds a tab/newline.
+    mov ecx, [wt_title_len]
+    lea rdi, [wt_title_buf]
+.wps_san:
+    test ecx, ecx
+    jz .wps_san_done
+    movzx eax, byte [rdi]
+    cmp al, 0x20
+    jae .wps_san_next
+    mov byte [rdi], 0x20
+.wps_san_next:
+    inc rdi
+    dec ecx
+    jmp .wps_san
+.wps_san_done:
+
+    ; Count UTF-8 codepoints in title. Continuation bytes (top bits 10)
+    ; do NOT advance the codepoint counter.
+    mov ecx, [wt_title_len]
+    lea rsi, [wt_title_buf]
+    xor r15d, r15d                        ; codepoint count
+.wps_cnt:
+    test ecx, ecx
+    jz .wps_cnt_done
+    movzx eax, byte [rsi]
+    and al, 0xC0
+    cmp al, 0x80
+    je .wps_cnt_skip
+    inc r15d
+.wps_cnt_skip:
+    inc rsi
+    dec ecx
+    jmp .wps_cnt
+.wps_cnt_done:
+    ; r15d = total codepoints in title.
+
+    ; If title fits in the cap → copy raw bytes, then pad with spaces.
+    mov rdi, r13                          ; output ptr
+    cmp r15d, r14d
+    ja .wps_truncate
+
+    ; Copy all wt_title_len bytes.
+    mov ecx, [wt_title_len]
+    lea rsi, [wt_title_buf]
+.wps_full_cp:
+    test ecx, ecx
+    jz .wps_full_done
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec ecx
+    jmp .wps_full_cp
+.wps_full_done:
+    ; Pad codepoints (= bytes for ASCII space) to reach max_chars.
+    mov ecx, r14d
+    sub ecx, r15d
+    jmp .wps_pad
+
+.wps_truncate:
+    ; Need mid-string truncate. Copy first (max-1+1)/2 = (max+1)/2
+    ; codepoints, append "…" (3 bytes UTF-8), copy last (max-1)/2.
+    mov eax, r14d
+    inc eax
+    shr eax, 1
+    mov ebx, eax                          ; left_keep = (max+1)/2
+    mov eax, r14d
+    dec eax
+    shr eax, 1                            ; right_keep = (max-1)/2
+
+    ; Copy left_keep codepoints.
+    push rax                              ; save right_keep
+    mov rsi, wt_title_buf
+    mov ecx, ebx
+    call wt_copy_cp                       ; advances rsi, rdi
+    ; Append "…" UTF-8 bytes 0xE2 0x80 0xA6.
+    mov byte [rdi], 0xE2
+    mov byte [rdi+1], 0x80
+    mov byte [rdi+2], 0xA6
+    add rdi, 3
+    pop rcx                               ; right_keep
+    push rcx
+    ; Skip (total_cp - right_keep) codepoints from start.
+    mov rsi, wt_title_buf
+    mov eax, r15d
+    sub eax, ecx
+    mov ecx, eax
+    call wt_skip_cp
+    pop rcx
+    call wt_copy_cp
+    xor ecx, ecx                          ; truncated → no padding
+
+.wps_pad:
+    ; ecx = remaining codepoints to pad with spaces (ASCII only, so
+    ; cp == byte). Cap so we don't overrun SEG_OUT_LEN.
+    test ecx, ecx
+    jz .wps_finalize
+.wps_pad_loop:
+    test ecx, ecx
+    jz .wps_finalize
+    mov byte [rdi], ' '
+    inc rdi
+    dec ecx
+    jmp .wps_pad_loop
+
+.wps_finalize:
+    ; Compute output length = rdi - r13.
+    sub rdi, r13
+    mov rax, rdi
+    cmp rax, SEG_OUT_LEN
+    jbe .wps_len_ok
+    mov rax, SEG_OUT_LEN
+.wps_len_ok:
+    mov [r12 + SEG_OFF_OUT_LEN], al
+    or byte [r12 + SEG_OFF_FLAGS], SEG_FLAG_DIRTY
+    mov byte [strip_dirty], 1
+.wps_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; Copy ecx UTF-8 codepoints from rsi to rdi, advancing both pointers
+; over both leading and continuation bytes. Stops on NUL or budget.
+wt_copy_cp:
+    test ecx, ecx
+    jz .wcc_done
+.wcc_lead:
+    mov al, [rsi]
+    test al, al
+    jz .wcc_done
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec ecx
+.wcc_cont:
+    mov al, [rsi]
+    test al, al
+    jz .wcc_done
+    mov dl, al
+    and dl, 0xC0
+    cmp dl, 0x80
+    jne .wcc_check
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    jmp .wcc_cont
+.wcc_check:
+    test ecx, ecx
+    jnz .wcc_lead
+.wcc_done:
+    ret
+
+; Skip ecx UTF-8 codepoints starting at rsi, advancing rsi.
+wt_skip_cp:
+    test ecx, ecx
+    jz .wsc_done
+.wsc_lead:
+    mov al, [rsi]
+    test al, al
+    jz .wsc_done
+    inc rsi
+    dec ecx
+.wsc_cont:
+    mov al, [rsi]
+    test al, al
+    jz .wsc_done
+    mov dl, al
+    and dl, 0xC0
+    cmp dl, 0x80
+    jne .wsc_check
+    inc rsi
+    jmp .wsc_cont
+.wsc_check:
+    test ecx, ecx
+    jnz .wsc_lead
+.wsc_done:
     ret
