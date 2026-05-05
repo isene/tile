@@ -181,6 +181,12 @@ wt_len_wm_name    equ 12
 wt_str_utf8:      db "UTF8_STRING", 0
 wt_len_utf8       equ 11
 
+; @workspaces builtin — atom names. Tile publishes both on root.
+ws_str_current:   db "_NET_CURRENT_DESKTOP", 0
+ws_len_current    equ 20
+ws_str_state:     db "_TILE_BAR_STATE", 0
+ws_len_state      equ 15
+
 ; ANSI SGR → pixel colour lookup. Indexed by (code - 30) for 30..37
 ; (standard 8), (code - 90 + 8) for 90..97 (bright 8). 16 entries.
 ; All include opaque alpha. SGR 0 (reset) is handled specially →
@@ -191,7 +197,8 @@ sgr_palette:
     dd 0xFF00CC00        ; 32 green
     dd 0xFFCCCC00        ; 33 yellow
     dd 0xFF0000CC        ; 34 blue
-    dd 0xFFCC00CC        ; 35 magenta
+    dd 0xFFFFA500        ; 35 ORANGE (was magenta — repurposed for
+                         ;          @workspaces active marker)
     dd 0xFF00CCCC        ; 36 cyan
     dd 0xFFCCCCCC        ; 37 white
     dd 0xFF555555        ; 90 bright black (dim grey)
@@ -199,7 +206,7 @@ sgr_palette:
     dd 0xFF55FF55        ; 92 bright green
     dd 0xFFFFFF55        ; 93 bright yellow
     dd 0xFF5555FF        ; 94 bright blue
-    dd 0xFFFF55FF        ; 95 bright magenta
+    dd 0xFFFFA500        ; 95 ORANGE (bright variant — same as 35)
     dd 0xFF55FFFF        ; 96 bright cyan
     dd 0xFFFFFFFF        ; 97 bright white
 
@@ -217,9 +224,10 @@ section .bss
 %define SEG_OFF_PID       128      ; int32 (0 = none)
 %define SEG_OFF_PIPE_FD   132      ; int32 (-1 = none)
 %define SEG_OFF_FLAGS     136      ; uint8 — see SEG_FLAG_* below
-%define SEG_FLAG_DIRTY            0x01   ; output changed since last render
-%define SEG_FLAG_BUILTIN_CLOCK    0x02   ; @clock — bake date/time, no fork
-%define SEG_FLAG_BUILTIN_WINTITLE 0x04   ; @wintitle — event-driven, no fork
+%define SEG_FLAG_DIRTY              0x01 ; output changed since last render
+%define SEG_FLAG_BUILTIN_CLOCK      0x02 ; @clock — bake date/time, no fork
+%define SEG_FLAG_BUILTIN_WINTITLE   0x04 ; @wintitle — event-driven, no fork
+%define SEG_FLAG_BUILTIN_WORKSPACES 0x08 ; @workspaces — event-driven, no fork
 %define SEG_OFF_DEFAULT_FG 140     ; uint32 (0 = use cfg_fg)
 %define SEG_OFF_GAP_OVR   144      ; uint32 extra pixels before this segment
 %define SEG_OFF_INC_BUF   148      ; staging buffer for in-flight output (96B)
@@ -332,6 +340,21 @@ wt_max_chars:        resd 1               ; truncation width in codepoints
 wt_title_len:        resd 1               ; bytes in wt_title_buf
 wt_title_buf:        resb WT_TITLE_MAX
 
+; @workspaces builtin state. Subscribes to PropertyChangeMask on root
+; (set already by @wintitle if both are configured) and reads
+; _NET_CURRENT_DESKTOP + _TILE_BAR_STATE published by tile. Renders
+; SGR-coloured "1 2 3  4 5 6  7 8 9  0 T" with per-WS state colour
+; plus current-WS layout indicator (T = TABBED, S = SPLIT).
+%define WS_COUNT 10
+ws_atom_current:     resd 1               ; _NET_CURRENT_DESKTOP
+ws_atom_state:       resd 1               ; _TILE_BAR_STATE
+ws_seg_idx:          resd 1               ; segment slot, -1 if no @workspaces
+ws_current:          resd 1               ; 1..10, or 0 if unknown
+ws_populated:        resb WS_COUNT        ; client count per WS
+ws_layouts:          resb WS_COUNT        ; 0=T 1=H 2=V 3=M
+ws_tab_count:        resb 1               ; clients on current_ws
+ws_tab_index:        resb 1               ; active tab idx (1-based, 0=none)
+
 ; ══════════════════════════════════════════════════════════════════════
 ; Code
 ; ══════════════════════════════════════════════════════════════════════
@@ -368,6 +391,7 @@ _start:
     mov dword [segment_count], 0
     mov dword [wt_seg_idx], -1
     mov dword [wt_max_chars], WT_DEFAULT_MAXCHARS
+    mov dword [ws_seg_idx], -1
 
     ; Seed font config from defaults; striprc may override.
     lea rsi, [default_font_name]
@@ -397,6 +421,7 @@ _start:
     call map_strip_window
     call tray_setup
     call wintitle_init                    ; no-op if striprc has no @wintitle
+    call workspaces_init                  ; no-op if striprc has no @workspaces
     mov byte [strip_dirty], 1
     call x11_flush
 
@@ -595,17 +620,37 @@ drain_ready_fds:
     jmp .drf_next
 .drf_x11_property:
     ; PropertyNotify: window @ +4, atom @ +8.
-    cmp dword [wt_seg_idx], -1
-    je .drf_next                          ; @wintitle not configured
     mov eax, [x11_read_buf + 4]           ; window
-    mov ecx, [x11_read_buf + 8]           ; atom
     cmp eax, [x11_root_window]
     jne .drf_prop_check_active
+    ; Root property changed. Sync GetProperty inside the handlers
+    ; discards X events queued behind the current one — to stay
+    ; consistent we refresh BOTH @wintitle (on active-window change)
+    ; AND @workspaces (on any of the three watched atoms). Costs
+    ; 2-4 extra syscalls per focus change.
+    mov ecx, [x11_read_buf + 8]           ; atom
+    cmp dword [wt_seg_idx], -1
+    je .drf_prop_no_wt
     cmp ecx, [wt_atom_net_active]
-    jne .drf_next
+    jne .drf_prop_no_wt
     call wt_on_active_changed
+.drf_prop_no_wt:
+    cmp dword [ws_seg_idx], -1
+    je .drf_next
+    ; Re-read the atom — wt_on_active_changed clobbered ecx.
+    mov ecx, [x11_read_buf + 8]
+    cmp ecx, [wt_atom_net_active]
+    je .drf_prop_ws_refresh
+    cmp ecx, [ws_atom_current]
+    je .drf_prop_ws_refresh
+    cmp ecx, [ws_atom_state]
+    jne .drf_next
+.drf_prop_ws_refresh:
+    call ws_refetch_state
     jmp .drf_next
 .drf_prop_check_active:
+    cmp dword [wt_seg_idx], -1
+    je .drf_next                          ; @wintitle not configured
     cmp eax, [wt_active_xid]
     jne .drf_next
     cmp ecx, [wt_atom_net_wm_name]
@@ -858,10 +903,10 @@ refresh_due_segments:
     cmp eax, r13d
     ja .rds_next                          ; future
 .rds_fire:
-    ; Built-in @wintitle: never schedule a refresh — the segment is
-    ; updated only by PropertyNotify events. Park it on a far-future
-    ; next_run so compute_timeout_ms doesn't waste poll budget on it.
-    test byte [r12 + SEG_OFF_FLAGS], SEG_FLAG_BUILTIN_WINTITLE
+    ; Event-driven builtins (@wintitle, @workspaces) never fire from
+    ; the timer — park their next_run far in the future so
+    ; compute_timeout_ms doesn't poll on them.
+    test byte [r12 + SEG_OFF_FLAGS], SEG_FLAG_BUILTIN_WINTITLE | SEG_FLAG_BUILTIN_WORKSPACES
     jz .rds_fire_check_clock
     mov dword [r12 + SEG_OFF_NEXT_RUN], 0xFFFFFFFF
     jmp .rds_next
@@ -1020,11 +1065,17 @@ seed_next_runs:
     mov rax, rbx
     imul rax, SEG_STRIDE_REAL
     lea rdi, [segments + rax]
+    ; Skip builtin segments — they were populated by their *_init
+    ; helpers and must not have OUT_LEN cleared, otherwise the bar
+    ; renders blank until the first event change.
+    test byte [rdi + SEG_OFF_FLAGS], SEG_FLAG_BUILTIN_CLOCK | SEG_FLAG_BUILTIN_WINTITLE | SEG_FLAG_BUILTIN_WORKSPACES
+    jnz .snr_skip
     mov dword [rdi + SEG_OFF_NEXT_RUN], 0
     mov dword [rdi + SEG_OFF_PID], 0
     mov dword [rdi + SEG_OFF_PIPE_FD], -1
     mov byte [rdi + SEG_OFF_OUT_LEN], 0
     and byte [rdi + SEG_OFF_FLAGS], ~SEG_FLAG_DIRTY
+.snr_skip:
     inc ebx
     jmp .snr_loop
 .snr_done:
@@ -2466,6 +2517,21 @@ register_segment:
     jmp .rseg_done
 
 .rseg_try_wintitle:
+    ; @workspaces? "workspaces" = 10 chars.
+    cmp dword [r13+1], 'work'
+    jne .rseg_try_wintitle2
+    cmp dword [r13+5], 'spac'
+    jne .rseg_try_wintitle2
+    cmp word [r13+9], 'es'
+    jne .rseg_try_wintitle2
+    cmp byte [r13+11], 0
+    jne .rseg_try_wintitle2
+    mov eax, [segment_count]
+    mov [ws_seg_idx], eax
+    or byte [r15 + SEG_OFF_FLAGS], SEG_FLAG_BUILTIN_WORKSPACES
+    jmp .rseg_done
+
+.rseg_try_wintitle2:
     ; @wintitle? Compare bytes 1..8 = "wintitle" (8 chars).
     cmp dword [r13+1], 'wint'
     jne .rseg_real_cmd
@@ -4212,4 +4278,409 @@ wt_skip_cp:
     test ecx, ecx
     jnz .wsc_lead
 .wsc_done:
+    ret
+
+; eax = byte 0..255, rdi = buffer ptr. Writes 1..3 ASCII digits without
+; leading zeros; advances rdi.
+wps_emit_u8:
+    push rcx
+    push rdx
+    cmp eax, 100
+    jb .weu_lt100
+    mov ecx, 100
+    xor edx, edx
+    div ecx
+    add al, '0'
+    mov [rdi], al
+    inc rdi
+    mov eax, edx
+    mov ecx, 10
+    xor edx, edx
+    div ecx
+    add al, '0'
+    add dl, '0'
+    mov [rdi], al
+    mov [rdi+1], dl
+    add rdi, 2
+    jmp .weu_done
+.weu_lt100:
+    cmp eax, 10
+    jb .weu_lt10
+    mov ecx, 10
+    xor edx, edx
+    div ecx
+    add al, '0'
+    add dl, '0'
+    mov [rdi], al
+    mov [rdi+1], dl
+    add rdi, 2
+    jmp .weu_done
+.weu_lt10:
+    add al, '0'
+    mov [rdi], al
+    inc rdi
+.weu_done:
+    pop rdx
+    pop rcx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; @workspaces builtin — workspace pips + layout glyph, driven by tile's
+; root-window properties _NET_CURRENT_DESKTOP and _TILE_BAR_STATE.
+;
+; Replaces tile's bar drawing for the workspace strip. Tile keeps
+; rendering its own bar only if bar_height > 0 in ~/.tilerc; setting
+; bar_height = 0 hands the whole bar over to strip.
+;
+; Render: "1 2 3  4 5 6  7 8 9  0 T" where each digit is SGR-coloured
+;   active     → bright white  \x1b[97m
+;   populated  → segment fg    \x1b[m
+;   empty      → bright black  \x1b[90m
+; followed by the current WS's layout glyph (T = TABBED, S = SPLIT)
+; in cyan \x1b[96m.
+; ══════════════════════════════════════════════════════════════════════
+
+workspaces_init:
+    cmp dword [ws_seg_idx], -1
+    je .wsi_done
+
+    ; Intern the two atoms we need.
+    lea rdi, [ws_str_current]
+    mov esi, ws_len_current
+    call intern_atom_sync
+    mov [ws_atom_current], eax
+    lea rdi, [ws_str_state]
+    mov esi, ws_len_state
+    call intern_atom_sync
+    mov [ws_atom_state], eax
+
+    ; Subscribe root to PropertyChangeMask. wintitle_init may have
+    ; already done this; setting it again is idempotent (ChangeWindow-
+    ; Attributes with the same value-mask + value is a no-op on the wire
+    ; effectively).
+    mov edi, [x11_root_window]
+    mov esi, PROPERTY_CHANGE_MASK
+    call wt_set_event_mask
+
+    call ws_refetch_state
+.wsi_done:
+    ret
+
+; Re-fetch both _NET_CURRENT_DESKTOP and _TILE_BAR_STATE from root,
+; update the BSS mirror, format into the segment output.
+ws_refetch_state:
+    push rbx
+
+    ; Fetch _NET_CURRENT_DESKTOP (CARD32).
+    mov edi, [x11_root_window]
+    mov esi, [ws_atom_current]
+    xor edx, edx
+    mov ecx, 1
+    call wt_get_property
+    test eax, eax
+    js .wrs_no_current
+    mov ecx, [tmp_buf + 16]               ; value-length (32-bit units)
+    test ecx, ecx
+    jz .wrs_no_current
+    mov ebx, [tmp_buf + 32]               ; 0-indexed desktop
+    inc ebx                               ; → 1..N
+    cmp ebx, 1
+    jb .wrs_no_current
+    cmp ebx, WS_COUNT
+    ja .wrs_no_current
+    mov [ws_current], ebx
+.wrs_no_current:
+
+    ; Fetch _TILE_BAR_STATE (currently 22 bytes, request 6 longs = 24
+    ; for headroom so format extensions don't silently truncate).
+    mov edi, [x11_root_window]
+    mov esi, [ws_atom_state]
+    xor edx, edx
+    mov ecx, 6                            ; 24 bytes
+    call wt_get_property
+    test eax, eax
+    js .wrs_publish
+    mov ecx, [tmp_buf + 16]               ; value-length (bytes since format=8)
+    cmp ecx, 22
+    jb .wrs_publish                       ; too short → skip
+    ; Copy 10 bytes of populated[].
+    xor ebx, ebx
+.wrs_cp_pop:
+    cmp ebx, WS_COUNT
+    jge .wrs_cp_pop_done
+    mov al, [tmp_buf + 32 + rbx]
+    mov [ws_populated + rbx], al
+    inc ebx
+    jmp .wrs_cp_pop
+.wrs_cp_pop_done:
+    ; Copy 10 bytes of layouts.
+    xor ebx, ebx
+.wrs_cp_lay:
+    cmp ebx, WS_COUNT
+    jge .wrs_cp_lay_done
+    mov al, [tmp_buf + 32 + 10 + rbx]
+    mov [ws_layouts + rbx], al
+    inc ebx
+    jmp .wrs_cp_lay
+.wrs_cp_lay_done:
+    mov al, [tmp_buf + 32 + 20]
+    mov [ws_tab_count], al
+    mov al, [tmp_buf + 32 + 21]
+    mov [ws_tab_index], al
+
+.wrs_publish:
+    call ws_publish_segment
+    pop rbx
+    ret
+
+; Format the workspace strip into the @workspaces segment's output
+; buffer. SGR is emitted only on state TRANSITION (active vs populated
+; vs empty), so a typical "1 active + 9 empty" workspace renders in
+; ~30 bytes of escapes, well inside SEG_OUT_LEN = 96.
+;
+; Active   = bright orange (24-bit RGB 255,165,0)
+; Populated = bright white (\x1b[97m)
+; Empty    = bright black  (\x1b[90m)
+%define WS_STATE_NONE      0
+%define WS_STATE_EMPTY     1
+%define WS_STATE_POPULATED 2
+%define WS_STATE_ACTIVE    3
+ws_publish_segment:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov eax, [ws_seg_idx]
+    cmp eax, -1
+    je .wps2_done
+    imul rax, rax, SEG_STRIDE_REAL
+    lea r12, [segments + rax]
+    lea rdi, [r12 + SEG_OFF_OUTPUT]
+    mov r13, rdi                          ; remember output start
+    xor r15d, r15d                        ; r15 = previous state (NONE)
+
+    xor ebx, ebx                          ; display position 0..9
+.wps2_loop:
+    cmp ebx, WS_COUNT
+    jge .wps2_after_pips
+
+    ; ws number: position 0..8 → 1..9, position 9 → 10.
+    mov r14d, ebx
+    inc r14d
+    cmp ebx, 9
+    jne .wps2_have_ws
+    mov r14d, 10
+.wps2_have_ws:
+
+    ; Single space before each non-first digit (compact mode — no
+    ; extra group separators).
+    test ebx, ebx
+    jz .wps2_compute_state
+    mov byte [rdi], ' '
+    inc rdi
+
+.wps2_compute_state:
+    ; Determine state for this WS.
+    mov eax, [ws_current]
+    cmp eax, r14d
+    je .wps2_state_active
+    mov ecx, r14d
+    dec ecx
+    movzx eax, byte [ws_populated + rcx]
+    test eax, eax
+    jnz .wps2_state_populated
+    mov ecx, WS_STATE_EMPTY
+    jmp .wps2_state_have
+.wps2_state_populated:
+    mov ecx, WS_STATE_POPULATED
+    jmp .wps2_state_have
+.wps2_state_active:
+    mov ecx, WS_STATE_ACTIVE
+.wps2_state_have:
+    ; Skip SGR emit if state unchanged from previous WS.
+    cmp ecx, r15d
+    je .wps2_emit_digit
+    mov r15d, ecx                         ; remember state
+    cmp ecx, WS_STATE_ACTIVE
+    je .wps2_sgr_active
+    cmp ecx, WS_STATE_POPULATED
+    je .wps2_sgr_populated
+    ; Empty: ESC [ 9 0 m
+    mov byte [rdi+0], 0x1b
+    mov byte [rdi+1], '['
+    mov byte [rdi+2], '9'
+    mov byte [rdi+3], '0'
+    mov byte [rdi+4], 'm'
+    add rdi, 5
+    jmp .wps2_emit_digit
+.wps2_sgr_populated:
+    ; Regular white: ESC [ 3 7 m  (cfg_palette[7] = #CCCCCC, dimmer
+    ; than active orange but brighter than empty grey).
+    mov byte [rdi+0], 0x1b
+    mov byte [rdi+1], '['
+    mov byte [rdi+2], '3'
+    mov byte [rdi+3], '7'
+    mov byte [rdi+4], 'm'
+    add rdi, 5
+    jmp .wps2_emit_digit
+.wps2_sgr_active:
+    ; Orange via repurposed palette slot 35 (see sgr_palette).
+    mov byte [rdi+0], 0x1b
+    mov byte [rdi+1], '['
+    mov byte [rdi+2], '3'
+    mov byte [rdi+3], '5'
+    mov byte [rdi+4], 'm'
+    add rdi, 5
+
+.wps2_emit_digit:
+    ; Digit: '1'..'9' for ws 1..9, '0' for ws 10.
+    cmp r14d, 10
+    jne .wps2_digit_normal
+    mov byte [rdi], '0'
+    inc rdi
+    jmp .wps2_digit_done
+.wps2_digit_normal:
+    lea eax, [r14d + '0']
+    mov [rdi], al
+    inc rdi
+.wps2_digit_done:
+    inc ebx
+    jmp .wps2_loop
+
+.wps2_after_pips:
+    ; Space + layout glyph in dim grey, if we know the WS.
+    mov eax, [ws_current]
+    test eax, eax
+    jz .wps2_finalize
+    cmp eax, WS_COUNT
+    ja .wps2_finalize
+    ; ' '  ESC [ 9 0 m  <layout>  — bright black = dim grey for layout
+    mov byte [rdi+0], ' '
+    mov byte [rdi+1], 0x1b
+    mov byte [rdi+2], '['
+    mov byte [rdi+3], '9'
+    mov byte [rdi+4], '0'
+    mov byte [rdi+5], 'm'
+    add rdi, 6
+    mov ecx, eax
+    dec ecx
+    movzx eax, byte [ws_layouts + rcx]
+    cmp eax, 1                            ; LAYOUT_SPLIT_H
+    je .wps2_layout_h
+    cmp eax, 2                            ; LAYOUT_SPLIT_V
+    je .wps2_layout_v
+    cmp eax, 3                            ; LAYOUT_MASTER
+    je .wps2_layout_m
+    mov byte [rdi], 'T'
+    jmp .wps2_layout_done
+.wps2_layout_h:
+    mov byte [rdi], 'H'
+    jmp .wps2_layout_done
+.wps2_layout_v:
+    mov byte [rdi], 'V'
+    jmp .wps2_layout_done
+.wps2_layout_m:
+    mov byte [rdi], 'M'
+.wps2_layout_done:
+    inc rdi
+
+    ; Tab bullets — fixed 6-char placeholder so the bar doesn't reflow.
+    ; Active bullet ●: orange via [35m (same as active WS pip).
+    ; Inactive bullet ○: white via [37m (same as populated WS pip).
+    ; State-tracked: r15 holds previous SGR state to skip redundant codes.
+    ; (r15 was last used in the WS pip loop; reuse here.)
+    mov byte [rdi], ' '
+    inc rdi
+    mov r15d, -1                          ; force first SGR emit
+    xor ebx, ebx                          ; position 0..4
+.wps2_bul_loop:
+    cmp ebx, 5
+    jge .wps2_bul_overflow
+    movzx eax, byte [ws_tab_count]
+    cmp ebx, eax
+    jae .wps2_bul_pad                     ; past end of tabs → space pad
+    movzx eax, byte [ws_tab_index]
+    dec eax                               ; 1-based → 0-based
+    cmp ebx, eax
+    je .wps2_bul_active
+
+    ; Inactive bullet — emit [37m if not already in white state.
+    cmp r15d, 1
+    je .wps2_bul_inactive_emit
+    mov byte [rdi+0], 0x1b
+    mov byte [rdi+1], '['
+    mov byte [rdi+2], '3'
+    mov byte [rdi+3], '7'
+    mov byte [rdi+4], 'm'
+    add rdi, 5
+    mov r15d, 1
+.wps2_bul_inactive_emit:
+    ; ○ U+25CB
+    mov byte [rdi+0], 0xE2
+    mov byte [rdi+1], 0x97
+    mov byte [rdi+2], 0x8B
+    add rdi, 3
+    inc ebx
+    jmp .wps2_bul_loop
+
+.wps2_bul_active:
+    ; Active bullet — emit [35m (orange) if not already in orange state.
+    cmp r15d, 2
+    je .wps2_bul_active_emit
+    mov byte [rdi+0], 0x1b
+    mov byte [rdi+1], '['
+    mov byte [rdi+2], '3'
+    mov byte [rdi+3], '5'
+    mov byte [rdi+4], 'm'
+    add rdi, 5
+    mov r15d, 2
+.wps2_bul_active_emit:
+    ; ● U+25CF
+    mov byte [rdi+0], 0xE2
+    mov byte [rdi+1], 0x97
+    mov byte [rdi+2], 0x8F
+    add rdi, 3
+    inc ebx
+    jmp .wps2_bul_loop
+
+.wps2_bul_pad:
+    mov byte [rdi], ' '
+    inc rdi
+    inc ebx
+    jmp .wps2_bul_loop
+
+.wps2_bul_overflow:
+    movzx eax, byte [ws_tab_count]
+    cmp eax, 5
+    ja .wps2_bul_plus
+    mov byte [rdi], ' '
+    inc rdi
+    jmp .wps2_finalize
+.wps2_bul_plus:
+    mov byte [rdi], '+'
+    inc rdi
+
+.wps2_finalize:
+    ; ESC [ m to reset back to default before strip's run terminator.
+    mov byte [rdi+0], 0x1b
+    mov byte [rdi+1], '['
+    mov byte [rdi+2], 'm'
+    add rdi, 3
+
+    sub rdi, r13                          ; total bytes
+    mov rax, rdi
+    cmp rax, SEG_OUT_LEN
+    jbe .wps2_len_ok
+    mov rax, SEG_OUT_LEN
+.wps2_len_ok:
+    mov [r12 + SEG_OFF_OUT_LEN], al
+    or byte [r12 + SEG_OFF_FLAGS], SEG_FLAG_DIRTY
+    mov byte [strip_dirty], 1
+.wps2_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     ret
