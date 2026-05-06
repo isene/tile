@@ -362,6 +362,9 @@ drf_x11_seen:        resb 1               ; set in drain_ready_fds when an X11
                                           ; the post-drain root-state pull that
                                           ; catches PropertyNotifies discarded
                                           ; by intervening sync GetProperty calls
+last_pull_sec:       resq 1               ; unix seconds of last forced pull;
+                                          ; safety-net resync runs every 30s
+                                          ; in case root subscription is lost
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Code
@@ -474,22 +477,28 @@ main_loop:
 
     call drain_ready_fds
     call refresh_due_segments
-    ; Unconditional root-state pull on every poll wake so the indicator
-    ; never goes stale even if root's PROPERTY_CHANGE_MASK gets silently
-    ; revoked (we've observed strip stop receiving PropertyNotify on
-    ; root despite ChangeWindowAttributes succeeding — mechanism unclear,
-    ; possibly a per-client mask drop at the X server). Cost: 3 sync
-    ; GetProperty per poll wake (~6 syscalls). Idle: zero (no wake → no
-    ; pull). Active: bounded by poll wake rate.
+    ; Safety-net resync: at most once per 30 seconds, force-pull root
+    ; state even if no PropertyNotify arrived. Catches cases where
+    ; root's PROPERTY_CHANGE_MASK silently dropped (observed but not
+    ; reproducible). Idle cost: 1 vDSO clock_gettime per poll wake +
+    ; one full pull per 30 seconds (~0.5 syscalls/sec averaged). The
+    ; clock check itself is a vDSO call — no syscall overhead.
+    call now_seconds
+    mov rcx, [last_pull_sec]
+    sub rax, rcx
+    cmp rax, 30
+    jb .ml_no_safety_pull
+    call now_seconds
+    mov [last_pull_sec], rax
     cmp dword [wt_seg_idx], -1
-    je .ml_no_wt_pull
+    je .ml_safety_no_wt
     call wt_on_active_changed
     call wt_refetch_title
-.ml_no_wt_pull:
+.ml_safety_no_wt:
     cmp dword [ws_seg_idx], -1
-    je .ml_no_ws_pull
+    je .ml_no_safety_pull
     call ws_refetch_state
-.ml_no_ws_pull:
+.ml_no_safety_pull:
     call render_strip
     jmp main_loop
 
