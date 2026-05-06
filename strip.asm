@@ -611,7 +611,6 @@ drain_ready_fds:
     syscall
     cmp rax, 32
     jl .drf_next
-    mov byte [drf_x11_seen], 1            ; mark for drf_done's catch-up pull
     movzx eax, byte [x11_read_buf]
     and al, 0x7F
     cmp al, EV_EXPOSE
@@ -636,6 +635,10 @@ drain_ready_fds:
     ; we'd otherwise dispatch on. Refetching both unconditionally
     ; costs 2-4 extra syscalls per root PropertyNotify and removes
     ; the whole class of "stale after WS switch / focus change" bugs.
+    ; Mark seen so drf_done's catch-up pull catches PropertyNotifies
+    ; that would otherwise be discarded by the sync GetProperty calls
+    ; in the per-event handlers below.
+    mov byte [drf_x11_seen], 1
     mov eax, [x11_read_buf + 4]           ; window
     cmp eax, [x11_root_window]
     jne .drf_prop_check_active
@@ -4182,15 +4185,16 @@ wt_publish_segment:
     jmp .wps_pad
 
 .wps_truncate:
-    ; Need mid-string truncate. Copy first (max-1+1)/2 = (max+1)/2
-    ; codepoints, append "…" (3 bytes UTF-8), copy last (max-1)/2.
+    ; Need mid-string truncate. Title rendered as left + "…" + right
+    ; should sum to exactly max_chars cells so the bar past wintitle
+    ; doesn't shift between full and truncated frames. Split the
+    ; remaining max-1 chars: left_keep = max/2, right_keep = max-1-left.
     mov eax, r14d
-    inc eax
     shr eax, 1
-    mov ebx, eax                          ; left_keep = (max+1)/2
+    mov ebx, eax                          ; left_keep = max/2
     mov eax, r14d
     dec eax
-    shr eax, 1                            ; right_keep = (max-1)/2
+    sub eax, ebx                          ; right_keep = max - 1 - left
 
     ; Copy left_keep codepoints.
     push rax                              ; save right_keep
