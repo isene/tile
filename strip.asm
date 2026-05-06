@@ -763,7 +763,10 @@ drain_ready_fds:
     mov byte [drf_x11_seen], 0
     cmp dword [wt_seg_idx], -1
     je .drf_pull_no_wt
-    call wt_on_active_changed
+    call wt_on_active_changed             ; refetches title only if xid changed
+    call wt_refetch_title                 ; covers same-xid-new-title case where
+                                          ; the per-window PropertyNotify got
+                                          ; eaten by an intervening sync read
 .drf_pull_no_wt:
     cmp dword [ws_seg_idx], -1
     je .drf_zombie_reap
