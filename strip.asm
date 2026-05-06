@@ -477,18 +477,21 @@ main_loop:
 
     call drain_ready_fds
     call refresh_due_segments
-    ; Safety-net resync: at most once per 30 seconds, force-pull root
-    ; state even if no PropertyNotify arrived. Catches cases where
-    ; root's PROPERTY_CHANGE_MASK silently dropped (observed but not
-    ; reproducible). Idle cost: 1 vDSO clock_gettime per poll wake +
-    ; one full pull per 30 seconds (~0.5 syscalls/sec averaged). The
-    ; clock check itself is a vDSO call — no syscall overhead.
+    ; Timer-driven root-state refresh: poll once per second regardless
+    ; of subscription state. This is how every other segment works —
+    ; the old tilebar+wintitle-asmite combo never had stale indicator
+    ; bugs because it was pure timer polling. Subscription-based
+    ; PropertyNotify dispatch is more efficient on paper but proved
+    ; fragile in practice (subscription silently drops, observed
+    ; repeatedly but not reproducible). Cost: 6 syscalls/sec = ~6µs
+    ; of CPU per second, well below any battery-meter noise floor.
+    ; The PropertyNotify path still works when subscription is healthy
+    ; — drf_x11_seen-gated catch-up handles burst cases — this is the
+    ; reliability floor.
     call now_seconds
     mov rcx, [last_pull_sec]
-    sub rax, rcx
-    cmp rax, 30
-    jb .ml_no_safety_pull
-    call now_seconds
+    cmp rax, rcx
+    je .ml_no_safety_pull                  ; same second, skip
     mov [last_pull_sec], rax
     cmp dword [wt_seg_idx], -1
     je .ml_safety_no_wt
