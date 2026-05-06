@@ -474,6 +474,22 @@ main_loop:
 
     call drain_ready_fds
     call refresh_due_segments
+    ; Unconditional root-state pull on every poll wake so the indicator
+    ; never goes stale even if root's PROPERTY_CHANGE_MASK gets silently
+    ; revoked (we've observed strip stop receiving PropertyNotify on
+    ; root despite ChangeWindowAttributes succeeding — mechanism unclear,
+    ; possibly a per-client mask drop at the X server). Cost: 3 sync
+    ; GetProperty per poll wake (~6 syscalls). Idle: zero (no wake → no
+    ; pull). Active: bounded by poll wake rate.
+    cmp dword [wt_seg_idx], -1
+    je .ml_no_wt_pull
+    call wt_on_active_changed
+    call wt_refetch_title
+.ml_no_wt_pull:
+    cmp dword [ws_seg_idx], -1
+    je .ml_no_ws_pull
+    call ws_refetch_state
+.ml_no_ws_pull:
     call render_strip
     jmp main_loop
 
