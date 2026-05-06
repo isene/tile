@@ -6881,6 +6881,15 @@ action_gather:
     ret
 
 action_restart:
+    ; Re-spawn snixembed so the SNI → XEmbed bridge comes back up if it
+    ; died at some point. The new instance races for the DBus name
+    ; org.kde.StatusNotifierWatcher; if the old one still holds it the
+    ; new instance exits cleanly (no harm). If the old one is gone the
+    ; new instance takes over and tray icons re-dock once strip's
+    ; restart broadcasts MANAGER. Done BEFORE execve because the child
+    ; needs to outlive this process.
+    lea rdi, [rel .ar_snixembed]
+    call fork_exec_string
     ; Build argv = [path, "--no-autostart", NULL] so the re-exec'd tile
     ; doesn't run autostart again (which would spawn a duplicate
     ; firefox/strip/feh/glass over the user's existing session).
@@ -6937,6 +6946,7 @@ action_restart:
     ret
 .ar_path1: db "/proc/self/exe", 0
 .ar_path3: db "/home/geir/bin/tile", 0
+.ar_snixembed: db "snixembed", 0
 .ar_fail_msg: db "tile: action_restart: all execve attempts failed", 10
 .ar_fail_msg_len equ $ - .ar_fail_msg
 

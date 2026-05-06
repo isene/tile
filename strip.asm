@@ -356,13 +356,12 @@ ws_populated:        resb WS_COUNT        ; client count per WS
 ws_layouts:          resb WS_COUNT        ; 0=T 1=H 2=V 3=M
 ws_tab_count:        resb 1               ; clients on current_ws
 ws_tab_index:        resb 1               ; active tab idx (1-based, 0=none)
-ws_root_prop_lost:   resb 1               ; wt_get_property's sync read
-                                          ; discarded a root PropertyNotify;
-                                          ; drf_x11_property re-runs ws_refetch_state
-                                          ; until clear (catches the "tile
-                                          ; publishes CD+TBS in one batch and
-                                          ; the TBS notify gets eaten by the
-                                          ; CD handler's sync read" race)
+ws_root_prop_lost:   resb 1               ; (reserved; legacy slot)
+drf_x11_seen:        resb 1               ; set in drain_ready_fds when an X11
+                                          ; event was successfully read; drives
+                                          ; the post-drain root-state pull that
+                                          ; catches PropertyNotifies discarded
+                                          ; by intervening sync GetProperty calls
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Code
@@ -612,6 +611,7 @@ drain_ready_fds:
     syscall
     cmp rax, 32
     jl .drf_next
+    mov byte [drf_x11_seen], 1            ; mark for drf_done's catch-up pull
     movzx eax, byte [x11_read_buf]
     and al, 0x7F
     cmp al, EV_EXPOSE
@@ -639,20 +639,14 @@ drain_ready_fds:
     mov eax, [x11_read_buf + 4]           ; window
     cmp eax, [x11_root_window]
     jne .drf_prop_check_active
-    mov byte [ws_root_prop_lost], 0       ; clear before this batch
-.drf_prop_root_loop:
     cmp dword [wt_seg_idx], -1
     je .drf_prop_no_wt
     call wt_on_active_changed
 .drf_prop_no_wt:
     cmp dword [ws_seg_idx], -1
-    je .drf_prop_root_check
-    call ws_refetch_state
-.drf_prop_root_check:
-    cmp byte [ws_root_prop_lost], 0
     je .drf_next
-    mov byte [ws_root_prop_lost], 0       ; clear and replay
-    jmp .drf_prop_root_loop
+    call ws_refetch_state
+    jmp .drf_next
 .drf_prop_check_active:
     cmp dword [wt_seg_idx], -1
     je .drf_next                          ; @wintitle not configured
@@ -753,6 +747,25 @@ drain_ready_fds:
     inc ebx
     jmp .drf_loop
 .drf_done:
+    ; If we processed at least one X event this cycle, pull root state
+    ; once before returning. Sync GetProperty in any of the per-event
+    ; handlers may have silently discarded a follow-up PropertyNotify
+    ; for _NET_CURRENT_DESKTOP / _TILE_BAR_STATE / _NET_ACTIVE_WINDOW —
+    ; this catch-up read sees the latest server state regardless of
+    ; which event was lost. Idle (only segment-pipe wakes, no X events)
+    ; skips this entirely, so battery cost stays at zero when nothing
+    ; is happening.
+    cmp byte [drf_x11_seen], 0
+    je .drf_zombie_reap
+    mov byte [drf_x11_seen], 0
+    cmp dword [wt_seg_idx], -1
+    je .drf_pull_no_wt
+    call wt_on_active_changed
+.drf_pull_no_wt:
+    cmp dword [ws_seg_idx], -1
+    je .drf_zombie_reap
+    call ws_refetch_state
+.drf_zombie_reap:
     ; Reap any zombies (children that closed their pipe).
     call reap_segment_children
     pop r13
@@ -4078,24 +4091,9 @@ wt_get_property:
     pop rbx
     ret
 .wgp_event_skip:
-    ; 32 bytes already read into tmp_buf as an event packet. If it's a
-    ; PropertyNotify on root, set a flag so the caller can replay
-    ; ws_refetch_state — otherwise the property update that fired the
-    ; PropertyNotify is lost forever (the ws_refetch_state read happened
-    ; before tile's second ChangeProperty in a CD+TBS batch hit the
-    ; server, so re-running picks up the new value once it's there).
-    push rax
-    movzx eax, byte [tmp_buf]
-    and al, 0x7F
-    cmp al, 28                            ; PropertyNotify
-    pop rax
-    jne .wgp_read
-    push rax
-    mov eax, [tmp_buf + 4]                ; window
-    cmp eax, [x11_root_window]
-    pop rax
-    jne .wgp_read
-    mov byte [ws_root_prop_lost], 1
+    ; 32 bytes already read into tmp_buf as an event packet. Discard.
+    ; drain_ready_fds's post-drain root-state pull (gated on drf_x11_seen)
+    ; catches anything that mattered.
     jmp .wgp_read
 .wgp_fail:
     mov rax, -1
