@@ -1920,6 +1920,19 @@ render_strip:
     push r12
     push r13
 
+    ; Heartbeat: re-issue PROPERTY_CHANGE_MASK on root. The subscription
+    ; gets silently lost periodically (mechanism unknown, observed via
+    ; "WS indicator and wintitle die" symptom: xev still sees PropertyNotify
+    ; events on root, but strip's poll never wakes for them — proving
+    ; strip's per-client mask was revoked while ours stayed). Re-subbing
+    ; here is cheap (~16-byte buffered ChangeWindowAttributes that
+    ; piggybacks on the render's existing flush, no reply, no event
+    ; generated server-side) and renders only fire when something actually
+    ; changes. Recovery latency ≤ next segment tick after subscription loss.
+    mov edi, [x11_root_window]
+    mov esi, PROPERTY_CHANGE_MASK
+    call wt_set_event_mask
+
     ; PolyFillRectangle on pixmap to clear it (using bg-coloured GC).
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_POLY_FILL_RECT
