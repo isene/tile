@@ -254,6 +254,8 @@ tile_bar_state_str:      db "_TILE_BAR_STATE"
 tile_bar_state_len       equ $ - tile_bar_state_str
 net_active_window_str: db "_NET_ACTIVE_WINDOW"
 net_active_window_len equ 18
+net_wm_desktop_str: db "_NET_WM_DESKTOP"
+net_wm_desktop_len equ $ - net_wm_desktop_str
 
 ; EWMH window-type atoms — used to detect dialog/utility/tool/menu
 ; windows that should NOT be tiled (Gimp tool palettes, file pickers,
@@ -818,6 +820,7 @@ wm_protocols_atom:   resd 1
 wm_delete_atom:      resd 1
 tile_shell_pid_atom: resd 1
 net_active_window_atom: resd 1
+net_wm_desktop_atom:    resd 1
 net_current_desktop_atom: resd 1
 tile_bar_state_atom:    resd 1
 
@@ -3859,6 +3862,38 @@ set_input_focus:
     pop rbx
     ret
 
+; publish_wm_desktop: r8d = window XID, ecx = 1-based workspace.
+; Sets _NET_WM_DESKTOP = ecx-1 on the window. EWMH numbers desktops
+; from 0; tile uses 1-based internally. Skips if the atom hasn't
+; been interned yet (called too early) or if ecx is 0 (untracked).
+; Clobbers rax, rcx, rdx, rsi, rdi.
+publish_wm_desktop:
+    mov eax, [net_wm_desktop_atom]
+    test eax, eax
+    jz .pwd_done
+    test ecx, ecx
+    jz .pwd_done
+    dec ecx                              ; 1-based → 0-based
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_PROPERTY
+    mov byte [rdi+1], 0                  ; mode = Replace
+    mov word [rdi+2], 7                  ; length: 6 base + 1 value word
+    mov [rdi+4], r8d                     ; window
+    mov [rdi+8], eax                     ; property = _NET_WM_DESKTOP atom
+    mov dword [rdi+12], 6                ; type = CARDINAL
+    mov byte [rdi+16], 32                ; format
+    mov byte [rdi+17], 0
+    mov byte [rdi+18], 0
+    mov byte [rdi+19], 0
+    mov dword [rdi+20], 1                ; value-length (32-bit words)
+    mov [rdi+24], ecx                    ; 0-based desktop number
+    lea rsi, [tmp_buf]
+    mov rdx, 28
+    call x11_buffer
+    inc dword [x11_seq]
+.pwd_done:
+    ret
+
 ; eax = window XID. Append to client_xids on the current workspace.
 ; If a spawn-split action set pending_spawn_xid, the new client is
 ; rotated into position immediately before/after the anchor (depending
@@ -3884,6 +3919,14 @@ track_client:
     mov byte [client_unmap_expected + rbx], 0
     mov byte [client_color + rbx], 0      ; tab_default colour
     inc dword [client_count]
+    ; Publish _NET_WM_DESKTOP on the newly-tracked window so EWMH-aware
+    ; tools (drain, wmctrl, panels) can attribute pid → workspace.
+    ; ecx already holds the 1-based ws; helper converts to 0-based.
+    ; Helper clobbers rcx; reload from memory afterwards so the debug
+    ; logging block below still sees the right value.
+    mov r8d, r12d                         ; XID into r8 for helper
+    call publish_wm_desktop
+    movzx ecx, byte [client_ws + rbx]
     ; Debug: log "tile: trk xid=N idx=N cnt=N\n"
     push rax
     push rcx
@@ -5015,6 +5058,13 @@ intern_wm_atoms:
     mov esi, net_current_desktop_len
     call intern_one_atom
     mov [net_current_desktop_atom], eax
+
+    ; _NET_WM_DESKTOP — published per-window so EWMH-aware tools (drain,
+    ; wmctrl, panels) can attribute each window to its workspace.
+    lea rdi, [net_wm_desktop_str]
+    mov esi, net_wm_desktop_len
+    call intern_one_atom
+    mov [net_wm_desktop_atom], eax
     lea rdi, [tile_bar_state_str]
     mov esi, tile_bar_state_len
     call intern_one_atom
@@ -7176,6 +7226,17 @@ move_focused_to_workspace:
     mov eax, r13d
     dec eax
     inc byte [workspace_populated + rax]
+
+    ; Publish the new _NET_WM_DESKTOP for the moved window. r12 is the
+    ; client index, r13b holds the new 1-based ws. Helper expects the
+    ; XID in r8d and the ws in ecx. Helper clobbers rax/rcx/rdx/rsi/rdi.
+    push r12
+    push r13
+    mov r8d, [client_xids + r12*4]
+    movzx ecx, r13b
+    call publish_wm_desktop
+    pop r13
+    pop r12
 
     ; Snapshot prev target active before overwriting, for the
     ; target-output refresh below.
