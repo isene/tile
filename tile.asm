@@ -4077,6 +4077,65 @@ untrack_client:
     inc ebx
     jmp .uc_find
 .uc_remove:
+    ; Debug: log "tile: untrk x=N c=N i=N\n" so destroy/untrack events
+    ; aren't silent. Cheap (untracks are rare, not in any hot path).
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    lea rdi, [dkp_buf]
+    mov byte [rdi+0], 't'
+    mov byte [rdi+1], 'i'
+    mov byte [rdi+2], 'l'
+    mov byte [rdi+3], 'e'
+    mov byte [rdi+4], ':'
+    mov byte [rdi+5], ' '
+    mov byte [rdi+6], 'u'
+    mov byte [rdi+7], 'n'
+    mov byte [rdi+8], 't'
+    mov byte [rdi+9], 'r'
+    mov byte [rdi+10], 'k'
+    mov byte [rdi+11], ' '
+    mov byte [rdi+12], 'x'
+    mov byte [rdi+13], '='
+    add rdi, 14
+    mov eax, r12d
+    call dbg_u32_dec
+    mov byte [rdi], ' '
+    mov byte [rdi+1], 'c'
+    mov byte [rdi+2], '='
+    add rdi, 3
+    mov eax, [client_count]
+    call dbg_u32_dec
+    mov byte [rdi], ' '
+    mov byte [rdi+1], 'i'
+    mov byte [rdi+2], '='
+    add rdi, 3
+    mov eax, ebx
+    call dbg_u32_dec
+    mov byte [rdi], 10
+    inc rdi
+    lea rsi, [dkp_buf]
+    mov rdx, rdi
+    sub rdx, rsi
+    mov rax, SYS_WRITE
+    mov edi, 2
+    syscall
+    call log_write_buf
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
     ; Decrement populated for this client's workspace.
     movzx ecx, byte [client_ws + rbx]
     test ecx, ecx
