@@ -5215,8 +5215,46 @@ rediscover_outputs:
     mov byte [output_source], 'X'
 
 .rdo_after_parse:
+    ; Re-init default workspace pinning so the new output topology
+    ; reaches every workspace. Without this, WS 10 stays pinned to
+    ; output 1 after the external is unplugged, leaving it effectively
+    ; unreachable (apply_workspace_layout bails on `pinned >= count`).
+    ; Mirrors discover_outputs' startup logic — user pin overrides in
+    ; ws_pin_override are re-applied by apply_pin_overrides below.
+    xor ebx, ebx
+.rdo_default_pin:
+    cmp ebx, WS_COUNT
+    jge .rdo_default_pin_done
+    mov byte [ws_pinned_output + rbx], 0
+    inc ebx
+    jmp .rdo_default_pin
+.rdo_default_pin_done:
+    cmp byte [output_count], 2
+    jl .rdo_apply_overrides
+    mov byte [ws_pinned_output + 9], 1
+.rdo_apply_overrides:
     ; Re-apply pin overrides + recompute output_current_ws.
     call apply_pin_overrides
+
+    ; Restore the focused workspace's visibility. apply_pin_overrides
+    ; recomputes output_current_ws to the lowest-pinned WS per output,
+    ; which on hot-plug would reset the user's view (focused on WS 5 on
+    ; the laptop → laptop snaps to WS 1). Re-route the current_ws onto
+    ; its now-pinned output so the user's context follows the topology
+    ; change. Also covers "was on WS 10 when external unplugged" — after
+    ; the re-init above WS 10 is on output 0, so the laptop reclaims it.
+    movzx eax, byte [current_ws]
+    test eax, eax
+    jz .rdo_skip_restore
+    cmp eax, WS_COUNT
+    ja .rdo_skip_restore
+    mov ecx, eax                          ; preserve 1-based ws
+    dec eax
+    movzx esi, byte [ws_pinned_output + rax]
+    cmp sil, byte [output_count]
+    jae .rdo_skip_restore
+    mov [output_current_ws + rsi], cl
+.rdo_skip_restore:
     ; Resize the bar to output 0's (possibly new) width.
     call resize_bar_to_output0
     ; Re-apply layout for every visible workspace.
@@ -5235,6 +5273,9 @@ rediscover_outputs:
 .rdo_render:
     call render_bar
     call x11_flush
+    call dbg_dump_outputs                 ; emit "tile: outputs=N src=X" so
+                                          ; hot-plug events leave a trace in
+                                          ; the log alongside startup
 .rdo_done:
     pop r14
     pop r13
