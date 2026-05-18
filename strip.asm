@@ -58,6 +58,13 @@
 %define X11_SET_SELECTION_OWNER 22
 %define X11_SEND_EVENT          25
 %define X11_REPARENT_WINDOW     7
+%define X11_QUERY_EXTENSION     98
+
+; RandR 1.5 RRGetMonitors. Used at startup to constrain strip to the
+; primary monitor's geometry — Xorg's x11_screen_width covers the entire
+; virtual root (both monitors), which would put right-aligned segments
+; like the clock and tray off on the external display.
+%define RR_GET_MONITORS         42
 %define X11_CONFIGURE_WINDOW    12
 %define X11_CHANGE_PROPERTY     18
 
@@ -148,6 +155,9 @@ default_font_name: db "-*-terminus-*-*-*-*-16-*-*-*-*-*-iso10646-1", 0
 default_font_name_len equ $ - default_font_name - 1
 
 striprc_suffix:  db "/.striprc", 0
+
+randr_name:       db "RANDR"
+randr_name_len    equ $ - randr_name
 
 ; Default exec arg vectors for fork_segment.
 sh_path:         db "/bin/sh", 0
@@ -244,8 +254,13 @@ x11_rid_base:        resd 1
 x11_rid_mask:        resd 1
 x11_rid_next:        resd 1
 x11_root_window:     resd 1
+; x11_screen_width is the virtual root size at startup (covers ALL
+; monitors). randr_pick_primary_geometry then narrows it to the primary
+; monitor's width and records its x offset in strip_x. After that point
+; every consumer of x11_screen_width / strip_x sees the primary monitor.
 x11_screen_width:    resw 1
 x11_screen_height:   resw 1
+strip_x:             resw 1            ; X position of strip window (primary monitor's x_origin)
 x11_root_visual:     resd 1
 x11_root_depth:      resb 1
 x11_white_pixel:     resd 1
@@ -391,6 +406,12 @@ _start:
     test rax, rax
     jnz .die_x11
     call x11_parse_setup
+
+    ; Narrow x11_screen_width to the primary monitor and seed strip_x.
+    ; Without this, on a multi-monitor setup x11_screen_width covers the
+    ; full virtual root and right-aligned segments (clock, tray) land on
+    ; whichever monitor is the right-most.
+    call randr_pick_primary_geometry
 
     ; Defaults.
     mov word [strip_height], DEFAULT_HEIGHT
@@ -2905,6 +2926,148 @@ parse_hex:
     ret
 
 ; ══════════════════════════════════════════════════════════════════════
+; Primary-monitor geometry via RandR 1.5
+; ══════════════════════════════════════════════════════════════════════
+
+; Probe the RANDR extension and, on success, narrow x11_screen_width +
+; strip_x to the first active monitor's rect. Without this, Xorg's
+; virtual root (spanning ALL monitors behind a USB-C / Thunderbolt dock)
+; would give strip a 4480-wide window across both displays, with the
+; right-aligned segments (clock, tray) ending up on the external. No-op
+; if RANDR isn't present or the reply is malformed — x11_parse_setup's
+; full-virtual-root values stay in place.
+;
+; Wire-format reference: see tile.asm's randr_query_monitors comment.
+randr_pick_primary_geometry:
+    push rbx
+    push r12
+    push r13
+    push r14
+
+    call x11_flush
+
+    ; --- QueryExtension RANDR ---
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_QUERY_EXTENSION
+    mov byte [rdi+1], 0
+    ; length = 2 + ceil(name_len/4) = 2 + 2 = 4 words (16 bytes)
+    mov ecx, randr_name_len
+    add ecx, 3
+    shr ecx, 2
+    add ecx, 2
+    mov word [rdi+2], cx
+    mov word [rdi+4], randr_name_len
+    mov word [rdi+6], 0
+    ; Copy "RANDR" (5 bytes) + 3 bytes of zero padding.
+    mov byte [rdi+8],  'R'
+    mov byte [rdi+9],  'A'
+    mov byte [rdi+10], 'N'
+    mov byte [rdi+11], 'D'
+    mov byte [rdi+12], 'R'
+    mov byte [rdi+13], 0
+    mov byte [rdi+14], 0
+    mov byte [rdi+15], 0
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    syscall
+    inc dword [x11_seq]
+
+.rpg_qe_read:
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_read_buf]
+    mov rdx, 32
+    syscall
+    cmp rax, 32
+    jl .rpg_done
+    cmp byte [x11_read_buf], 1
+    je .rpg_qe_have
+    cmp byte [x11_read_buf], 0
+    je .rpg_done
+    jmp .rpg_qe_read
+.rpg_qe_have:
+    cmp byte [x11_read_buf + 8], 0       ; present
+    je .rpg_done
+    movzx ebx, byte [x11_read_buf + 9]   ; major opcode
+
+    ; --- RRGetMonitors(get-active=1) ---
+    lea rdi, [tmp_buf]
+    mov [rdi], bl                        ; major opcode
+    mov byte [rdi+1], RR_GET_MONITORS    ; minor opcode = 42
+    mov word [rdi+2], 3                  ; length = 3 words
+    mov eax, [x11_root_window]
+    mov [rdi+4], eax
+    mov byte [rdi+8], 1                  ; get-active = TRUE
+    mov byte [rdi+9], 0
+    mov word [rdi+10], 0
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 12
+    syscall
+    inc dword [x11_seq]
+
+.rpg_rr_read:
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_read_buf]
+    mov rdx, 32
+    syscall
+    cmp rax, 32
+    jl .rpg_done
+    cmp byte [x11_read_buf], 1
+    je .rpg_rr_have
+    cmp byte [x11_read_buf], 0
+    je .rpg_done
+    jmp .rpg_rr_read
+.rpg_rr_have:
+    mov ebx, [x11_read_buf + 12]         ; nmonitors
+    test ebx, ebx
+    jz .rpg_done
+    mov edx, [x11_read_buf + 4]          ; additional reply length (words)
+    shl edx, 2
+    test edx, edx
+    jz .rpg_done
+
+    ; Drain the payload into tmp_buf. The first monitor record is all we
+    ; need; 24 + 4*ncrtcs bytes max ~64 bytes for realistic setups.
+    xor r12d, r12d
+.rpg_drain:
+    cmp r12, rdx
+    jge .rpg_parse
+    push rdx
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    add rsi, r12
+    mov rcx, rdx
+    sub rcx, r12
+    mov rdx, rcx
+    syscall
+    pop rdx
+    test rax, rax
+    jle .rpg_done
+    add r12, rax
+    jmp .rpg_drain
+
+.rpg_parse:
+    ; First MONITORINFO is the primary on Xorg (Xorg returns the active
+    ; monitor list with the primary first). Use its x and width.
+    movzx eax, word [tmp_buf + 8]        ; x (INT16)
+    mov [strip_x], ax
+    movzx eax, word [tmp_buf + 12]       ; width
+    mov [x11_screen_width], ax
+
+.rpg_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
 ; XEMBED system tray
 ; ══════════════════════════════════════════════════════════════════════
 
@@ -3376,7 +3539,8 @@ create_strip_window:
     mov [rdi+4], r12d
     mov eax, [x11_root_window]
     mov [rdi+8], eax
-    mov word [rdi+12], 0
+    movzx eax, word [strip_x]             ; primary monitor's x_origin (0 in single-output setups)
+    mov [rdi+12], ax
     movzx eax, word [strip_y]
     mov [rdi+14], ax
     movzx eax, word [x11_screen_width]
