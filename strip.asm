@@ -27,6 +27,7 @@
 %define SYS_FORK          57
 %define SYS_EXECVE        59
 %define SYS_EXIT          60
+%define SYS_EXIT_GROUP    231
 %define SYS_WAIT4         61
 %define SYS_CLOCK_GETTIME 228
 
@@ -266,6 +267,16 @@ x11_screen_height:   resw 1
 strip_x:             resw 1            ; X position of strip window (primary monitor's x_origin)
 randr_n_monitors:    resb 1            ; Active monitor count from RRGetMonitors. 0 if RandR absent;
                                         ; >= 2 enables the WS 10 purple marker in @workspaces.
+randr_event_base:    resb 1            ; First-event byte returned by QueryExtension RANDR. The
+                                        ; main loop compares incoming X events against this; RR
+                                        ; ScreenChangeNotify = base + 0, which triggers a clean
+                                        ; self-exit so strip-watchdog respawns with fresh state
+                                        ; (n_monitors, strip_x, x11_screen_width). Cheaper than
+                                        ; an in-place refresh (no event-safe-read scaffolding).
+                                        ; Stays 0 if RandR isn't present — the main-loop check
+                                        ; is gated on randr_n_monitors >= 1.
+randr_major:         resb 1            ; Major opcode of RANDR. Needed only to issue RRSelectInput;
+                                        ; the comparison in the event-loop uses randr_event_base.
 x11_root_visual:     resd 1
 x11_root_depth:      resb 1
 x11_white_pixel:     resd 1
@@ -679,7 +690,25 @@ drain_ready_fds:
     je .drf_x11_configure
     cmp al, EV_PROPERTY_NOTIFY
     je .drf_x11_property
+    ; RandR ScreenChangeNotify? randr_event_base is 0 if RandR isn't
+    ; present at startup, in which case the comparison is also 0 and we
+    ; might match a core "Reply" pseudo-event byte (which is 1, not 0).
+    ; Gate explicitly on randr_n_monitors having been recorded.
+    cmp byte [randr_n_monitors], 0
+    je .drf_next
+    cmp al, byte [randr_event_base]
+    je .drf_x11_randr
     jmp .drf_next
+.drf_x11_randr:
+    ; Monitor topology changed. Re-querying RandR in-place would need
+    ; event-safe reply reads (events keep arriving on x11_fd while we
+    ; wait), a ConfigureWindow + pixmap recreate, and a re-render. All
+    ; doable but ~60 lines of asm. Cheaper: exit. strip-watchdog
+    ; respawns within ~1 s with fresh state, and the cost is one-shot
+    ; per real hot-plug — zero at idle.
+    mov rax, SYS_EXIT_GROUP
+    xor edi, edi
+    syscall
 .drf_x11_property:
     ; PropertyNotify: window @ +4. Any property change on root is a
     ; hint to refetch BOTH @wintitle and @workspaces state. The
@@ -2996,6 +3025,9 @@ randr_pick_primary_geometry:
     cmp byte [x11_read_buf + 8], 0       ; present
     je .rpg_done
     movzx ebx, byte [x11_read_buf + 9]   ; major opcode
+    mov [randr_major], bl                ; save for later RRSelectInput
+    movzx eax, byte [x11_read_buf + 10]  ; first_event
+    mov [randr_event_base], al           ; main loop matches against this
 
     ; --- RRGetMonitors(get-active=1) ---
     lea rdi, [tmp_buf]
@@ -3065,6 +3097,28 @@ randr_pick_primary_geometry:
     mov [strip_x], ax
     movzx eax, word [tmp_buf + 12]       ; width
     mov [x11_screen_width], ax
+
+    ; Subscribe to RRScreenChangeNotify on root. Fires only on monitor
+    ; topology changes (plug / unplug / resolution / orientation) — zero
+    ; wakes at idle. The main loop catches the event and exits cleanly
+    ; so strip-watchdog respawns with fresh randr_n_monitors, strip_x,
+    ; and x11_screen_width. Replaces the previous "pkill strip" hack in
+    ; ~/bin/monitor-hotplug. randr_major was saved above; reuse here.
+    lea rdi, [tmp_buf]
+    movzx eax, byte [randr_major]
+    mov [rdi], al                        ; major opcode
+    mov byte [rdi+1], 4                  ; RRSelectInput sub-opcode
+    mov word [rdi+2], 3                  ; length = 3 words
+    mov eax, [x11_root_window]
+    mov [rdi+4], eax                     ; window = root
+    mov word [rdi+8], 1                  ; mask = RRScreenChangeNotifyMask
+    mov word [rdi+10], 0                 ; padding
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 12
+    syscall
+    inc dword [x11_seq]
 
 .rpg_done:
     pop r14
