@@ -69,6 +69,12 @@
 %define XIN_GET_STATE           1
 %define XIN_QUERY_SCREENS       5
 
+; RandR sub-opcodes (sent with major = randr_major). RandR 1.5's
+; RRGetMonitors is preferred over Xinerama because it sees MST child
+; connectors (USB-C / Thunderbolt docks) that Xorg's Xinerama doesn't
+; synthesise correctly. Falls back to Xinerama for ancient servers.
+%define RR_GET_MONITORS         42
+
 %define MAX_OUTPUTS             4
 %define X11_SET_INPUT_FOCUS     42
 %define X11_SEND_EVENT          25
@@ -727,14 +733,20 @@ cfg_active_frame:        resd 1
 ; WS 10 → output 1 if a secondary exists, else also output 0).
 xinerama_major:          resb 1
 
-; RandR is queried alongside Xinerama. We don't use RandR for output
-; discovery (Xinerama already gives us the right rectangles); RandR's
-; only job here is to deliver RRScreenChangeNotify events when monitors
-; come or go, so we can re-run discover_outputs without restarting tile.
+; RandR is queried before Xinerama. As of v0.1.18 RandR 1.5's
+; RRGetMonitors is the primary discovery path because Xorg's Xinerama
+; doesn't synthesise MST child connectors (USB-C / Thunderbolt docks)
+; — it reports a single screen even when xrandr sees two. RandR also
+; delivers RRScreenChangeNotify on hot-plug so the same scaffold drives
+; rediscover_outputs without restarting tile. Xinerama remains a
+; fallback for ancient servers without RandR 1.5.
 randr_major:             resb 1
 randr_event_base:        resb 1
 randr_present:           resb 1
 output_count:            resb 1
+; 'R' = RandR RRGetMonitors, 'X' = Xinerama, 'F' = fallback single-screen.
+; Logged by dbg_dump_outputs so the path is visible without strace.
+output_source:           resb 1
 output_x:                resw MAX_OUTPUTS
 output_y:                resw MAX_OUTPUTS
 output_w:                resw MAX_OUTPUTS
@@ -1046,14 +1058,17 @@ _start:
     ; Resolve the ICCCM atoms used for WM_DELETE_WINDOW.
     call intern_wm_atoms
 
-    ; Discover physical outputs via the XINERAMA extension. Falls back
-    ; to a single-output table covering the whole root window if the
-    ; extension isn't present. After this returns, output_count is at
-    ; least 1 and ws_pinned_output[] is initialised.
+    ; Probe the RandR extension first (sets randr_present + grabs
+    ; RRScreenChangeNotify on root for hot-plug). discover_outputs then
+    ; prefers RandR's RRGetMonitors over Xinerama because Xinerama
+    ; doesn't synthesise MST child connectors on Xorg. Falls back to
+    ; Xinerama and finally to a single virtual output. After
+    ; discover_outputs returns, output_count is at least 1 and
+    ; ws_pinned_output[] is initialised.
+    call randr_setup
     call discover_outputs
     call dbg_dump_outputs
     call apply_pin_overrides
-    call randr_setup
 
     ; Resolve every bind's keysym to a keycode and grab them on root.
     call resolve_and_grab_binds
@@ -3032,11 +3047,22 @@ dbg_dump_outputs:
     mov byte [rdi+13], '='
     add al, '0'
     mov [rdi+14], al
-    mov byte [rdi+15], 10
+    mov byte [rdi+15], ' '
+    mov byte [rdi+16], 's'
+    mov byte [rdi+17], 'r'
+    mov byte [rdi+18], 'c'
+    mov byte [rdi+19], '='
+    movzx eax, byte [output_source]
+    test eax, eax
+    jnz .ddo_src_ok
+    mov eax, '?'
+.ddo_src_ok:
+    mov [rdi+20], al
+    mov byte [rdi+21], 10
     mov rax, SYS_WRITE
     mov edi, 2
     lea rsi, [dkp_buf]
-    mov edx, 16
+    mov edx, 22
     syscall
     call log_write_buf
     ; Per-output: "  out N x=NNN y=NNN w=NNNN h=NNNN cur=N\n"
@@ -4657,12 +4683,174 @@ xinerama_query_screens:
     pop rbx
     ret
 
+; Issue RandR RRGetMonitors (sub-opcode 42, RandR 1.5). Fills
+; output_x/y/w/h arrays and output_count. Requires randr_present = 1
+; and randr_major to be set (done by randr_setup, which must run first).
+; Returns eax = 1 on success (parsed at least one monitor), 0 otherwise.
+;
+; Preferred over xinerama_query_screens because RRGetMonitors sees MST
+; child connectors (DP-1-1, DP-1-2, ...) that Xorg's Xinerama doesn't
+; synthesise, so multi-monitor setups behind a USB-C dock report
+; outputs=1 under Xinerama but outputs=2 under RandR.
+;
+; Wire-format reference:
+;   request : 12 bytes  (length field = 3 words)
+;     [0]   = randr major opcode
+;     [1]   = 42 (RR_GET_MONITORS)
+;     [2:2] = 3
+;     [4:4] = root window
+;     [8]   = get-active (1 = only active monitors)
+;     [9:3] = padding
+;   reply header : 32 bytes
+;     [0]   = 1 (Reply)
+;     [4:4] = additional length in 4-byte units
+;     [8:4] = timestamp
+;     [12:4] = nmonitors
+;     [16:4] = noutputs
+;     [20:12] = padding
+;   per-monitor record : 24 + 4*ncrtcs bytes
+;     [0:4]  = name atom        [4]   = primary
+;     [5]    = automatic        [6:2] = ncrtcs (count of OUTPUT IDs)
+;     [8:2]  = x   (INT16)      [10:2]= y   (INT16)
+;     [12:2] = width            [14:2]= height
+;     [16:4] = width-mm         [20:4]= height-mm
+;     [24+]  = ncrtcs * 4 bytes of OUTPUT IDs (skipped)
+randr_query_monitors:
+    push rbx
+    push r12
+    push r13
+    push r14
+
+    cmp byte [randr_present], 0
+    je .rqm_fail
+
+    call x11_flush
+
+    lea rdi, [tmp_buf]
+    movzx eax, byte [randr_major]
+    mov [rdi], al                       ; major opcode
+    mov byte [rdi+1], RR_GET_MONITORS   ; minor opcode = 42
+    mov word [rdi+2], 3                 ; length = 3 words
+    mov eax, [x11_root_window]
+    mov [rdi+4], eax                    ; window
+    mov byte [rdi+8], 1                 ; get-active = TRUE
+    mov byte [rdi+9], 0                 ; padding
+    mov word [rdi+10], 0                ; padding
+
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 12
+    syscall
+    inc dword [x11_seq]
+
+    ; Read 32-byte reply header.
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_read_buf]
+    mov rdx, 32
+    syscall
+    cmp rax, 32
+    jl .rqm_fail
+
+    ; Reject error replies (type=0). Reply has type=1.
+    cmp byte [x11_read_buf], 1
+    jne .rqm_fail
+
+    ; nmonitors at offset 12 (CARD32). Clamp to MAX_OUTPUTS.
+    mov ebx, [x11_read_buf + 12]
+    cmp ebx, MAX_OUTPUTS
+    jle .rqm_count_ok
+    mov ebx, MAX_OUTPUTS
+.rqm_count_ok:
+    test ebx, ebx
+    jz .rqm_fail
+
+    ; Additional reply length in bytes (length-word * 4).
+    mov edx, [x11_read_buf + 4]
+    shl edx, 2
+    test edx, edx
+    jz .rqm_fail
+
+    ; Drain the payload into tmp_buf + 1024. tmp_buf is 16KB; a realistic
+    ; max (MAX_OUTPUTS=4 monitors with a handful of CRTCs each) is well
+    ; under 1KB.
+    xor r12d, r12d
+.rqm_read:
+    cmp r12, rdx
+    jge .rqm_parse
+    push rdx
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf + 1024]
+    add rsi, r12
+    mov rcx, rdx
+    sub rcx, r12
+    mov rdx, rcx
+    syscall
+    pop rdx
+    test rax, rax
+    jle .rqm_fail
+    add r12, rax
+    jmp .rqm_read
+
+.rqm_parse:
+    mov [output_count], bl
+    xor r13d, r13d                      ; monitor index
+    lea r14, [tmp_buf + 1024]           ; cursor into payload
+.rqm_loop:
+    cmp r13d, ebx
+    jge .rqm_done
+    movzx eax, word [r14 + 8]           ; x
+    mov [output_x + r13*2], ax
+    movzx eax, word [r14 + 10]          ; y
+    mov [output_y + r13*2], ax
+    movzx eax, word [r14 + 12]          ; width
+    mov [output_w + r13*2], ax
+    movzx eax, word [r14 + 14]          ; height
+    mov [output_h + r13*2], ax
+    ; Skip past this MONITORINFO: 24 byte header + ncrtcs*4 bytes.
+    movzx eax, word [r14 + 6]
+    shl eax, 2
+    add eax, 24
+    add r14, rax
+    inc r13
+    jmp .rqm_loop
+
+.rqm_done:
+    mov eax, 1
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.rqm_fail:
+    mov byte [output_count], 0
+    xor eax, eax
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 ; Discover physical outputs. After this returns, output_count >= 1
 ; and ws_pinned_output[] is initialised. Must be called after
 ; intern_wm_atoms (so we don't interleave InternAtom and QueryExtension
 ; replies on the wire).
 discover_outputs:
     push rbx
+    ; Try RandR 1.5 RRGetMonitors first — sees MST child connectors that
+    ; Xinerama misses on Xorg (USB-C / Thunderbolt docks with daisy-
+    ; chained or fanned-out monitors). randr_present is set by
+    ; randr_setup, which now runs before discover_outputs in main.
+    cmp byte [randr_present], 0
+    je .do_try_xinerama
+    call randr_query_monitors
+    test eax, eax
+    jz .do_try_xinerama
+    mov byte [output_source], 'R'
+    jmp .do_pin
+.do_try_xinerama:
     lea rdi, [xinerama_name]
     mov esi, xinerama_name_len
     call query_extension
@@ -4671,10 +4859,12 @@ discover_outputs:
     mov [xinerama_major], al
     call xinerama_query_screens
     cmp byte [output_count], 0
-    jne .do_pin
+    je .do_fallback
+    mov byte [output_source], 'X'
+    jmp .do_pin
 .do_fallback:
-    ; XINERAMA absent or returned no screens — single virtual output
-    ; covering the whole root window.
+    ; Neither RandR nor Xinerama gave us anything — single virtual
+    ; output covering the whole root window.
     mov byte [output_count], 1
     mov word [output_x], 0
     mov word [output_y], 0
@@ -4682,6 +4872,7 @@ discover_outputs:
     mov [output_w], ax
     mov ax, [x11_screen_height]
     mov [output_h], ax
+    mov byte [output_source], 'F'
 .do_pin:
     ; Default workspace pinning: every workspace on output 0.
     xor ebx, ebx
@@ -4813,20 +5004,110 @@ randr_setup:
     pop rbx
     ret
 
-; Re-run Xinerama QueryScreens after a hot-plug, re-apply pin
-; overrides, resize the bar to output 0's new geometry, and re-apply
-; every visible workspace's layout. Uses read_reply_or_queue so events
-; arriving on the wire while we wait for the reply aren't lost.
-; Safe to call from inside event_loop dispatch.
+; Re-run output discovery after a hot-plug, re-apply pin overrides,
+; resize the bar to output 0's new geometry, and re-apply every visible
+; workspace's layout. Tries RandR RRGetMonitors first (sees MST children
+; correctly under Xorg), falls back to Xinerama QueryScreens. Uses
+; read_reply_or_queue so events arriving on the wire while we wait for
+; the reply aren't lost. Safe to call from inside event_loop dispatch.
 rediscover_outputs:
     push rbx
     push r12
     push r13
     push r14
-    cmp byte [xinerama_major], 0
-    je .rdo_done                          ; no Xinerama, can't refresh
 
-    ; Send Xinerama QueryScreens (sub-opcode 5).
+    ; --- Try RandR RRGetMonitors first ---
+    cmp byte [randr_present], 0
+    je .rdo_try_xinerama
+
+    call x11_flush
+    lea rdi, [tmp_buf]
+    movzx eax, byte [randr_major]
+    mov [rdi], al
+    mov byte [rdi+1], RR_GET_MONITORS
+    mov word [rdi+2], 3
+    mov eax, [x11_root_window]
+    mov [rdi+4], eax
+    mov byte [rdi+8], 1                   ; get-active
+    mov byte [rdi+9], 0
+    mov word [rdi+10], 0
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 12
+    syscall
+    inc dword [x11_seq]
+
+    lea rdi, [tmp_buf + 1024]
+    call read_reply_or_queue
+    test eax, eax
+    jz .rdo_try_xinerama
+
+    cmp byte [tmp_buf + 1024], 1          ; reply type (not error)
+    jne .rdo_try_xinerama
+
+    mov ebx, [tmp_buf + 1024 + 12]        ; nmonitors
+    cmp ebx, MAX_OUTPUTS
+    jle .rdo_rr_count_ok
+    mov ebx, MAX_OUTPUTS
+.rdo_rr_count_ok:
+    test ebx, ebx
+    jz .rdo_try_xinerama
+    mov edx, [tmp_buf + 1024 + 4]         ; reply additional length (words)
+    shl edx, 2
+    test edx, edx
+    jz .rdo_try_xinerama
+
+    ; Drain the payload into tmp_buf + 2048.
+    xor r14d, r14d
+.rdo_rr_read:
+    cmp r14, rdx
+    jge .rdo_rr_parse
+    push rdx
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf + 2048]
+    add rsi, r14
+    mov rcx, rdx
+    sub rcx, r14
+    mov rdx, rcx
+    syscall
+    pop rdx
+    test rax, rax
+    jle .rdo_done
+    add r14, rax
+    jmp .rdo_rr_read
+
+.rdo_rr_parse:
+    mov [output_count], bl
+    xor r13d, r13d
+    lea r12, [tmp_buf + 2048]             ; cursor into payload
+.rdo_rr_loop:
+    cmp r13d, ebx
+    jge .rdo_rr_done
+    movzx eax, word [r12 + 8]
+    mov [output_x + r13*2], ax
+    movzx eax, word [r12 + 10]
+    mov [output_y + r13*2], ax
+    movzx eax, word [r12 + 12]
+    mov [output_w + r13*2], ax
+    movzx eax, word [r12 + 14]
+    mov [output_h + r13*2], ax
+    movzx eax, word [r12 + 6]             ; ncrtcs
+    shl eax, 2
+    add eax, 24                           ; MONITORINFO header size
+    add r12, rax
+    inc r13
+    jmp .rdo_rr_loop
+.rdo_rr_done:
+    mov byte [output_source], 'R'
+    jmp .rdo_after_parse
+
+    ; --- Fallback: Xinerama QueryScreens (sub-opcode 5) ---
+.rdo_try_xinerama:
+    cmp byte [xinerama_major], 0
+    je .rdo_done                          ; nothing to refresh with
+
     call x11_flush
     lea rdi, [tmp_buf]
     movzx eax, byte [xinerama_major]
@@ -4883,7 +5164,7 @@ rediscover_outputs:
     xor r13d, r13d
 .rdo_loop:
     cmp r13d, ebx
-    jge .rdo_after_parse
+    jge .rdo_xin_done
     mov rax, r13
     shl rax, 3
     lea rsi, [tmp_buf + 2048]
@@ -4898,6 +5179,8 @@ rediscover_outputs:
     mov [output_h + r13*2], ax
     inc r13
     jmp .rdo_loop
+.rdo_xin_done:
+    mov byte [output_source], 'X'
 
 .rdo_after_parse:
     ; Re-apply pin overrides + recompute output_current_ws.
@@ -7409,6 +7692,16 @@ move_focused_to_workspace:
     mov eax, r14d
     call send_unmap_window
 .mtw_target_map:
+    ; Configure the moving client to the target ws's pinned-output rect
+    ; BEFORE mapping. Without this, send_map_window maps the window at
+    ; whatever geometry it had on the source output — so moving a window
+    ; from WS 1 (output 0, laptop) to WS 10 (output 1, external) leaves
+    ; it physically at +0+0 with output 0's dimensions, overlapping the
+    ; laptop view across every workspace switch. Mirrors the source-side
+    ; configure-before-map at .mtw_source_no_new above.
+    mov edi, ebx                        ; moving xid
+    mov esi, r13d                       ; target ws
+    call configure_client_for_workspace
     mov eax, ebx
     call send_map_window
     ; Focus stays on source per convention; do not steal it here.
