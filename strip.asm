@@ -217,7 +217,10 @@ sgr_palette:
     dd 0xFF55FF55        ; 92 bright green
     dd 0xFFFFFF55        ; 93 bright yellow
     dd 0xFF5555FF        ; 94 bright blue
-    dd 0xFFFFA500        ; 95 ORANGE (bright variant — same as 35)
+    dd 0xFFC586FF        ; 95 bright purple — repurposed for @workspaces
+                         ; WS 10 marker when an external monitor is
+                         ; attached (n_monitors >= 2). Was a redundant
+                         ; orange (35 already covers it).
     dd 0xFF777777        ; 96 "bright cyan" — repurposed to #777777 for
                          ; the @workspaces layout glyph
     dd 0xFFFFFFFF        ; 97 bright white
@@ -261,6 +264,8 @@ x11_root_window:     resd 1
 x11_screen_width:    resw 1
 x11_screen_height:   resw 1
 strip_x:             resw 1            ; X position of strip window (primary monitor's x_origin)
+randr_n_monitors:    resb 1            ; Active monitor count from RRGetMonitors. 0 if RandR absent;
+                                        ; >= 2 enables the WS 10 purple marker in @workspaces.
 x11_root_visual:     resd 1
 x11_root_depth:      resb 1
 x11_white_pixel:     resd 1
@@ -3026,6 +3031,7 @@ randr_pick_primary_geometry:
     mov ebx, [x11_read_buf + 12]         ; nmonitors
     test ebx, ebx
     jz .rpg_done
+    mov [randr_n_monitors], bl           ; record count for @workspaces WS 10 marker
     mov edx, [x11_read_buf + 4]          ; additional reply length (words)
     shl edx, 2
     test edx, edx
@@ -4772,6 +4778,20 @@ ws_publish_segment:
     ; Digit: '1'..'9' for ws 1..9, '0' for ws 10.
     cmp r14d, 10
     jne .wps2_digit_normal
+    ; WS 10 with an external monitor attached: override the per-state
+    ; colour with bright purple (palette slot 95). Signals at a glance
+    ; "this workspace lives on the external display". When no external
+    ; is connected (n_monitors < 2) WS 10 keeps the normal state colour.
+    cmp byte [randr_n_monitors], 2
+    jb .wps2_ws10_skip_purple
+    mov byte [rdi+0], 0x1b
+    mov byte [rdi+1], '['
+    mov byte [rdi+2], '9'
+    mov byte [rdi+3], '5'
+    mov byte [rdi+4], 'm'
+    add rdi, 5
+    mov r15d, WS_STATE_NONE              ; invalidate state cache for any future emits
+.wps2_ws10_skip_purple:
     mov byte [rdi], '0'
     inc rdi
     jmp .wps2_digit_done
