@@ -2597,26 +2597,58 @@ event_loop:
     jz .ev_mr_t_no_centre                  ; geometry read failed → just MapWindow
     movzx ecx, word [tmp_buf + 64 + 16]    ; dialog width
     movzx edx, word [tmp_buf + 64 + 18]    ; dialog height
-    movzx eax, word [x11_screen_width]
-    sub eax, ecx
-    sar eax, 1                             ; (screen_w - dialog_w) / 2
+
+    ; Pick the output to centre on: the current workspace's pinned
+    ; output (so the popup lands on whichever monitor the user is
+    ; actually looking at), with output 0 as the fallback. Without this
+    ; the centring used x11_screen_width which spans the entire virtual
+    ; root on multi-monitor setups, leaving 85/15 splits across the
+    ; laptop+external boundary (forticlient login, GTK alerts, etc.).
+    xor r8d, r8d                           ; output index, default 0
+    movzx eax, byte [current_ws]
+    test eax, eax
+    jz .ev_mr_t_have_out
+    cmp eax, WS_COUNT
+    ja .ev_mr_t_have_out
+    dec eax
+    movzx r8d, byte [ws_pinned_output + rax]
+    cmp r8b, byte [output_count]
+    jb .ev_mr_t_have_out
+    xor r8d, r8d                           ; out-of-range → output 0
+.ev_mr_t_have_out:
+
+    ; Centred X within the chosen output's rect.
+    movzx eax, word [output_w + r8*2]
+    sub eax, ecx                           ; w_margin = ow - dialog_w
     js .ev_mr_t_x_zero
+    sar eax, 1
+    movzx esi, word [output_x + r8*2]
+    add eax, esi                           ; eax = ox + w_margin/2
     jmp .ev_mr_t_have_x
 .ev_mr_t_x_zero:
-    xor eax, eax
+    movzx eax, word [output_x + r8*2]      ; dialog wider than output → pin to ox
 .ev_mr_t_have_x:
     push rax                               ; centred X
-    movzx eax, word [x11_screen_height]
-    sub eax, edx
-    sar eax, 1                             ; (screen_h - dialog_h) / 2
+
+    ; Centred Y within the chosen output's usable rect. Output 0
+    ; reserves strip + bar; other outputs use full height.
+    movzx eax, word [output_h + r8*2]
+    movzx esi, word [output_y + r8*2]
+    test r8d, r8d
+    jnz .ev_mr_t_y_no_bar
+    movzx edi, word [bar_height]
+    movzx r9d, word [cfg_strip_height]
+    add edi, r9d                           ; reserved top px
+    sub eax, edi                           ; usable height
+    add esi, edi                           ; usable origin Y
+.ev_mr_t_y_no_bar:
+    sub eax, edx                           ; h_margin = oh' - dialog_h
     js .ev_mr_t_y_zero
-    movzx ecx, word [cfg_strip_height]
-    cmp eax, ecx
-    jge .ev_mr_t_have_y
-    mov eax, ecx                           ; clamp below strip
+    sar eax, 1
+    add eax, esi
     jmp .ev_mr_t_have_y
 .ev_mr_t_y_zero:
-    movzx eax, word [cfg_strip_height]
+    mov eax, esi                           ; dialog taller than usable area → pin to top of usable
 .ev_mr_t_have_y:
     pop rcx                                ; rcx = X, rax = Y
     ; ConfigureWindow X | Y | StackMode=Above. Has to precede MapWindow
