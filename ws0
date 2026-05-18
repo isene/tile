@@ -1,0 +1,74 @@
+#!/bin/bash
+# ws0 — list the windows currently on WS 10 (the "0" slot in tile's bar).
+# Walks root's child top-level windows via xwininfo, then filters on
+# _NET_WM_DESKTOP (which tile DOES publish per-window). Avoids needing
+# _NET_CLIENT_LIST on root (tile doesn't publish that).
+#
+# Battery: 1 xwininfo + N xprop forks per invocation, where N = number of
+# top-level windows tile is tracking. Bounded; safe for one-shot. For
+# live updates, drive it from xprop -spy on a property tile DOES touch:
+#
+#   xprop -root -spy _NET_ACTIVE_WINDOW | while read; do clear; ws0; done
+#
+# That wakes on focus changes (which fire on workspace switches and new
+# window maps) — close enough to "list changed" without polling.
+
+WS_IDX=9
+
+# Pull the top-level XIDs from the WM's root tree. xwininfo prints lines
+# like "     0x4000003 \"title\": ("class" "Class")  WxH+x+y  ...".
+# We just need the hex IDs — third column when the line starts with
+# whitespace + "0x". Pure bash tokenisation; no awk/sed in the hot path.
+ids=()
+while IFS= read -r line; do
+    # Skip non-child lines (headers, separators).
+    [[ "$line" =~ ^[[:space:]]+0x[0-9a-f]+ ]] || continue
+    # First token after trimming leading whitespace.
+    read -r wid _ <<<"$line"
+    ids+=("$wid")
+done < <(xwininfo -children -root 2>/dev/null)
+
+count=0
+for wid in "${ids[@]}"; do
+    # Single xprop call: desktop + class + EWMH name + legacy WM_NAME.
+    # Glass and other minimal X11 clients set only WM_NAME; tracking-aware
+    # apps set _NET_WM_NAME. Try EWMH first, fall back to WM_NAME.
+    info=$(xprop -id "$wid" -notype _NET_WM_DESKTOP WM_CLASS _NET_WM_NAME WM_NAME 2>/dev/null) || continue
+
+    # Skip if no _NET_WM_DESKTOP (tile only publishes it on tracked clients).
+    [[ "$info" == *"_NET_WM_DESKTOP ="* ]] || continue
+
+    desk_line="${info%%$'\n'*}"
+    desk="${desk_line##* = }"
+    [ "$desk" = "$WS_IDX" ] || continue
+
+    rest="${info#*$'\n'}"
+    cls_line="${rest%%$'\n'*}"
+    cls="${cls_line##*, \"}"
+    cls="${cls%\"*}"
+    # WM_CLASS sometimes prints as "not found" if the atom isn't set on
+    # an obscure window — fall back to a placeholder so output stays tidy.
+    [[ "$cls_line" == *"not found"* ]] && cls="?"
+
+    # rest now holds 2 lines: _NET_WM_NAME and WM_NAME.
+    name_line="${rest#*$'\n'}"
+    ewmh_name="${name_line%%$'\n'*}"
+    legacy_line="${name_line#*$'\n'}"
+
+    if [[ "$ewmh_name" == *"not found"* ]]; then
+        name="${legacy_line##*= \"}"
+        name="${name%\"}"
+        [[ "$legacy_line" == *"not found"* ]] && name="(no title)"
+    else
+        name="${ewmh_name##*= \"}"
+        name="${name%\"}"
+    fi
+
+    printf '%-18s  %s\n' "$cls" "$name"
+    count=$((count + 1))
+done
+
+if [ "$count" = 0 ]; then
+    echo "(WS 10 is empty)"
+fi
+exit 0
