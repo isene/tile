@@ -73,6 +73,7 @@
 %define EV_CLIENT_MESSAGE       33
 %define EV_DESTROY_NOTIFY       17
 %define EV_UNMAP_NOTIFY         18
+%define EV_REPARENT_NOTIFY      21
 %define EV_CONFIGURE_NOTIFY     22
 %define EV_PROPERTY_NOTIFY      28
 %define SUBSTRUCTURE_NOTIFY_MASK    0x00080000
@@ -686,6 +687,8 @@ drain_ready_fds:
     je .drf_x11_destroy
     cmp al, EV_UNMAP_NOTIFY
     je .drf_x11_unmap
+    cmp al, EV_REPARENT_NOTIFY
+    je .drf_x11_reparent
     cmp al, EV_CONFIGURE_NOTIFY
     je .drf_x11_configure
     cmp al, EV_PROPERTY_NOTIFY
@@ -827,6 +830,18 @@ drain_ready_fds:
     jmp .drf_next
 .drf_x11_unmap:
     mov eax, [x11_read_buf + 8]
+    call tray_undock_icon
+    jmp .drf_next
+.drf_x11_reparent:
+    ; ReparentNotify wire layout: window @ +8, parent @ +12.
+    ; snixembed sometimes reparents a proxy back to root (or to its own
+    ; window) during SNI cleanup instead of unmapping/destroying — we'd
+    ; otherwise leak the slot. If the new parent isn't strip's window,
+    ; drop the icon from tray_icons[] so tray_layout closes the gap.
+    mov eax, [x11_read_buf + 12]          ; new parent
+    cmp eax, [window_id]
+    je .drf_next                          ; still our child, nothing to do
+    mov eax, [x11_read_buf + 8]           ; reparented window
     call tray_undock_icon
     jmp .drf_next
 .drf_next:
