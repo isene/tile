@@ -679,6 +679,8 @@ drain_ready_fds:
     jl .drf_next
     movzx eax, byte [x11_read_buf]
     and al, 0x7F
+    test al, al
+    jz .drf_x11_error
     cmp al, EV_EXPOSE
     je .drf_x11_expose
     cmp al, EV_CLIENT_MESSAGE
@@ -842,6 +844,31 @@ drain_ready_fds:
     cmp eax, [window_id]
     je .drf_next                          ; still our child, nothing to do
     mov eax, [x11_read_buf + 8]           ; reparented window
+    call tray_undock_icon
+    jmp .drf_next
+.drf_x11_error:
+    ; X11 Error event (event code 0). Wire layout: byte 1 = error code,
+    ; bytes 4-7 = bad resource ID, byte 10 = major opcode of the failing
+    ; request. tray_dock_icon fires Reparent + ConfigureWindow + Map +
+    ; SendEvent on the icon. If the icon's owner died between sending
+    ; the dock request to root and our handling it, *all four* fail with
+    ; BadWindow and the XID is never a child of strip, so we'll never
+    ; get DestroyNotify / UnmapNotify / ReparentNotify either. Drop the
+    ; dead XID here so the slot collapses instead of leaking.
+    ; tray_layout's own ConfigureWindow on a dead XID would also land
+    ; here, with the same correct outcome.
+    movzx ecx, byte [x11_read_buf + 10]
+    cmp ecx, X11_REPARENT_WINDOW
+    je .drf_err_drop
+    cmp ecx, X11_CONFIGURE_WINDOW
+    je .drf_err_drop
+    cmp ecx, X11_MAP_WINDOW
+    je .drf_err_drop
+    cmp ecx, X11_SEND_EVENT
+    je .drf_err_drop
+    jmp .drf_next
+.drf_err_drop:
+    mov eax, [x11_read_buf + 4]           ; bad resource ID
     call tray_undock_icon
     jmp .drf_next
 .drf_next:
