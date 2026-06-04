@@ -29,9 +29,12 @@
 %define CLOCK_MONOTONIC 1
 
 ; Signals + sigaction flags
+%define SIGHUP          1
 %define SIGUSR1         10
 %define SIGUSR2         12
 %define SYS_FCNTL       72
+%define SYS_ACCESS      21
+%define F_OK            0
 %define F_SETFD         2
 %define FD_CLOEXEC      1
 %define SA_RESTORER     0x04000000
@@ -63,6 +66,9 @@
 %define X11_GET_KEYBOARD_MAPPING 101
 %define X11_KILL_CLIENT         113
 %define X11_QUERY_EXTENSION     98
+%define X11_UNGRAB_POINTER      27
+%define X11_UNGRAB_KEYBOARD     32
+%define X11_GET_INPUT_FOCUS     43
 
 ; Xinerama sub-opcodes (sent with major = xinerama_major).
 %define XIN_QUERY_VERSION       0
@@ -262,6 +268,11 @@ net_active_window_str: db "_NET_ACTIVE_WINDOW"
 net_active_window_len equ 18
 net_wm_desktop_str: db "_NET_WM_DESKTOP"
 net_wm_desktop_len equ $ - net_wm_desktop_str
+; EWMH PID hint — used by the SIGHUP dead-client sweep to look up the
+; owning process of each top-level window. Apps set this via
+; XChangeProperty(win, _NET_WM_PID, XA_CARDINAL, ...) at startup.
+net_wm_pid_str:    db "_NET_WM_PID"
+net_wm_pid_len     equ $ - net_wm_pid_str
 
 ; EWMH window-type atoms — used to detect dialog/utility/tool/menu
 ; windows that should NOT be tiled (Gimp tool palettes, file pickers,
@@ -630,6 +641,22 @@ reload_pending:          resb 1
 ; nuclear Mod4+Shift+q (action_exit).
 restart_pending:         resb 1
 
+; Soft-recovery coordination. SIGHUP sets `recover_pending`; the main
+; event loop runs action_recover between events to:
+;   1. UngrabKeyboard / UngrabPointer on tile's own connection
+;   2. QueryTree(root), check every top-level for _NET_WM_PID, and
+;      KillClient any whose owning process is dead — releases grabs
+;      held by zombie clients (e.g. SDL game crashed mid-grab).
+; Preserves tile's internal state, unlike SIGUSR2's full re-exec.
+recover_pending:         resb 1
+
+; Scratch for action_recover. recov_reply_buf holds one X11 reply
+; (32-byte header + up to one CARD32 value for _NET_WM_PID). The
+; proc_path_buf holds "/proc/<pid>\0" — max PID 4194303 = 7 digits,
+; so 6+7+1 = 14 bytes; round to 32.
+recov_reply_buf:         resb 64
+proc_path_buf:           resb 32
+
 ; Wall-clock timestamp (ms) of the last fork_exec_string call. The
 ; MapRequest handler skips the recent_unmap flicker-break check if
 ; the upcoming map is within a few hundred ms of a user-driven
@@ -834,6 +861,7 @@ tile_shell_pid_atom: resd 1
 net_active_window_atom: resd 1
 net_wm_desktop_atom:    resd 1
 net_current_desktop_atom: resd 1
+net_wm_pid_atom:        resd 1
 tile_bar_state_atom:    resd 1
 
 ; EWMH window-type atoms (resolved at startup; 0 if unresolved means
@@ -2323,6 +2351,13 @@ event_loop:
     mov byte [restart_pending], 0
     call action_restart
 .el_no_restart:
+    ; SIGHUP → soft recovery (ungrab + dead-client sweep). Preserves
+    ; tile's internal state; doesn't re-exec.
+    cmp byte [recover_pending], 0
+    je .el_no_recover
+    mov byte [recover_pending], 0
+    call action_recover
+.el_no_recover:
     ; SIGUSR1 may have asked for a reload while we were busy or
     ; sleeping in read(). Handle it here, between events, where the
     ; X11 connection is in a known state (no half-sent requests).
@@ -5539,6 +5574,12 @@ intern_wm_atoms:
     call intern_one_atom
     mov [nwwt_tooltip_atom], eax
 
+    ; _NET_WM_PID — used by SIGHUP dead-client sweep.
+    lea rdi, [net_wm_pid_str]
+    mov esi, net_wm_pid_len
+    call intern_one_atom
+    mov [net_wm_pid_atom], eax
+
     pop r12
     pop rbx
     ret
@@ -7124,6 +7165,16 @@ sigusr2_handler:
     mov byte [restart_pending], 1
     ret
 
+sighup_handler:
+    ; Async-safe: just set the flag. The event loop runs action_recover
+    ; between events: UngrabKeyboard / UngrabPointer + dead-client sweep
+    ; via QueryTree + _NET_WM_PID + KillClient. Soft recovery from an
+    ; orphaned XGrabKeyboard (SDL game crashed mid-grab) without losing
+    ; tile's workspace / focus state. Trigger from a TTY:
+    ;   pkill -HUP -x tile
+    mov byte [recover_pending], 1
+    ret
+
 ; Install the SIGUSR1 handler. Uses the kernel sigaction layout (NOT
 ; glibc's). The kernel demands SA_RESTORER + a restorer that issues
 ; rt_sigreturn — without it the signal would corrupt rip on return
@@ -7160,6 +7211,17 @@ install_sigusr1:
     xor edx, edx
     mov r10, 8
     syscall
+    ; SIGHUP → recover-pending. Soft recovery (ungrab + dead-client
+    ; sweep). Same NO-SA_RESTART rationale.
+    lea rdi, [sigact_buf]
+    lea rax, [sighup_handler]
+    mov [rdi], rax
+    mov rax, SYS_RT_SIGACTION
+    mov rdi, SIGHUP
+    lea rsi, [sigact_buf]
+    xor edx, edx
+    mov r10, 8
+    syscall
     pop rbx
     ret
 
@@ -7183,6 +7245,362 @@ ungrab_all_keys:
     call x11_buffer
     inc dword [x11_seq]
     ret
+
+; ══════════════════════════════════════════════════════════════════════
+; action_recover — soft recovery for orphaned X grabs (SIGHUP).
+;
+; The wesnoth scenario: an SDL game grabs the keyboard, crashes mid-grab,
+; X server still routes every keypress to the now-dead client. Tile sees
+; nothing — no keybinding works, even Mod4 is dead. Only Ctrl+Alt+BS
+; (nuke the X session) recovers.
+;
+; This function runs from a TTY-driven `pkill -HUP -x tile`:
+;
+;   1. UngrabKeyboard + UngrabPointer on tile's own connection. Releases
+;      any grab WE accidentally hold. Cheap, safe. Does NOT release
+;      grabs held by other clients — that needs step 2.
+;
+;   2. GetInputFocus round-trip — pure XSync (cheap), ensures the
+;      ungrabs hit the wire before we walk the tree.
+;
+;   3. QueryTree(root) → enumerate every top-level. For each:
+;        a. GetProperty(_NET_WM_PID, XA_CARDINAL). Skip if absent.
+;        b. access("/proc/<pid>", F_OK). Skip if alive.
+;        c. KillClient(xid). X tears down the dead client's connection
+;           and releases every resource it held — grabs included.
+;
+; Battery cost: zero at idle (only runs when SIGHUP fires). One sweep
+; sends one QueryTree + one GetProperty per top-level window + one
+; KillClient per dead owner — typically a few dozen syscalls, single-
+; digit-ms total.
+; ══════════════════════════════════════════════════════════════════════
+action_recover:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+
+    ; ── Log: recovery start ──
+    push rax
+    push rdi
+    lea rsi, [rel .ar_start_msg]
+    mov rdx, .ar_start_msg_len
+    mov rax, SYS_WRITE
+    mov edi, 2
+    syscall
+    call log_write_buf
+    pop rdi
+    pop rax
+
+    ; ── Step 1: UngrabKeyboard(time = CurrentTime) ──
+    call x11_flush
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_UNGRAB_KEYBOARD
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2                   ; length = 2 words = 8 bytes
+    mov dword [rdi+4], 0                  ; time = CurrentTime
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    call x11_buffer
+    inc dword [x11_seq]
+
+    ; ── UngrabPointer(time = CurrentTime) ──
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_UNGRAB_POINTER
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov dword [rdi+4], 0
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    call x11_buffer
+    inc dword [x11_seq]
+
+    ; ── XSync via GetInputFocus. Reply is exactly 32 bytes (no tail).
+    call x11_flush
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_GET_INPUT_FOCUS
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 1                   ; length = 1 word = 4 bytes
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 4
+    syscall
+    inc dword [x11_seq]
+    lea rdi, [recov_reply_buf]
+    call read_reply_or_queue
+    ; Ignore the result — even if it timed out, the ungrabs are flushed.
+
+    ; ── Step 2: QueryTree(root) ──
+    ; Direct write + custom drain loop (cribbed from
+    ; adopt_existing_windows.aew_qt_drain). read_reply_or_queue is
+    ; 32-byte-only and would lose sync against the 4N-byte children list.
+    call x11_flush
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_QUERY_TREE
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov eax, [x11_root_window]
+    mov [rdi+4], eax
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    syscall
+    inc dword [x11_seq]
+
+    xor ebx, ebx                          ; bytes drained
+    lea r14, [qt_reply_buf]
+.ar_qt_drain:
+    cmp ebx, 32
+    jge .ar_qt_more_check
+    jmp .ar_qt_poll
+.ar_qt_more_check:
+    mov eax, [qt_reply_buf + 4]           ; reply-length in 4-byte units
+    shl eax, 2                            ; bytes after the 32-byte header
+    add eax, 32
+    cmp ebx, eax
+    jge .ar_qt_drained
+.ar_qt_poll:
+    sub rsp, 16
+    mov eax, [x11_fd]
+    mov [rsp + 0], eax
+    mov word [rsp + 4], 1                 ; POLLIN
+    mov word [rsp + 6], 0
+    mov rax, SYS_POLL
+    lea rdi, [rsp]
+    mov esi, 1
+    mov edx, 100                          ; 100 ms per poll
+    syscall
+    add rsp, 16
+    test rax, rax
+    jle .ar_qt_drained
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    mov rsi, r14
+    mov edx, 4096
+    syscall
+    test rax, rax
+    jle .ar_qt_drained
+    add r14, rax
+    add ebx, eax
+    cmp ebx, 4128
+    jge .ar_qt_drained
+    jmp .ar_qt_drain
+.ar_qt_drained:
+    cmp ebx, 32
+    jl .ar_done
+
+    ; Find a reply (byte 0 == 1) at a 32-byte boundary; that's our
+    ; QueryTree response. Anything before it is queued events.
+    xor ecx, ecx
+.ar_qt_find:
+    cmp ecx, ebx
+    jge .ar_done
+    cmp byte [qt_reply_buf + rcx], 1
+    je .ar_qt_found
+    add ecx, 32
+    jmp .ar_qt_find
+.ar_qt_found:
+    test ecx, ecx
+    jz .ar_qt_at_zero
+    mov edx, ebx
+    sub edx, ecx
+    lea rsi, [qt_reply_buf + rcx]
+    lea rdi, [qt_reply_buf]
+    push rcx
+    mov rcx, rdx
+    rep movsb
+    pop rcx
+.ar_qt_at_zero:
+
+    movzx r15d, word [qt_reply_buf + 16]  ; num_children
+    test r15d, r15d
+    jz .ar_done
+    cmp r15d, 1024
+    jbe .ar_iter_setup
+    mov r15d, 1024
+.ar_iter_setup:
+
+    xor ebx, ebx                          ; child index
+.ar_iter:
+    cmp ebx, r15d
+    jge .ar_done
+    mov r12d, [qt_reply_buf + 32 + rbx*4] ; xid
+
+    ; Skip our own bar window — we don't want to KillClient ourselves
+    ; even if our PID test accidentally said "dead".
+    cmp r12d, [bar_window_id]
+    je .ar_next
+
+    ; ── GetProperty(xid, _NET_WM_PID, XA_CARDINAL, 0, 1) ──
+    call x11_flush
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_GET_PROPERTY
+    mov byte [rdi+1], 0                   ; delete = false
+    mov word [rdi+2], 6                   ; length = 6 words = 24 bytes
+    mov [rdi+4], r12d                     ; window
+    mov eax, [net_wm_pid_atom]
+    mov [rdi+8], eax                      ; property
+    mov dword [rdi+12], 6                 ; type = XA_CARDINAL
+    mov dword [rdi+16], 0                 ; long-offset
+    mov dword [rdi+20], 1                 ; long-length (1 CARD32)
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 24
+    syscall
+    inc dword [x11_seq]
+
+    lea rdi, [recov_reply_buf]
+    call read_reply_or_queue
+    test eax, eax
+    jz .ar_next                           ; XID dead / timeout — skip
+
+    ; Reply layout for _NET_WM_PID set:
+    ;   format @ +1 = 32
+    ;   reply_length @ +4 = 1 (one CARD32 follows the 32-byte header)
+    ; Anything else (None, wrong format) → drain tail if any, skip.
+    cmp byte [recov_reply_buf + 1], 32
+    jne .ar_drain_tail
+    cmp dword [recov_reply_buf + 4], 1
+    jne .ar_drain_tail
+
+    ; Read 4 value bytes (the PID) from the socket.
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [recov_reply_buf + 32]
+    mov rdx, 4
+    syscall
+    cmp rax, 4
+    jl .ar_next
+    mov r13d, [recov_reply_buf + 32]      ; PID
+    test r13d, r13d
+    jz .ar_next
+    jmp .ar_have_pid
+
+.ar_drain_tail:
+    ; No usable PID. If reply_length > 0 we still must drain those
+    ; bytes off the socket so the next reply lines up. Cap at the
+    ; recov_reply_buf size minus the 32-byte header.
+    mov eax, [recov_reply_buf + 4]
+    shl eax, 2
+    test eax, eax
+    jz .ar_next
+    cmp eax, 32
+    jbe .ar_drain_tail_ok
+    mov eax, 32
+.ar_drain_tail_ok:
+    mov rdx, rax
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [recov_reply_buf + 32]
+    syscall
+    jmp .ar_next
+
+.ar_have_pid:
+    ; Build "/proc/<pid>\0" in proc_path_buf.
+    lea rdi, [proc_path_buf]
+    mov byte [rdi],   '/'
+    mov byte [rdi+1], 'p'
+    mov byte [rdi+2], 'r'
+    mov byte [rdi+3], 'o'
+    mov byte [rdi+4], 'c'
+    mov byte [rdi+5], '/'
+    add rdi, 6
+    mov eax, r13d
+    call dbg_u32_dec
+    mov byte [rdi], 0
+
+    ; access("/proc/<pid>", F_OK) — 0 = directory exists, owner alive.
+    mov rax, SYS_ACCESS
+    lea rdi, [proc_path_buf]
+    mov esi, F_OK
+    syscall
+    test rax, rax
+    jz .ar_next                           ; alive — keep the window
+
+    ; ── PID is dead. KillClient(xid). ──
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_KILL_CLIENT
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov [rdi+4], r12d
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    call x11_buffer
+    inc dword [x11_seq]
+
+    ; Log: "tile: killed orphan pid=<pid> xid=<xid>"
+    push rax
+    push rdi
+    lea rdi, [dkp_buf]
+    lea rsi, [rel .ar_kill_pre]
+    mov ecx, .ar_kill_pre_len
+.ar_kill_cp:
+    test ecx, ecx
+    jz .ar_kill_cp_done
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec ecx
+    jmp .ar_kill_cp
+.ar_kill_cp_done:
+    mov eax, r13d
+    call dbg_u32_dec
+    mov byte [rdi], ' '
+    mov byte [rdi+1], 'x'
+    mov byte [rdi+2], 'i'
+    mov byte [rdi+3], 'd'
+    mov byte [rdi+4], '='
+    add rdi, 5
+    mov eax, r12d
+    call dbg_u32_dec
+    mov byte [rdi], 10
+    inc rdi
+    lea rsi, [dkp_buf]
+    mov rdx, rdi
+    sub rdx, rsi
+    mov rax, SYS_WRITE
+    mov edi, 2
+    syscall
+    call log_write_buf
+    pop rdi
+    pop rax
+
+.ar_next:
+    inc ebx
+    jmp .ar_iter
+.ar_done:
+    call x11_flush
+
+    ; Log: recovery done
+    push rax
+    push rdi
+    lea rsi, [rel .ar_done_msg]
+    mov rdx, .ar_done_msg_len
+    mov rax, SYS_WRITE
+    mov edi, 2
+    syscall
+    call log_write_buf
+    pop rdi
+    pop rax
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.ar_start_msg:    db "tile: SIGHUP - recovery start", 10
+.ar_start_msg_len equ $ - .ar_start_msg
+.ar_done_msg:     db "tile: SIGHUP - recovery done", 10
+.ar_done_msg_len  equ $ - .ar_done_msg
+.ar_kill_pre:     db "tile: killed orphan pid="
+.ar_kill_pre_len  equ $ - .ar_kill_pre
 
 ; In-place restart: re-execs the on-disk tile binary so a freshly-
 ; built version takes over without dropping any X clients (X owns
