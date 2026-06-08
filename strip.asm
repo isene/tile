@@ -1797,6 +1797,16 @@ render_segment_sgr:
     imul eax, [char_width_var]
     add r12d, eax                         ; advance x
 .rss_no_flush:
+    ; ebp tracked the "current run start" pointing BEFORE the ESC.
+    ; Park it at r14 (buffer end) so that if the SGR runs off the
+    ; buffer (truncated mid-escape, common when the WS segment with
+    ; 4+ bullets pushes near SEG_OUT_LEN=96), .rss_flush_final ends
+    ; up painting zero bytes instead of re-painting the prior text
+    ; AND the partial "ESC [ 3 5" as literal "[3" on screen.
+    ; On the success path (.rss_sgr_end) and the fail-resync path
+    ; (.rss_resync), ebp is overwritten with a sensible value before
+    ; any further text is painted.
+    mov ebp, r14d
     ; Parse "ESC [ N (;N)* m": collect every numeric token into
     ; sgr_codes[], then process the array at 'm'. This lets 38;2;R;G;B
     ; (24-bit RGB foreground) coexist with simple codes.
