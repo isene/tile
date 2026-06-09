@@ -32,6 +32,8 @@
 %define SIGHUP          1
 %define SIGUSR1         10
 %define SIGUSR2         12
+%define SIGCHLD         17
+%define SIG_IGN         1
 %define SYS_FCNTL       72
 %define SYS_ACCESS      21
 %define F_OK            0
@@ -7127,10 +7129,10 @@ fork_exec_string:
     syscall
 .fes_parent:
     ; Don't wait4: autostart and exec actions are fire-and-forget.
-    ; Without WAIT, children become zombies until reaped — set a
-    ; SIGCHLD ignore so the kernel auto-reaps. (Default action of
-    ; SIGCHLD is already SIG_DFL which doesn't auto-reap; we'll fix
-    ; that in a phase 1b polish pass with proper SIGCHLD handler.)
+    ; Children would normally become zombies; install_sigusr1 sets
+    ; sigaction(SIGCHLD, SIG_IGN) at startup so the Linux kernel
+    ; auto-reaps. (POSIX.1-2001: explicit SIG_IGN on SIGCHLD blocks
+    ; zombie creation — distinct from SIG_DFL, which doesn't.)
     pop r12
     pop rbx
     ret
@@ -7218,6 +7220,22 @@ install_sigusr1:
     mov [rdi], rax
     mov rax, SYS_RT_SIGACTION
     mov rdi, SIGHUP
+    lea rsi, [sigact_buf]
+    xor edx, edx
+    mov r10, 8
+    syscall
+    ; SIGCHLD → SIG_IGN. Tells the Linux kernel to auto-reap exited
+    ; children so fire-and-forget fork+execve (autostart, exec
+    ; bindings) doesn't leak zombies. Without this, ~5-day uptime
+    ; accumulates a couple hundred <defunct> PID slots. No SA_RESTORER
+    ; needed: SIG_IGN never returns to user space.
+    lea rdi, [sigact_buf]
+    mov qword [rdi], SIG_IGN              ; sa_handler = SIG_IGN
+    mov qword [rdi + 8], 0                ; sa_flags = 0
+    mov qword [rdi + 16], 0               ; sa_restorer (unused for SIG_IGN)
+    mov qword [rdi + 24], 0               ; sa_mask
+    mov rax, SYS_RT_SIGACTION
+    mov rdi, SIGCHLD
     lea rsi, [sigact_buf]
     xor edx, edx
     mov r10, 8
