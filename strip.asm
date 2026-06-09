@@ -2770,6 +2770,33 @@ register_segment:
 apply_setting:
     push rbx
     mov rbx, rsi
+    ; ── palette.<N> = #RRGGBB ── live override for an sgr_palette slot.
+    ; <N> is the SGR code (30..37 or 90..97). Lets the user tweak the
+    ; WS-indicator colours from ~/.striprc instead of recompiling strip.
+    ;   palette.35 = #FFA500    ; active WS pip + active tab bullet
+    ;   palette.37 = #AAAAAA    ; populated WS pip + inactive tab bullet
+    ;   palette.90 = #444444    ; empty WS pip
+    ;   palette.95 = #C586FF    ; WS 10 (external monitor)
+    ;   palette.96 = #777777    ; layout glyph T/H/V/M
+    ; SGR 31..36, 91..94, 97 are also patchable but they're not used
+    ; by the WS segment; affects any segment that emits ESC[Nm.
+    ; Keys not starting with "palette." fall through to the existing
+    ; key dispatch below, with rdi restored to the original key string.
+    push rdi
+    mov rsi, rdi
+    lea rdi, [.k_palette]
+.as_palpre_loop:
+    mov al, [rdi]
+    test al, al
+    jz .as_pal_match
+    mov dl, [rsi]
+    cmp al, dl
+    jne .as_pal_no
+    inc rdi
+    inc rsi
+    jmp .as_palpre_loop
+.as_pal_no:
+    pop rdi                            ; restore original key ptr
     lea rsi, [.k_height]
     call .as_streq
     test eax, eax
@@ -2881,6 +2908,34 @@ apply_setting:
     pop rbx
     ret
 
+.as_pal_match:
+    ; rsi points just past "palette." in the key — that's the SGR
+    ; code as decimal text. Drop the saved-rdi we pushed above; we're
+    ; not going to use it (no fall-through to other keys on a hit).
+    add rsp, 8
+    mov rdi, rsi
+    call parse_dec                     ; eax = SGR code (e.g. 90)
+    cmp eax, 30
+    jb .as_pal_done
+    cmp eax, 37
+    jbe .as_pal_low
+    cmp eax, 90
+    jb .as_pal_done
+    cmp eax, 97
+    ja .as_pal_done
+    sub eax, 90 - 8                    ; map 90..97 → slot 8..15
+    jmp .as_pal_slot
+.as_pal_low:
+    sub eax, 30                        ; map 30..37 → slot 0..7
+.as_pal_slot:
+    mov r9d, eax                       ; slot index, survives parse_hex
+    mov rdi, rbx                       ; VALUE
+    call parse_hex                     ; eax = 0xFFRRGGBB
+    mov [sgr_palette + r9*4], eax
+.as_pal_done:
+    pop rbx
+    ret
+
 .as_streq:
     push rbx
 .ase_loop:
@@ -2910,6 +2965,7 @@ apply_setting:
 .k_char_width: db "char_width", 0
 .k_baseline:   db "baseline", 0
 .k_gap:        db "gap", 0
+.k_palette:    db "palette.", 0
 
 ; rdi = source NUL-terminated string. Copy into arg_pool, return offset
 ; in eax (0 on failure / empty).
