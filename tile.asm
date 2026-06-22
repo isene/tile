@@ -25,6 +25,11 @@
 %define SYS_WAIT4       61
 %define SYS_RT_SIGACTION    13
 %define SYS_RT_SIGRETURN    15
+%define SYS_RT_SIGPROCMASK  14
+%define SYS_SIGNALFD4       289
+%define SIG_BLOCK           0
+%define SFD_CLOEXEC         0x80000        ; O_CLOEXEC value (octal 02000000)
+%define SFD_NONBLOCK        0x800          ; O_NONBLOCK value (octal 04000)
 %define SYS_CLOCK_GETTIME 228
 %define CLOCK_MONOTONIC 1
 
@@ -631,26 +636,19 @@ pending_assign_ws:       resb 1
 %define WM_CLASS_BUF_SIZE 512
 wm_class_buf:            resb WM_CLASS_BUF_SIZE
 
-; Reload coordination. SIGUSR1 sets `reload_pending`; the main event
-; loop drains it between events and calls reload_runtime. Keeps the
-; signal handler tiny — no async-unsafe calls inside it.
-reload_pending:          resb 1
-
-; Restart-recovery coordination. SIGUSR2 sets `restart_pending`; the
-; main event loop sees it and calls action_restart (re-execs tile).
-; Lets the user recover from a stuck-fullscreen-glass scenario via
-; `pkill -USR2 -x tile` from a TTY without logging out via the
-; nuclear Mod4+Shift+q (action_exit).
-restart_pending:         resb 1
-
-; Soft-recovery coordination. SIGHUP sets `recover_pending`; the main
-; event loop runs action_recover between events to:
-;   1. UngrabKeyboard / UngrabPointer on tile's own connection
-;   2. QueryTree(root), check every top-level for _NET_WM_PID, and
-;      KillClient any whose owning process is dead — releases grabs
-;      held by zombie clients (e.g. SDL game crashed mid-grab).
-; Preserves tile's internal state, unlike SIGUSR2's full re-exec.
-recover_pending:         resb 1
+; Signal coordination. We block SIGUSR1+SIGUSR2+SIGHUP in the process
+; mask and drain them synchronously via a signalfd that's polled in
+; the event loop alongside the X11 socket. Replaces the older
+; rt_sigaction + pending-flag pattern, which proved unreliable in the
+; 2026-06-22 wesnoth-freeze incident — `pkill -USR2 tile` had no
+; effect even though tile was in an interruptible read() on x11_fd.
+; The most likely failure modes (async handler running but flag never
+; visible, signal delivery to wrong thread, SA_RESTART semantics
+; quietly enabled by something) all evaporate when signal delivery is
+; just another fd-readable event.
+signalfd_fd:             resq 1          ; fd from signalfd4()
+signal_mask:             resq 1          ; sigset_t for the blocked signals
+signalfd_buf:            resb 128        ; struct signalfd_siginfo
 
 ; Scratch for action_recover. recov_reply_buf holds one X11 reply
 ; (32-byte header + up to one CARD32 value for _NET_WM_PID). The
@@ -676,8 +674,9 @@ last_fork_exec_ms:       resq 1
 ; in that case so error paths never crash on a missing log file.
 log_fd_tile:             resq 1
 
-; sigaction(2) struct used to install the SIGUSR1 handler. Layout is
-; the kernel's struct sigaction (not glibc's): handler ptr at +0,
+; sigaction(2) struct, now only used for the SIGCHLD = SIG_IGN install.
+; USR1/USR2/HUP moved to signalfd-based delivery. Layout is the
+; kernel's struct sigaction (not glibc's): handler ptr at +0,
 ; sa_flags at +8, sa_restorer at +16, sa_mask at +24 (8 bytes for the
 ; first 64 signals). 32 bytes total.
 sigact_buf:              resb 32
@@ -1110,8 +1109,9 @@ _start:
     call render_bar
     call x11_flush
 
-    ; SIGUSR1 → reload ~/.tilerc without restarting.
-    call install_sigusr1
+    ; SIGUSR1/USR2/HUP → block in process mask, deliver via signalfd
+    ; polled from event_loop. SIGCHLD → SIG_IGN.
+    call install_signal_fd
 
     ; Either run autostart (fresh login) or re-adopt existing X clients
     ; (action_restart). action_restart sets skip_autostart=1 because
@@ -2344,29 +2344,6 @@ x11_flush:
 ; ══════════════════════════════════════════════════════════════════════
 
 event_loop:
-    ; SIGUSR2 → restart in place (re-exec tile). Checked first so a
-    ; user-triggered recovery from a TTY (`pkill -USR2 -x tile`) goes
-    ; through even when reload is also pending. action_restart only
-    ; returns if execve fails; otherwise this call doesn't come back.
-    cmp byte [restart_pending], 0
-    je .el_no_restart
-    mov byte [restart_pending], 0
-    call action_restart
-.el_no_restart:
-    ; SIGHUP → soft recovery (ungrab + dead-client sweep). Preserves
-    ; tile's internal state; doesn't re-exec.
-    cmp byte [recover_pending], 0
-    je .el_no_recover
-    mov byte [recover_pending], 0
-    call action_recover
-.el_no_recover:
-    ; SIGUSR1 may have asked for a reload while we were busy or
-    ; sleeping in read(). Handle it here, between events, where the
-    ; X11 connection is in a known state (no half-sent requests).
-    cmp byte [reload_pending], 0
-    je .el_no_reload
-    call reload_runtime
-.el_no_reload:
     ; Always flush before sleeping so the server sees our requests.
     call x11_flush
 
@@ -2375,7 +2352,7 @@ event_loop:
     ; PENDING_MAX 32-byte events; we copy one into x11_read_buf and
     ; jump straight to dispatch.
     cmp dword [pending_count], 0
-    je .el_read_socket
+    je .el_wait_io
     mov ebx, [pending_head]
     mov rax, rbx
     shl rax, 5                   ; * 32
@@ -2398,14 +2375,45 @@ event_loop:
     dec dword [pending_count]
     jmp .el_dispatch
 
+.el_wait_io:
+    ; Two fds to wait on: the X11 socket and the signalfd. Both
+    ; carry events the event loop needs to dispatch; whichever wakes
+    ; first wins. A bare read() on x11_fd alone is no longer enough,
+    ; because signals are now blocked at the process level and
+    ; delivered only via the signalfd. Each pollfd is 8 bytes:
+    ; fd(4) + events(2) + revents(2).
+    sub rsp, 16
+    mov eax, [x11_fd]
+    mov [rsp + 0], eax
+    mov word [rsp + 4], 1                 ; POLLIN
+    mov word [rsp + 6], 0                 ; revents
+    mov eax, [signalfd_fd]
+    mov [rsp + 8], eax
+    mov word [rsp + 12], 1                ; POLLIN
+    mov word [rsp + 14], 0                ; revents
+    mov rax, SYS_POLL
+    mov rdi, rsp
+    mov esi, 2
+    mov edx, -1                           ; infinite timeout
+    syscall
+    movzx ecx, word [rsp + 6]             ; x11_fd revents
+    movzx edx, word [rsp + 14]            ; signalfd_fd revents
+    add rsp, 16
+    test eax, eax
+    js event_loop                         ; -EINTR or other — re-poll
+    ; Signal events get priority — they include "user wants tile to
+    ; restart RIGHT NOW because the WM is wedged" (SIGUSR2). Service
+    ; them before reading any more X11 events.
+    test edx, edx
+    jnz .el_signal_ready
+    test ecx, ecx
+    jz event_loop                         ; spurious wakeup
 .el_read_socket:
     ; Read one 32-byte event (X11 always sends events as 32-byte units).
-    ; A blocking read on a Unix socket sleeps the process; that's the
-    ; only path we should ever take when at idle. If the X server has
-    ; gone away, read returns 0 (EOF) — without the .x11_dead exit
-    ; below, we'd spin re-reading the dead socket forever, which is
-    ; exactly the 100%-CPU bug that made tile a battery hog when its
-    ; Xephyr was killed.
+    ; If the X server has gone away, read returns 0 (EOF) — without the
+    ; .x11_dead exit below, we'd spin re-reading the dead socket
+    ; forever, which is exactly the 100%-CPU bug that made tile a
+    ; battery hog when its Xephyr was killed.
     mov rax, SYS_READ
     mov rdi, [x11_fd]
     lea rsi, [x11_read_buf]
@@ -2416,6 +2424,40 @@ event_loop:
     js .el_read_err              ; negative = -errno; tolerate -EINTR
     cmp rax, 32
     jl event_loop                ; genuine short read — retry
+    jmp .el_dispatch
+
+.el_signal_ready:
+    ; Drain one struct signalfd_siginfo (128 bytes). ssi_signo at
+    ; offset 0 identifies which signal arrived. Multiple siginfos
+    ; can be queued; we read one per loop iteration so a signal
+    ; storm can't starve the X11 path.
+    mov rax, SYS_READ
+    mov rdi, [signalfd_fd]
+    lea rsi, [signalfd_buf]
+    mov rdx, 128
+    syscall
+    cmp rax, 128
+    jl event_loop                         ; short read / EAGAIN — re-poll
+    mov eax, [signalfd_buf]               ; ssi_signo
+    cmp eax, SIGUSR2
+    je .el_sig_usr2
+    cmp eax, SIGHUP
+    je .el_sig_hup
+    cmp eax, SIGUSR1
+    je .el_sig_usr1
+    jmp event_loop                        ; unknown — ignore
+.el_sig_usr2:
+    ; Restart in place. action_restart only returns on execve failure.
+    call action_restart
+    jmp event_loop
+.el_sig_hup:
+    ; Soft recovery: ungrab + dead-client sweep. Preserves WM state.
+    call action_recover
+    jmp event_loop
+.el_sig_usr1:
+    ; Reload ~/.tilerc.
+    call reload_runtime
+    jmp event_loop
 .el_dispatch:
 
     movzx eax, byte [x11_read_buf]
@@ -2455,8 +2497,10 @@ event_loop:
     jmp event_loop
 
 .el_read_err:
-    ; -EINTR (signal handler ran during the read, e.g. SIGUSR1) — go
-    ; back to the top of the loop so reload_pending gets drained.
+    ; -EINTR can still happen on the read() from signals tile doesn't
+    ; block (anything other than USR1/USR2/HUP — they're all in the
+    ; process mask now and never reach the read). Loop back; the
+    ; X11 socket state is fine.
     cmp rax, -EINTR
     je event_loop
     ; Other errors are fatal in the same way EOF is.
@@ -7129,7 +7173,7 @@ fork_exec_string:
     syscall
 .fes_parent:
     ; Don't wait4: autostart and exec actions are fire-and-forget.
-    ; Children would normally become zombies; install_sigusr1 sets
+    ; Children would normally become zombies; install_signal_fd sets
     ; sigaction(SIGCHLD, SIG_IGN) at startup so the Linux kernel
     ; auto-reaps. (POSIX.1-2001: explicit SIG_IGN on SIGCHLD blocks
     ; zombie creation — distinct from SIG_DFL, which doesn't.)
@@ -7152,78 +7196,50 @@ fork_exec_string:
 ; overrides, refreshes the bar, but deliberately does NOT re-run
 ; autostart — that would spawn a duplicate strip, feh, etc.
 ; ──────────────────────────────────────────────────────────────────────
-sigusr1_handler:
-    ; Mark a reload as needing to happen. Touch nothing else from a
-    ; signal context — async-signal-unsafe code (X11 writes, etc.) in
-    ; here would race the main loop and break the world.
-    mov byte [reload_pending], 1
-    ret
-
-sigusr2_handler:
-    ; Async-safe: just set the flag. The event loop checks it between
-    ; events and calls action_restart (re-execs tile). Recovery hatch
-    ; for stuck-WM scenarios that aren't bad enough to require a full
-    ; gdm logout.
-    mov byte [restart_pending], 1
-    ret
-
-sighup_handler:
-    ; Async-safe: just set the flag. The event loop runs action_recover
-    ; between events: UngrabKeyboard / UngrabPointer + dead-client sweep
-    ; via QueryTree + _NET_WM_PID + KillClient. Soft recovery from an
-    ; orphaned XGrabKeyboard (SDL game crashed mid-grab) without losing
-    ; tile's workspace / focus state. Trigger from a TTY:
-    ;   pkill -HUP -x tile
-    mov byte [recover_pending], 1
-    ret
-
-; Install the SIGUSR1 handler. Uses the kernel sigaction layout (NOT
-; glibc's). The kernel demands SA_RESTORER + a restorer that issues
-; rt_sigreturn — without it the signal would corrupt rip on return
-; from user space.
-install_sigusr1:
+; ──────────────────────────────────────────────────────────────────────
+; install_signal_fd — block SIGUSR1+SIGUSR2+SIGHUP in the process
+; signal mask, then open a signalfd subscribed to the same set. From
+; that point on, signal delivery is "fd is readable" and the main
+; event loop dispatches them synchronously alongside X11 events.
+;
+; History: tile used to install async signal handlers (rt_sigaction
+; with a flag-setting trampoline) and drain the flags at the top of
+; event_loop. On 2026-06-22 a wesnoth crash wedged tile, and the
+; expected `pkill -USR2 tile` recovery hatch (re-exec via signal) did
+; not fire — tile was in an interruptible read() on x11_fd, signal
+; should have arrived as -EINTR + flag set, but PID/start-time were
+; unchanged after the signal, and a TERM was needed to kill it. The
+; same was true of USR1 and HUP.
+;
+; The robust replacement is signalfd. The signal is queued in the
+; kernel as readable bytes on the fd; the next poll() returns; we
+; read a 128-byte siginfo and dispatch on ssi_signo. No race window,
+; no async-unsafe handler, no SA_RESTART semantics to negotiate.
+; ──────────────────────────────────────────────────────────────────────
+install_signal_fd:
     push rbx
-    lea rdi, [sigact_buf]
-    lea rax, [sigusr1_handler]
-    mov [rdi], rax                        ; sa_handler
-    ; Deliberately NO SA_RESTART: we want SIGUSR1 to interrupt the
-    ; read() in event_loop with -EINTR so the loop wakes up and drains
-    ; reload_pending. With SA_RESTART the read auto-restarts after the
-    ; handler runs, leaving reload_pending stuck until the next genuine
-    ; X event. The event_loop's .el_read_err path tolerates -EINTR.
-    mov qword [rdi + 8], SA_RESTORER
-    lea rax, [sigreturn_trampoline]
-    mov [rdi + 16], rax                   ; sa_restorer
-    mov qword [rdi + 24], 0               ; sa_mask (no extra blocks)
-    mov rax, SYS_RT_SIGACTION
-    mov rdi, SIGUSR1
-    lea rsi, [sigact_buf]
-    xor edx, edx
-    mov r10, 8                            ; sigsetsize
-    syscall
-    ; Reuse the same sigact_buf (overwrite handler ptr) for SIGUSR2 →
-    ; restart-pending. Same rationale as SIGUSR1 for omitting
-    ; SA_RESTART; flag is drained at the top of event_loop.
-    lea rdi, [sigact_buf]
-    lea rax, [sigusr2_handler]
-    mov [rdi], rax
-    mov rax, SYS_RT_SIGACTION
-    mov rdi, SIGUSR2
-    lea rsi, [sigact_buf]
-    xor edx, edx
+    ; Build the sigset_t mask: SIGHUP (bit 0), SIGUSR1 (bit 9),
+    ; SIGUSR2 (bit 11). (1<<0)|(1<<9)|(1<<11) = 0xA01.
+    mov qword [signal_mask], 0xA01
+
+    ; rt_sigprocmask(SIG_BLOCK, &signal_mask, NULL, 8) — block these
+    ; in the process mask so they're delivered only via the signalfd.
+    mov rax, SYS_RT_SIGPROCMASK
+    xor edi, edi                          ; SIG_BLOCK
+    lea rsi, [signal_mask]
+    xor edx, edx                          ; oset = NULL
     mov r10, 8
     syscall
-    ; SIGHUP → recover-pending. Soft recovery (ungrab + dead-client
-    ; sweep). Same NO-SA_RESTART rationale.
-    lea rdi, [sigact_buf]
-    lea rax, [sighup_handler]
-    mov [rdi], rax
-    mov rax, SYS_RT_SIGACTION
-    mov rdi, SIGHUP
-    lea rsi, [sigact_buf]
-    xor edx, edx
-    mov r10, 8
+
+    ; signalfd4(-1, &signal_mask, 8, SFD_CLOEXEC | SFD_NONBLOCK)
+    mov rax, SYS_SIGNALFD4
+    mov rdi, -1
+    lea rsi, [signal_mask]
+    mov rdx, 8
+    mov r10, SFD_CLOEXEC | SFD_NONBLOCK
     syscall
+    mov [signalfd_fd], rax
+
     ; SIGCHLD → SIG_IGN. Tells the Linux kernel to auto-reap exited
     ; children so fire-and-forget fork+execve (autostart, exec
     ; bindings) doesn't leak zombies. Without this, ~5-day uptime
@@ -7242,10 +7258,6 @@ install_sigusr1:
     syscall
     pop rbx
     ret
-
-sigreturn_trampoline:
-    mov rax, SYS_RT_SIGRETURN
-    syscall
 
 ; Drop every key we grabbed on root, so a subsequent regrab won't
 ; collide with the previous set (which might bind different keysyms).
@@ -7785,7 +7797,6 @@ action_restart:
 reload_runtime:
     push rbx
     push r12
-    mov byte [reload_pending], 0
     call ungrab_all_keys
     ; load_config zeroes bind_count + exec_count and re-parses the file.
     call load_config
