@@ -9,7 +9,7 @@ import sys
 from PIL import ImageFont
 
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
-SIZE = 16                      # px; ascent ~15 fits baseline 16 on a 22px bar
+SIZE = 13                      # px; advance ~8 (matches original Terminus width), ~12px tall
 
 # ASCII + Latin-1 Supplement (·°±×÷ accents) + status-bar symbols seen on the
 # real bar / used by striprc segments (markers, arrows, triangles, check marks,
