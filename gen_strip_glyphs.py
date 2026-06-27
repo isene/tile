@@ -8,8 +8,10 @@
 import sys
 from PIL import ImageFont
 
-FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
-SIZE = 13                      # px; advance ~8 (matches original Terminus width), ~12px tall
+FONT = "/home/geir/.local/share/fonts/TerminessNerdFontMono-Regular.ttf"
+SIZE = 16                      # Terminus (narrow, crisp) at adv 8 / ascent 15 — taller
+                               # than the DejaVu 13 and a narrower typeface. Restores the
+                               # original strip look. Re-run after changing FONT/SIZE.
 
 # ASCII + Latin-1 Supplement (·°±×÷ accents) + status-bar symbols seen on the
 # real bar / used by striprc segments (markers, arrows, triangles, check marks,
