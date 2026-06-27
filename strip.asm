@@ -2185,40 +2185,71 @@ render_init:
     ; Scan num_formats PICTFORMINFO (28 bytes each). Pick A8 / RGB24 / ARGB32.
     mov r14d, [conn_setup_buf + 8]        ; num_formats
     lea r15, [conn_setup_buf + 32]
+    ; Match formats the way glass does (proven on real Xorg): require type
+    ; Direct and match by channel SHIFTS, not just masks — a long Xorg format
+    ; list has several depth-8/24 formats and a mask-only match picks wrong.
+    ; PICTFORMINFO: +4 type, +5 depth, +8 r_shift, +12 g_shift, +16 b_shift,
+    ; +20 a_shift, +22 a_mask.
 .ri_scan:
     test r14d, r14d
     jz .ri_scan_done
+    cmp byte [r15 + 4], 1                 ; type == Direct
+    jne .ri_next
     movzx eax, byte [r15 + 5]             ; depth
-    movzx ecx, word [r15 + 22]            ; alpha-mask (direct + 14)
-    movzx edx, word [r15 + 10]            ; red-mask (direct + 2)
+    movzx ecx, word [r15 + 8]             ; r_shift
+    movzx edx, word [r15 + 12]            ; g_shift
+    movzx r8d,  word [r15 + 16]           ; b_shift
+    movzx r9d,  word [r15 + 20]           ; a_shift
+    movzx r10d, word [r15 + 22]           ; a_mask
+    ; A8: depth 8, all shifts 0, a_mask 0xFF.
     cmp eax, 8
-    jne .ri_chk24
-    cmp ecx, 0xFF
+    jne .ri_chk_argb
+    mov r11d, ecx
+    or r11d, edx
+    or r11d, r8d
+    or r11d, r9d
+    jnz .ri_next
+    cmp r10d, 0xFF
     jne .ri_next
     cmp dword [render_fmt_a8], 0
     jne .ri_next
     mov ebx, [r15]
     mov [render_fmt_a8], ebx
     jmp .ri_next
-.ri_chk24:
-    cmp eax, 24
-    jne .ri_chk32
-    test edx, edx
-    jz .ri_next
-    cmp dword [render_fmt_rgb24], 0
-    jne .ri_next
-    mov ebx, [r15]
-    mov [render_fmt_rgb24], ebx
-    jmp .ri_next
-.ri_chk32:
+.ri_chk_argb:
+    ; ARGB32: depth 32, r=16 g=8 b=0 a=24 a_mask=0xFF (pen source).
     cmp eax, 32
-    jne .ri_next
-    cmp ecx, 0xFF
-    jne .ri_next
+    jne .ri_chk_dst
+    cmp ecx, 16
+    jne .ri_chk_dst
+    cmp edx, 8
+    jne .ri_chk_dst
+    test r8d, r8d
+    jnz .ri_chk_dst
+    cmp r9d, 24
+    jne .ri_chk_dst
+    cmp r10d, 0xFF
+    jne .ri_chk_dst
     cmp dword [render_fmt_argb32], 0
     jne .ri_next
     mov ebx, [r15]
     mov [render_fmt_argb32], ebx
+    jmp .ri_next
+.ri_chk_dst:
+    ; dst format: r=16 g=8 b=0, depth == pixmap (root) depth.
+    cmp ecx, 16
+    jne .ri_next
+    cmp edx, 8
+    jne .ri_next
+    test r8d, r8d
+    jnz .ri_next
+    movzx r11d, byte [x11_root_depth]
+    cmp eax, r11d
+    jne .ri_next
+    cmp dword [render_fmt_dst], 0
+    jne .ri_next
+    mov ebx, [r15]
+    mov [render_fmt_dst], ebx
 .ri_next:
     add r15, 28
     dec r14d
@@ -2228,18 +2259,8 @@ render_init:
     je .ri_fail
     cmp dword [render_fmt_argb32], 0
     je .ri_fail
-    ; dst format matches the pixmap depth (= root depth).
-    movzx eax, byte [x11_root_depth]
-    cmp eax, 32
-    je .ri_dst_argb
-    mov eax, [render_fmt_rgb24]
-    test eax, eax
-    jz .ri_fail
-    jmp .ri_dst_set
-.ri_dst_argb:
-    mov eax, [render_fmt_argb32]
-.ri_dst_set:
-    mov [render_fmt_dst], eax
+    cmp dword [render_fmt_dst], 0
+    je .ri_fail
 
     ; --- CreatePicture over the pixmap (text dst) ---
     call alloc_xid
