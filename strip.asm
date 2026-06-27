@@ -67,6 +67,7 @@
 %define RENDER_CREATE_GLYPH_SET   17
 %define RENDER_ADD_GLYPHS         20
 %define RENDER_COMPOSITE_GLYPHS8  23
+%define RENDER_COMPOSITE_GLYPHS32 25
 %define RENDER_OP_OVER            3
 %define RENDER_CP_REPEAT          0x01
 
@@ -2432,27 +2433,60 @@ render_set_pen:
     ret
 
 ; ----------------------------------------------------------------------
+; map_glyph_id — edi = codepoint. Returns eax = glyph id: the codepoint if
+; it is in the atlas, else 32 (space) so the column advance stays aligned
+; (frame doesn't advance the pen over a glyph it lacks). Binary search over
+; glyph_table (GLYPH_COUNT entries, 20 bytes, cp at +0, sorted ascending).
+; ----------------------------------------------------------------------
+map_glyph_id:
+    xor ecx, ecx                          ; lo
+    mov edx, GLYPH_COUNT                  ; hi
+.mgi_loop:
+    cmp ecx, edx
+    jge .mgi_miss
+    lea eax, [rcx + rdx]
+    shr eax, 1                            ; mid
+    mov r8d, eax
+    imul r8, r8, 20
+    mov r9d, [glyph_table + r8]           ; entry cp
+    cmp edi, r9d
+    je .mgi_hit
+    jl .mgi_lo
+    lea ecx, [rax + 1]                    ; lo = mid + 1
+    jmp .mgi_loop
+.mgi_lo:
+    mov edx, eax                          ; hi = mid
+    jmp .mgi_loop
+.mgi_hit:
+    mov eax, edi
+    ret
+.mgi_miss:
+    mov eax, 32
+    ret
+
+; ----------------------------------------------------------------------
 ; render_emit_glyphs — edi = x, esi = y, edx = count, codepoints (BE16)
-; at tmp_buf+1024. Sets the pen to text_color, then one CompositeGlyphs8
-; (op Over, pen → pix_picture) with the run. Out-of-atlas codepoints map
-; to space so the column advance stays aligned with the layout.
+; at tmp_buf+1024. Sets the pen to text_color, then one CompositeGlyphs32
+; (op Over, pen → pix_picture) with the run. Uses 32-bit glyph ids so any
+; atlas codepoint (incl. symbols ≥ U+0100) renders; misses map to space.
 ; ----------------------------------------------------------------------
 render_emit_glyphs:
     push rbx
     push r12
     push r13
     push r14
+    push r15
+    mov r12d, edx                         ; count
     mov r13d, edi                         ; x
     mov r14d, esi                         ; y
-    mov r12d, edx                         ; count
     mov eax, [text_color]
     call render_set_pen
 
-    ; CompositeGlyphs8 header (28 bytes) at tmp_buf.
+    ; CompositeGlyphs32 header (28 bytes) at tmp_buf.
     lea rdi, [tmp_buf]
     mov bl, [render_major]
     mov [rdi], bl
-    mov byte [rdi+1], RENDER_COMPOSITE_GLYPHS8
+    mov byte [rdi+1], RENDER_COMPOSITE_GLYPHS32
     mov byte [rdi+4], RENDER_OP_OVER
     mov byte [rdi+5], 0
     mov word [rdi+6], 0
@@ -2465,58 +2499,39 @@ render_emit_glyphs:
     mov eax, [glyphset_id]
     mov [rdi+20], eax
     mov dword [rdi+24], 0                 ; srcX, srcY
-    ; GLYPHELT header at +28.
+    ; GLYPHELT header at +28 (8 bytes): count, 3 pad, deltaX, deltaY.
     mov [rdi+28], r12b                    ; glyph count
     mov byte [rdi+29], 0
     mov word [rdi+30], 0
     mov [rdi+32], r13w                    ; deltaX = x
     mov [rdi+34], r14w                    ; deltaY = y
-    ; glyph id bytes at +36.
-    lea rsi, [tmp_buf + 1024]             ; cps (BE16)
-    lea rdi, [tmp_buf + 36]
-    mov ecx, r12d
-.reg_byte:
-    test ecx, ecx
-    jz .reg_pad
-    movzx eax, byte [rsi + 1]             ; low byte of BE16 = cp (if < 256)
-    cmp byte [rsi], 0                     ; high byte non-zero → not ASCII
-    jne .reg_space
-    cmp al, 32
-    jb .reg_space
-    cmp al, 126
-    jbe .reg_have
-.reg_space:
-    mov al, 32                            ; out-of-atlas → space (keep advance)
-.reg_have:
-    mov [rdi], al
-    inc rdi
-    add rsi, 2
-    dec ecx
-    jmp .reg_byte
-.reg_pad:
-    ; pad glyph bytes up to a 4-byte boundary (relative to tmp_buf).
-    lea rax, [tmp_buf]
-    mov rdx, rdi
-    sub rdx, rax                          ; current length
-    mov ecx, edx
-    and ecx, 3
+    ; 4-byte glyph ids at +36.
+    lea r15, [tmp_buf + 1024]             ; cps (BE16)
+    lea rbx, [tmp_buf + 36]               ; gid dst
+    mov r13d, r12d                        ; counter
+.reg_loop:
+    test r13d, r13d
     jz .reg_send
-    mov eax, 4
-    sub eax, ecx
-.reg_pl:
-    mov byte [rdi], 0
-    inc rdi
-    dec eax
-    jnz .reg_pl
+    movzx edi, byte [r15]                 ; cp = (hi<<8)|lo
+    shl edi, 8
+    movzx eax, byte [r15 + 1]
+    or edi, eax
+    call map_glyph_id                     ; eax = gid (preserves rbx/r12-r15)
+    mov [rbx], eax
+    add rbx, 4
+    add r15, 2
+    dec r13d
+    jmp .reg_loop
 .reg_send:
     lea rsi, [tmp_buf]
-    mov rdx, rdi
-    sub rdx, rsi                          ; total bytes
+    mov rdx, rbx
+    sub rdx, rsi                          ; total bytes (already 4-aligned)
     mov rax, rdx
     shr rax, 2
-    mov [tmp_buf + 2], ax                 ; request length (words)
+    mov word [tmp_buf + 2], ax            ; request length (words)
     call x11_buffer
     inc dword [x11_seq]
+    pop r15
     pop r14
     pop r13
     pop r12
