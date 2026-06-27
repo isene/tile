@@ -492,11 +492,17 @@ _start:
 
     call load_striprc
 
-    call open_core_font
     call create_strip_window
     call create_pixmap
     call create_gc
     call render_init                      ; RENDER glyph path (falls back if absent)
+    ; Only load a server-side core font if RENDER is unavailable (rare). Saves
+    ; the OpenFont + the server keeping a font resident in the common case.
+    cmp byte [render_ok], 0
+    jne .have_text_font
+    call open_core_font
+    call set_text_gc_font
+.have_text_font:
     call map_strip_window
     call tray_setup
     call wintitle_init                    ; no-op if striprc has no @wintitle
@@ -4231,6 +4237,24 @@ open_core_font:
     pop rbx
     ret
 
+; set_text_gc_font — put font_id on the text GC. Only called in the core-font
+; fallback (RENDER unavailable), since CreateGC no longer sets a font.
+set_text_gc_font:
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_GC
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov eax, [gc_id]
+    mov [rdi+4], eax
+    mov dword [rdi+8], GC_FONT
+    mov eax, [font_id]
+    mov [rdi+12], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    ret
+
 create_strip_window:
     push rbx
     push r12
@@ -4273,26 +4297,28 @@ create_strip_window:
 create_gc:
     push rbx
     push r12
-    ; Text GC: foreground = cfg_fg, background = cfg_bg, font = font_id.
+    ; Text GC: foreground = cfg_fg, background = cfg_bg. No font set here —
+    ; the RENDER glyph path (CompositeGlyphs) doesn't use a GC font, and the
+    ; GC is otherwise used only for CopyArea. The core-font fallback adds the
+    ; font via set_text_gc_font only if RENDER is unavailable (so the common
+    ; case never loads a server font).
     call alloc_xid
     mov [gc_id], eax
     mov r12d, eax
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_CREATE_GC
     mov byte [rdi+1], 0
-    mov word [rdi+2], 7
+    mov word [rdi+2], 6
     mov [rdi+4], r12d
     mov ebx, [window_id]
     mov [rdi+8], ebx
-    mov dword [rdi+12], GC_FOREGROUND | GC_BACKGROUND | GC_FONT
+    mov dword [rdi+12], GC_FOREGROUND | GC_BACKGROUND
     mov eax, [cfg_fg]
     mov [rdi+16], eax
     mov eax, [cfg_bg]
     mov [rdi+20], eax
-    mov ebx, [font_id]
-    mov [rdi+24], ebx
     lea rsi, [tmp_buf]
-    mov rdx, 28
+    mov rdx, 24
     call x11_buffer
     inc dword [x11_seq]
 
