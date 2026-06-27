@@ -60,6 +60,15 @@
 %define X11_SEND_EVENT          25
 %define X11_REPARENT_WINDOW     7
 %define X11_QUERY_EXTENSION     98
+%define X11_PUT_IMAGE           72
+; RENDER extension minor opcodes + constants (for the glyph text path).
+%define RENDER_QUERY_PICT_FORMATS 1
+%define RENDER_CREATE_PICTURE     4
+%define RENDER_CREATE_GLYPH_SET   17
+%define RENDER_ADD_GLYPHS         20
+%define RENDER_COMPOSITE_GLYPHS8  23
+%define RENDER_OP_OVER            3
+%define RENDER_CP_REPEAT          0x01
 
 ; RandR 1.5 RRGetMonitors. Used at startup to constrain strip to the
 ; primary monitor's geometry — Xorg's x11_screen_width covers the entire
@@ -227,6 +236,10 @@ sgr_palette:
                          ; the @workspaces layout glyph
     dd 0xFFFFFFFF        ; 97 bright white
 
+; Pre-rasterized A8 glyph atlas (gen_strip_glyphs.py). Defines GLYPH_COUNT,
+; GLYPH_ADVANCE, GLYPH_ADDREQ_MAX, glyph_table, glyph_atlas.
+%include "strip_glyphs.inc"
+
 ; ══════════════════════════════════════════════════════════════════════
 ; BSS
 ; ══════════════════════════════════════════════════════════════════════
@@ -287,6 +300,19 @@ window_id:           resd 1
 pixmap_id:           resd 1
 gc_id:               resd 1            ; text GC: fg=cfg_fg, bg=cfg_bg
 fill_gc_id:          resd 1            ; fill GC: fg=cfg_bg (used to clear)
+; ---- RENDER glyph text path (replaces core-font ImageText) ----
+render_ok:           resb 1            ; 1 if RENDER init succeeded
+render_major:        resb 1            ; RENDER major opcode (from QueryExtension)
+render_fmt_a8:       resd 1            ; PictFormat: A8 (glyph coverage)
+render_fmt_argb32:   resd 1            ; PictFormat: ARGB32 (pen source)
+render_fmt_rgb24:    resd 1            ; PictFormat: RGB24
+render_fmt_dst:      resd 1            ; PictFormat for the pixmap (by depth)
+pix_picture:         resd 1            ; Picture over pixmap_id (text dst)
+pen_pixmap:          resd 1            ; 1x1 ARGB32 pixmap (solid colour)
+pen_picture:         resd 1            ; Picture over pen_pixmap (Repeat)
+glyphset_id:         resd 1            ; GlyphSet holding the atlas
+pen_color_cur:       resd 1            ; ARGB currently in the pen (cache)
+text_color:          resd 1            ; desired text colour (set by change_gc_fg)
 font_id:             resd 1
 strip_height:        resw 1
 strip_y:             resw 1
@@ -467,6 +493,7 @@ _start:
     call create_strip_window
     call create_pixmap
     call create_gc
+    call render_init                      ; RENDER glyph path (falls back if absent)
     call map_strip_window
     call tray_setup
     call wintitle_init                    ; no-op if striprc has no @wintitle
@@ -1654,6 +1681,7 @@ image_text8_pixmap:
 ; eax = pixel value. Sends ChangeGC to set the text GC's foreground.
 change_gc_fg:
     push rbx
+    mov [text_color], eax                 ; remember for the RENDER pen
     mov ebx, eax
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_CHANGE_GC
@@ -1966,6 +1994,23 @@ paint_text:
     test ecx, ecx
     jz .pt_zero_post
 
+    ; RENDER glyph path (preferred). Falls back to core ImageText16 when
+    ; render_init failed / the server lacks RENDER.
+    cmp byte [render_ok], 0
+    je .pt_coretext
+    mov r13d, ecx                         ; count (return value)
+    mov edi, r14d                         ; x
+                                          ; esi = y already
+    mov edx, ecx                          ; count
+    call render_emit_glyphs
+    mov eax, r13d
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.pt_coretext:
     ; Build ImageText16 request. Length unit = 4 bytes; header = 4 words
     ; (16 bytes); body = 2 * count bytes, padded to 4.
     mov r13d, ecx                         ; preserve count for return
@@ -2035,6 +2080,443 @@ paint_text:
 .pt_zero:
     add rsp, 8                            ; drop saved y
     xor eax, eax
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; RENDER glyph text path
+; ══════════════════════════════════════════════════════════════════════
+; render_init — negotiate RENDER, find pict formats, create the pixmap +
+; pen Pictures and the glyph set, upload the atlas. Sets render_ok=1 on
+; success; on any failure leaves render_ok=0 (strip uses core ImageText).
+; Called once at startup with window_id + pixmap_id already created.
+; ----------------------------------------------------------------------
+render_init:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    call x11_flush                        ; drain buffered reqs before sync reads
+
+    ; --- QueryExtension "RENDER" ---
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_QUERY_EXTENSION
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4                   ; 2 + ceil(6/4) = 4 words
+    mov word [rdi+4], 6                   ; name length
+    mov word [rdi+6], 0
+    mov dword [rdi+8], 'REND'
+    mov word [rdi+12], 'ER'
+    mov word [rdi+14], 0
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    syscall
+    inc dword [x11_seq]
+.ri_qe_read:
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [x11_read_buf]
+    mov rdx, 32
+    syscall
+    cmp rax, 32
+    jl .ri_fail
+    cmp byte [x11_read_buf], 1
+    je .ri_qe_have
+    cmp byte [x11_read_buf], 0
+    je .ri_fail
+    jmp .ri_qe_read
+.ri_qe_have:
+    cmp byte [x11_read_buf + 8], 0        ; present?
+    je .ri_fail
+    movzx eax, byte [x11_read_buf + 9]    ; major opcode
+    mov [render_major], al
+
+    ; --- QueryPictFormats ---
+    mov al, [render_major]
+    lea rdi, [tmp_buf]
+    mov [rdi], al
+    mov byte [rdi+1], RENDER_QUERY_PICT_FORMATS
+    mov word [rdi+2], 1
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 4
+    syscall
+    inc dword [x11_seq]
+.ri_pf_read:
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [conn_setup_buf]
+    mov rdx, 32
+    syscall
+    cmp rax, 32
+    jl .ri_fail
+    cmp byte [conn_setup_buf], 1
+    je .ri_pf_have
+    cmp byte [conn_setup_buf], 0
+    je .ri_fail
+    jmp .ri_pf_read
+.ri_pf_have:
+    mov eax, [conn_setup_buf + 4]         ; reply length (4-byte units)
+    shl eax, 2                            ; bytes after the 32-byte header
+    mov r12d, eax                         ; remaining
+    lea r13, [conn_setup_buf + 32]
+.ri_pf_more:
+    test r12d, r12d
+    jz .ri_pf_done
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    mov rsi, r13
+    mov edx, r12d
+    syscall
+    test rax, rax
+    jle .ri_fail
+    add r13, rax
+    sub r12d, eax
+    jmp .ri_pf_more
+.ri_pf_done:
+    ; Scan num_formats PICTFORMINFO (28 bytes each). Pick A8 / RGB24 / ARGB32.
+    mov r14d, [conn_setup_buf + 8]        ; num_formats
+    lea r15, [conn_setup_buf + 32]
+.ri_scan:
+    test r14d, r14d
+    jz .ri_scan_done
+    movzx eax, byte [r15 + 5]             ; depth
+    movzx ecx, word [r15 + 22]            ; alpha-mask (direct + 14)
+    movzx edx, word [r15 + 10]            ; red-mask (direct + 2)
+    cmp eax, 8
+    jne .ri_chk24
+    cmp ecx, 0xFF
+    jne .ri_next
+    cmp dword [render_fmt_a8], 0
+    jne .ri_next
+    mov ebx, [r15]
+    mov [render_fmt_a8], ebx
+    jmp .ri_next
+.ri_chk24:
+    cmp eax, 24
+    jne .ri_chk32
+    test edx, edx
+    jz .ri_next
+    cmp dword [render_fmt_rgb24], 0
+    jne .ri_next
+    mov ebx, [r15]
+    mov [render_fmt_rgb24], ebx
+    jmp .ri_next
+.ri_chk32:
+    cmp eax, 32
+    jne .ri_next
+    cmp ecx, 0xFF
+    jne .ri_next
+    cmp dword [render_fmt_argb32], 0
+    jne .ri_next
+    mov ebx, [r15]
+    mov [render_fmt_argb32], ebx
+.ri_next:
+    add r15, 28
+    dec r14d
+    jmp .ri_scan
+.ri_scan_done:
+    cmp dword [render_fmt_a8], 0
+    je .ri_fail
+    cmp dword [render_fmt_argb32], 0
+    je .ri_fail
+    ; dst format matches the pixmap depth (= root depth).
+    movzx eax, byte [x11_root_depth]
+    cmp eax, 32
+    je .ri_dst_argb
+    mov eax, [render_fmt_rgb24]
+    test eax, eax
+    jz .ri_fail
+    jmp .ri_dst_set
+.ri_dst_argb:
+    mov eax, [render_fmt_argb32]
+.ri_dst_set:
+    mov [render_fmt_dst], eax
+
+    ; --- CreatePicture over the pixmap (text dst) ---
+    call alloc_xid
+    mov [pix_picture], eax
+    lea rdi, [tmp_buf]
+    mov bl, [render_major]
+    mov [rdi], bl
+    mov byte [rdi+1], RENDER_CREATE_PICTURE
+    mov word [rdi+2], 5
+    mov eax, [pix_picture]
+    mov [rdi+4], eax
+    mov eax, [pixmap_id]
+    mov [rdi+8], eax
+    mov eax, [render_fmt_dst]
+    mov [rdi+12], eax
+    mov dword [rdi+16], 0                 ; value-mask = 0
+    lea rsi, [tmp_buf]
+    mov rdx, 20
+    call x11_buffer
+    inc dword [x11_seq]
+
+    ; --- 1x1 ARGB32 pen pixmap ---
+    call alloc_xid
+    mov [pen_pixmap], eax
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CREATE_PIXMAP
+    mov byte [rdi+1], 32
+    mov word [rdi+2], 4
+    mov eax, [pen_pixmap]
+    mov [rdi+4], eax
+    mov eax, [window_id]
+    mov [rdi+8], eax
+    mov word [rdi+12], 1
+    mov word [rdi+14], 1
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+
+    ; --- pen Picture (Repeat) ---
+    call alloc_xid
+    mov [pen_picture], eax
+    lea rdi, [tmp_buf]
+    mov bl, [render_major]
+    mov [rdi], bl
+    mov byte [rdi+1], RENDER_CREATE_PICTURE
+    mov word [rdi+2], 6
+    mov eax, [pen_picture]
+    mov [rdi+4], eax
+    mov eax, [pen_pixmap]
+    mov [rdi+8], eax
+    mov eax, [render_fmt_argb32]
+    mov [rdi+12], eax
+    mov dword [rdi+16], RENDER_CP_REPEAT
+    mov dword [rdi+20], 1                 ; RepeatNormal
+    lea rsi, [tmp_buf]
+    mov rdx, 24
+    call x11_buffer
+    inc dword [x11_seq]
+
+    ; --- CreateGlyphSet (A8) ---
+    call alloc_xid
+    mov [glyphset_id], eax
+    lea rdi, [tmp_buf]
+    mov bl, [render_major]
+    mov [rdi], bl
+    mov byte [rdi+1], RENDER_CREATE_GLYPH_SET
+    mov word [rdi+2], 3
+    mov eax, [glyphset_id]
+    mov [rdi+4], eax
+    mov eax, [render_fmt_a8]
+    mov [rdi+8], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 12
+    call x11_buffer
+    inc dword [x11_seq]
+
+    call render_upload_glyphs
+
+    mov byte [render_ok], 1
+    mov dword [char_width_var], GLYPH_ADVANCE   ; layout matches the glyphs
+    jmp .ri_ret
+.ri_fail:
+    mov byte [render_ok], 0
+.ri_ret:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------
+; render_upload_glyphs — AddGlyphs every atlas entry into glyphset_id.
+; entry (20 bytes): cp(u32) w(u16) h(u16) x(s16) y(s16) adv(u16) pad off(u32)
+; ----------------------------------------------------------------------
+render_upload_glyphs:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    lea r12, [glyph_table]
+    mov r13d, GLYPH_COUNT
+.rug_loop:
+    test r13d, r13d
+    jz .rug_done
+    movzx r14d, word [r12 + 4]            ; w
+    movzx r15d, word [r12 + 6]            ; h
+    mov eax, r14d                         ; stride = (w+3)&~3
+    add eax, 3
+    and eax, ~3
+    imul eax, r15d                        ; padded alpha bytes
+    mov ebx, eax                          ; ebx = padded bytes
+    lea rdi, [tmp_buf]
+    mov dl, [render_major]
+    mov [rdi], dl
+    mov byte [rdi+1], RENDER_ADD_GLYPHS
+    mov eax, ebx
+    add eax, 28
+    shr eax, 2
+    mov [rdi+2], ax                       ; length words
+    mov eax, [glyphset_id]
+    mov [rdi+4], eax
+    mov dword [rdi+8], 1                  ; num_glyphs
+    mov eax, [r12 + 0]                    ; gid = cp
+    mov [rdi+12], eax
+    mov ax, [r12 + 4]
+    mov [rdi+16], ax                      ; w
+    mov ax, [r12 + 6]
+    mov [rdi+18], ax                      ; h
+    mov ax, [r12 + 8]
+    mov [rdi+20], ax                      ; x
+    mov ax, [r12 + 10]
+    mov [rdi+22], ax                      ; y
+    mov ax, [r12 + 12]
+    mov [rdi+24], ax                      ; xOff = advance
+    mov word [rdi+26], 0                  ; yOff
+    ; copy padded alpha: glyph_atlas + off → tmp_buf+28
+    mov eax, [r12 + 16]                   ; off
+    lea rsi, [glyph_atlas + rax]
+    lea rdi, [tmp_buf + 28]
+    mov ecx, ebx                          ; padded bytes
+    rep movsb
+    lea rsi, [tmp_buf]
+    mov edx, ebx
+    add edx, 28
+    call x11_buffer
+    inc dword [x11_seq]
+    add r12, 20
+    dec r13d
+    jmp .rug_loop
+.rug_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------
+; render_set_pen — eax = RGB colour. PutImage it (opaque) into the 1x1
+; pen pixmap, unless it already holds that colour.
+; ----------------------------------------------------------------------
+render_set_pen:
+    or eax, 0xFF000000                    ; opaque ARGB
+    cmp eax, [pen_color_cur]
+    je .rsp_done
+    mov [pen_color_cur], eax
+    mov r8d, eax
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_PUT_IMAGE
+    mov byte [rdi+1], 2                   ; ZPixmap
+    mov word [rdi+2], 7
+    mov eax, [pen_pixmap]
+    mov [rdi+4], eax
+    mov eax, [gc_id]
+    mov [rdi+8], eax
+    mov word [rdi+12], 1                  ; width
+    mov word [rdi+14], 1                  ; height
+    mov dword [rdi+16], 0                 ; dstX,dstY
+    mov byte [rdi+20], 0                  ; left-pad
+    mov byte [rdi+21], 32                 ; depth
+    mov word [rdi+22], 0
+    mov [rdi+24], r8d                     ; the ARGB pixel
+    lea rsi, [tmp_buf]
+    mov rdx, 28
+    call x11_buffer
+    inc dword [x11_seq]
+.rsp_done:
+    ret
+
+; ----------------------------------------------------------------------
+; render_emit_glyphs — edi = x, esi = y, edx = count, codepoints (BE16)
+; at tmp_buf+1024. Sets the pen to text_color, then one CompositeGlyphs8
+; (op Over, pen → pix_picture) with the run. Out-of-atlas codepoints map
+; to space so the column advance stays aligned with the layout.
+; ----------------------------------------------------------------------
+render_emit_glyphs:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r13d, edi                         ; x
+    mov r14d, esi                         ; y
+    mov r12d, edx                         ; count
+    mov eax, [text_color]
+    call render_set_pen
+
+    ; CompositeGlyphs8 header (28 bytes) at tmp_buf.
+    lea rdi, [tmp_buf]
+    mov bl, [render_major]
+    mov [rdi], bl
+    mov byte [rdi+1], RENDER_COMPOSITE_GLYPHS8
+    mov byte [rdi+4], RENDER_OP_OVER
+    mov byte [rdi+5], 0
+    mov word [rdi+6], 0
+    mov eax, [pen_picture]
+    mov [rdi+8], eax                      ; src
+    mov eax, [pix_picture]
+    mov [rdi+12], eax                     ; dst
+    mov eax, [render_fmt_a8]
+    mov [rdi+16], eax                     ; mask format
+    mov eax, [glyphset_id]
+    mov [rdi+20], eax
+    mov dword [rdi+24], 0                 ; srcX, srcY
+    ; GLYPHELT header at +28.
+    mov [rdi+28], r12b                    ; glyph count
+    mov byte [rdi+29], 0
+    mov word [rdi+30], 0
+    mov [rdi+32], r13w                    ; deltaX = x
+    mov [rdi+34], r14w                    ; deltaY = y
+    ; glyph id bytes at +36.
+    lea rsi, [tmp_buf + 1024]             ; cps (BE16)
+    lea rdi, [tmp_buf + 36]
+    mov ecx, r12d
+.reg_byte:
+    test ecx, ecx
+    jz .reg_pad
+    movzx eax, byte [rsi + 1]             ; low byte of BE16 = cp (if < 256)
+    cmp byte [rsi], 0                     ; high byte non-zero → not ASCII
+    jne .reg_space
+    cmp al, 32
+    jb .reg_space
+    cmp al, 126
+    jbe .reg_have
+.reg_space:
+    mov al, 32                            ; out-of-atlas → space (keep advance)
+.reg_have:
+    mov [rdi], al
+    inc rdi
+    add rsi, 2
+    dec ecx
+    jmp .reg_byte
+.reg_pad:
+    ; pad glyph bytes up to a 4-byte boundary (relative to tmp_buf).
+    lea rax, [tmp_buf]
+    mov rdx, rdi
+    sub rdx, rax                          ; current length
+    mov ecx, edx
+    and ecx, 3
+    jz .reg_send
+    mov eax, 4
+    sub eax, ecx
+.reg_pl:
+    mov byte [rdi], 0
+    inc rdi
+    dec eax
+    jnz .reg_pl
+.reg_send:
+    lea rsi, [tmp_buf]
+    mov rdx, rdi
+    sub rdx, rsi                          ; total bytes
+    mov rax, rdx
+    shr rax, 2
+    mov [tmp_buf + 2], ax                 ; request length (words)
+    call x11_buffer
+    inc dword [x11_seq]
     pop r14
     pop r13
     pop r12
