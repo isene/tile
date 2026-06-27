@@ -10,7 +10,32 @@ from PIL import ImageFont
 
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
 SIZE = 16                      # px; ascent ~15 fits baseline 16 on a 22px bar
-CODEPOINTS = list(range(32, 127))   # printable ASCII (symbols added later)
+
+# ASCII + Latin-1 Supplement (·°±×÷ accents) + status-bar symbols seen on the
+# real bar / used by striprc segments (markers, arrows, triangles, check marks,
+# dashes, ellipsis, math). Cmap-filtered below so unsupported glyphs are
+# dropped rather than rendered as .notdef boxes.
+SYMBOLS = [
+    0x2013, 0x2014,                     # – —
+    0x2018, 0x2019, 0x201C, 0x201D,     # ‘ ’ “ ”
+    0x2022, 0x2026,                     # • …
+    0x2190, 0x2191, 0x2192, 0x2193, 0x2194,   # ← ↑ → ↓ ↔
+    0x2248, 0x2260, 0x2264, 0x2265,     # ≈ ≠ ≤ ≥
+    0x25A0, 0x25A1, 0x25AA, 0x25AB,     # ■ □ ▪ ▫
+    0x25B2, 0x25BC, 0x25B6, 0x25C0,     # ▲ ▼ ▶ ◀
+    0x25B8, 0x25C2, 0x25C6, 0x25C7,     # ▸ ◂ ◆ ◇
+    0x25CB, 0x25CF, 0x25C9,             # ○ ● ◉
+    0x2605, 0x2606,                     # ★ ☆
+    0x2713, 0x2714, 0x2717, 0x2718,     # ✓ ✔ ✗ ✘
+]
+_cand = sorted(set(range(32, 127)) | set(range(160, 256)) | set(SYMBOLS))
+
+try:
+    from fontTools.ttLib import TTFont
+    _cmap = TTFont(FONT).getBestCmap()
+    CODEPOINTS = [c for c in _cand if c in _cmap]
+except Exception:
+    CODEPOINTS = _cand
 
 font = ImageFont.truetype(FONT, SIZE)
 ascent, descent = font.getmetrics()
