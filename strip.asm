@@ -310,6 +310,8 @@ render_fmt_rgb24:    resd 1            ; PictFormat: RGB24
 render_fmt_dst:      resd 1            ; PictFormat for the pixmap (by depth)
 pix_picture:         resd 1            ; Picture over pixmap_id (text dst)
 pen_pixmap:          resd 1            ; 1x1 ARGB32 pixmap (solid colour)
+pen_gc:              resd 1            ; GC valid for the depth-32 pen pixmap
+                                       ; (gc_id is depth-24 → BadMatch on Xorg)
 pen_picture:         resd 1            ; Picture over pen_pixmap (Repeat)
 glyphset_id:         resd 1            ; GlyphSet holding the atlas
 pen_color_cur:       resd 1            ; ARGB currently in the pen (cache)
@@ -2300,6 +2302,24 @@ render_init:
     call x11_buffer
     inc dword [x11_seq]
 
+    ; --- pen GC (created ON the depth-32 pen pixmap; gc_id is depth-24 and
+    ;     a depth mismatch makes PutImage BadMatch on a strict server) ---
+    call alloc_xid
+    mov [pen_gc], eax
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CREATE_GC
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov eax, [pen_gc]
+    mov [rdi+4], eax
+    mov eax, [pen_pixmap]
+    mov [rdi+8], eax                      ; drawable = depth-32 pixmap
+    mov dword [rdi+12], 0                 ; value-mask = 0
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+
     ; --- pen Picture (Repeat) ---
     call alloc_xid
     mov [pen_picture], eax
@@ -2437,7 +2457,7 @@ render_set_pen:
     mov word [rdi+2], 7
     mov eax, [pen_pixmap]
     mov [rdi+4], eax
-    mov eax, [gc_id]
+    mov eax, [pen_gc]                     ; depth-32 GC (not the depth-24 gc_id)
     mov [rdi+8], eax
     mov word [rdi+12], 1                  ; width
     mov word [rdi+14], 1                  ; height
