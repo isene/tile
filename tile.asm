@@ -1406,6 +1406,14 @@ x11_connect:
     dec edx
     jnz .xc_pad
 .xc_data:
+    ; Only append the cookie if we actually have one. The block declares
+    ; auth-data-len = xauth_len; writing the 16-byte cookie area anyway
+    ; (zeros) put 16 undeclared bytes on the wire, which the server then
+    ; parsed as garbage REQUESTS — sequence shift, BadRequest errors, and
+    ; a desynced connection from the very first exchange (dead grabs,
+    ; garbage atom ids). Hit whenever the auth file has no cookie.
+    cmp qword [xauth_len], 0
+    je  .xc_send
     lea rsi, [xauth_data]
     mov ecx, 16
 .xc_cp_cookie:
@@ -1415,7 +1423,7 @@ x11_connect:
     inc rdi
     dec ecx
     jnz .xc_cp_cookie
-
+.xc_send:
     mov rdx, rdi
     lea rsi, [tmp_buf]
     sub rdx, rsi
