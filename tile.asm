@@ -4720,14 +4720,15 @@ xinerama_query_screens:
     syscall
     inc dword [x11_seq]
 
-    ; Read the 32-byte reply header
-    mov rax, SYS_READ
-    mov rdi, [x11_fd]
-    lea rsi, [x11_read_buf]
-    mov rdx, 32
-    syscall
-    cmp rax, 32
-    jl .xqs_fail
+    ; Event-safe reply read (see randr_query_monitors) + reply-type check —
+    ; the old naive read parsed whatever 32 bytes came first, event or error
+    ; included, and desynced the connection.
+    lea rdi, [x11_read_buf]
+    call read_reply_or_queue
+    test eax, eax
+    jz .xqs_fail
+    cmp byte [x11_read_buf], 1
+    jne .xqs_fail
 
     ; Number of screens at offset 8 (CARD32)
     mov ebx, [x11_read_buf + 8]
@@ -4857,14 +4858,17 @@ randr_query_monitors:
     syscall
     inc dword [x11_seq]
 
-    ; Read 32-byte reply header.
-    mov rax, SYS_READ
-    mov rdi, [x11_fd]
-    lea rsi, [x11_read_buf]
-    mov rdx, 32
-    syscall
-    cmp rax, 32
-    jl .rqm_fail
+    ; Event-safe reply read. A fresh server can deliver RRScreenChangeNotify
+    ; IMMEDIATELY after our RRSelectInput (config changed since we connected
+    ; — exactly the bolt-greet cold-Xorg case). The old naive 32-byte read
+    ; here ate that event as "the reply", bailed to the Xinerama fallback,
+    ; and left the REAL reply + payload in the pipe — a permanently desynced
+    ; stream: dead grabs, zeroed events (mr xid=0), no property publishes.
+    ; Same fix rediscover_outputs already carries.
+    lea rdi, [x11_read_buf]
+    call read_reply_or_queue
+    test eax, eax
+    jz .rqm_fail
 
     ; Reject error replies (type=0). Reply has type=1.
     cmp byte [x11_read_buf], 1
