@@ -5515,6 +5515,13 @@ ws_publish_segment:
     ; colour with bright purple (palette slot 95). Signals at a glance
     ; "this workspace lives on the external display". When no external
     ; is connected (n_monitors < 2) WS 10 keeps the normal state colour.
+    ;
+    ; BUT skip the override when WS 10 is the *active* workspace: leave the
+    ; active-orange SGR (emitted above by the state logic) in place so the
+    ; bar shows "you are here". Without this WS0 was the same purple whether
+    ; focused or not — no way to tell you were on it.
+    cmp dword [ws_current], 10
+    je .wps2_ws10_skip_purple
     cmp byte [randr_n_monitors], 2
     jb .wps2_ws10_skip_purple
     mov byte [rdi+0], 0x1b
