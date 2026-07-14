@@ -2,7 +2,7 @@
 
 <img src="img/tile.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.38-blue)
+![Version](https://img.shields.io/badge/version-0.1.39-blue)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
 ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue)
@@ -140,7 +140,15 @@ statements: `bind <chord> <action> [arg]`, `exec <cmdline>`,
 Modifiers: `Shift`, `Ctrl`/`Control`, `Alt`/`Mod1`, `Mod4`/`Win`/`Super`.
 Actions: `exec`, `exec-here`, `kill`, `exit`, `workspace`, `move-to`,
 `focus`, `move-tab`, `tab-color-cycle`, `stash`, `unstash`, `layout`,
-`spawn-split`, `reload`, `restart`.
+`spawn-split`, `reload`, `restart`, `overview`.
+
+The `overview` action opens a schematic map of all 10 workspaces: a 5x2
+grid where each cell shows colored boxes for the windows on that
+workspace (coloured by tab palette), with the current workspace framed
+in the accent colour. Press a workspace number (1-9, 0 for 10) to jump
+there, or Esc to close. No pixels are captured, so it costs nothing when
+closed and is instant to open. Bind it with e.g. `bind Mod4+Alt+e
+overview`.
 
 ## License
 
