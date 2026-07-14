@@ -75,6 +75,7 @@
 %define X11_QUERY_EXTENSION     98
 %define X11_UNGRAB_POINTER      27
 %define X11_UNGRAB_KEYBOARD     32
+%define X11_GRAB_KEYBOARD       31
 %define X11_GET_INPUT_FOCUS     43
 
 ; Xinerama sub-opcodes (sent with major = xinerama_major).
@@ -95,6 +96,7 @@
 %define X11_CHANGE_GC           56
 %define X11_FREE_GC             60
 %define X11_POLY_RECTANGLE      67
+%define X11_CLEAR_AREA          61
 %define X11_POLY_FILL_RECT      70
 
 ; CW masks (for CreateWindow / ChangeWindowAttributes value mask)
@@ -177,6 +179,7 @@
 %define ACT_RELOAD      14
 %define ACT_RESTART     15
 %define ACT_GATHER      16
+%define ACT_OVERVIEW    17
 
 %define MAX_STASH       8
 
@@ -467,6 +470,8 @@ action_table:
     db ACT_RESTART, 0
     db "gather", 0
     db ACT_GATHER, 0
+    db "overview", 0
+    db ACT_OVERVIEW, 0
     db 0                       ; terminator
 
 ; layout arg keyword table: `layout tabbed | split-h | split-v | toggle`.
@@ -575,6 +580,22 @@ keysym_map:          resd 256 * 8
 ;                       1..palette_count = palette[idx-1].
 bar_height:              resw 1
 bar_window_id:           resd 1
+; --- overview (Mod4+Alt+e via `bind ... overview`): a schematic workspace
+; map. Full-screen override-redirect overlay; 5x2 grid of workspace cells,
+; each showing colored boxes for its windows. Press a workspace number to
+; jump there, Esc to close. Created lazily, reused. Zero cost when closed.
+overview_window_id:      resd 1
+overview_gc_id:          resd 1
+overview_active:         resb 1
+    alignb 4
+ov_W:                    resd 1        ; draw_overview scratch (screen + cell geom)
+ov_H:                    resd 1
+ov_cellW:                resd 1
+ov_cellH:                resd 1
+ov_cx:                   resd 1        ; current cell inner rect
+ov_cy:                   resd 1
+ov_cw:                   resd 1
+ov_ch:                   resd 1
 bar_gc_id:               resd 1
 client_color:            resb MAX_CLIENTS
 
@@ -3042,6 +3063,13 @@ event_loop:
 .ev_key_press:
     ; KeyPress layout: byte 1 = keycode, bytes 28-29 = state (modifiers).
     movzx eax, byte [x11_read_buf + 1]
+    ; Overview modal: while it's up, keys drive the map, not the WM binds.
+    cmp byte [overview_active], 0
+    je .ekp_normal
+    mov edi, eax
+    call overview_key
+    jmp event_loop
+.ekp_normal:
     movzx edx, word [x11_read_buf + 28]
     and edx, ~(MOD_LOCK | MOD_MOD2)      ; strip locks
     push rax
@@ -7005,6 +7033,11 @@ dispatch_keypress:
     je .dk_restart
     cmp eax, ACT_GATHER
     je .dk_gather
+    cmp eax, ACT_OVERVIEW
+    je .dk_overview
+    jmp .dk_done
+.dk_overview:
+    call open_overview
     jmp .dk_done
 .dk_exec:
     test edx, edx
@@ -11443,6 +11476,411 @@ client_color_to_pixel:
     ret
 .cctp_default:
     mov eax, [cfg_tab_default]
+    ret
+
+; ============================================================================
+; Overview — a schematic workspace map (see BSS notes at overview_window_id).
+; ============================================================================
+%define OV_PAD    24
+%define OV_BORDER 3
+
+; ov_set_fg — edi = CARD32 pixel. ChangeGC foreground on the overview GC.
+; Preserves rbx, r12-r15 (draw_overview's loop state).
+ov_set_fg:
+    push rsi
+    push rdx
+    push rcx
+    lea rsi, [tmp_buf]
+    mov byte [rsi], X11_CHANGE_GC
+    mov byte [rsi+1], 0
+    mov word [rsi+2], 4
+    mov ecx, [overview_gc_id]
+    mov [rsi+4], ecx
+    mov dword [rsi+8], GC_FOREGROUND
+    mov [rsi+12], edi
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    pop rcx
+    pop rdx
+    pop rsi
+    ret
+
+; ov_fill — edi=x, esi=y, edx=w, ecx=h. PolyFillRectangle with the current GC
+; foreground into the overview window. Preserves rbx, r12-r15.
+ov_fill:
+    push r8
+    push r9
+    push r10
+    push r11
+    push rsi
+    push rdx
+    push rcx
+    mov r8d, edi
+    mov r9d, esi
+    mov r10d, edx
+    mov r11d, ecx
+    lea rsi, [tmp_buf]
+    mov byte [rsi], X11_POLY_FILL_RECT
+    mov byte [rsi+1], 0
+    mov word [rsi+2], 5
+    mov eax, [overview_window_id]
+    mov [rsi+4], eax
+    mov eax, [overview_gc_id]
+    mov [rsi+8], eax
+    mov [rsi+12], r8w
+    mov [rsi+14], r9w
+    mov [rsi+16], r10w
+    mov [rsi+18], r11w
+    mov rdx, 20
+    call x11_buffer
+    inc dword [x11_seq]
+    pop rcx
+    pop rdx
+    pop rsi
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    ret
+
+; ensure_overview_window — create the full-screen override-redirect overlay
+; + its GC once, lazily. Uses the primary output's rect.
+ensure_overview_window:
+    cmp dword [overview_window_id], 0
+    jne .eow_done
+    call alloc_xid
+    mov [overview_window_id], eax
+    push rax
+    lea rdi, [tmp_buf]
+    movzx eax, byte [x11_root_depth]
+    mov byte [rdi+1], al                  ; depth
+    mov word [rdi+2], 11
+    pop rax
+    mov [rdi+4], eax                      ; wid
+    mov ecx, [x11_root_window]
+    mov [rdi+8], ecx
+    movzx eax, word [output_x]
+    mov [rdi+12], ax
+    movzx eax, word [output_y]
+    mov [rdi+14], ax
+    movzx eax, word [output_w]
+    mov [rdi+16], ax
+    movzx eax, word [output_h]
+    mov [rdi+18], ax
+    mov word [rdi+20], 0                  ; border-width
+    mov word [rdi+22], 1                  ; InputOutput
+    mov dword [rdi+24], 0                 ; visual = CopyFromParent
+    mov dword [rdi+28], CW_BACK_PIXEL | CW_OVERRIDE_REDIRECT | CW_EVENT_MASK
+    mov dword [rdi+32], 0xFF101014        ; bg
+    mov dword [rdi+36], 1                 ; override-redirect
+    mov dword [rdi+40], EXPOSURE_MASK
+    mov byte [rdi], X11_CREATE_WINDOW
+    lea rsi, [tmp_buf]
+    mov rdx, 44
+    call x11_buffer
+    inc dword [x11_seq]
+    ; CreateGC
+    call alloc_xid
+    mov [overview_gc_id], eax
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CREATE_GC
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 5
+    mov [rdi+4], eax
+    mov ecx, [overview_window_id]
+    mov [rdi+8], ecx
+    mov dword [rdi+12], GC_FOREGROUND
+    mov dword [rdi+16], 0
+    lea rsi, [tmp_buf]
+    mov rdx, 20
+    call x11_buffer
+    inc dword [x11_seq]
+.eow_done:
+    ret
+
+; draw_overview — repaint the whole map: 5x2 grid of workspace cells, each
+; with a dim/accent border (accent = current_ws) and equal-width colored
+; stripes for the windows on that workspace.
+draw_overview:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    ; screen geom (primary output)
+    movzx eax, word [output_w]
+    mov [ov_W], eax
+    movzx eax, word [output_h]
+    mov [ov_H], eax
+    mov eax, [ov_W]
+    xor edx, edx
+    mov ecx, 5
+    div ecx
+    mov [ov_cellW], eax
+    mov eax, [ov_H]
+    xor edx, edx
+    mov ecx, 2
+    div ecx
+    mov [ov_cellH], eax
+    ; bg fill
+    mov edi, 0xFF101014
+    call ov_set_fg
+    xor edi, edi
+    xor esi, esi
+    mov edx, [ov_W]
+    mov ecx, [ov_H]
+    call ov_fill
+    ; per-workspace cells
+    mov r12d, 1                           ; ws = 1..10
+.dov_ws:
+    cmp r12d, 10
+    jg .dov_done
+    ; col = (ws-1)%5, row = (ws-1)/5
+    mov eax, r12d
+    dec eax
+    xor edx, edx
+    mov ecx, 5
+    div ecx                               ; eax=row, edx=col
+    ; cell outer x = col*cellW, y = row*cellH
+    mov r13d, edx                         ; col
+    imul r13d, [ov_cellW]                 ; outer x
+    mov r14d, eax                         ; row
+    imul r14d, [ov_cellH]                 ; outer y
+    ; inner rect (+PAD)
+    lea ebx, [r13d + OV_PAD]
+    mov [ov_cx], ebx
+    lea ebx, [r14d + OV_PAD]
+    mov [ov_cy], ebx
+    mov ebx, [ov_cellW]
+    sub ebx, OV_PAD*2
+    mov [ov_cw], ebx
+    mov ebx, [ov_cellH]
+    sub ebx, OV_PAD*2
+    mov [ov_ch], ebx
+    ; border colour: accent if current ws, else dim grey
+    movzx eax, byte [current_ws]
+    cmp eax, r12d
+    jne .dov_dim
+    mov edi, [cfg_active_frame]
+    test edi, edi
+    jnz .dov_border
+    mov edi, 0xFF3070C0                   ; fallback accent
+    jmp .dov_border
+.dov_dim:
+    mov edi, 0xFF404048
+.dov_border:
+    call ov_set_fg
+    mov edi, [ov_cx]
+    mov esi, [ov_cy]
+    mov edx, [ov_cw]
+    mov ecx, [ov_ch]
+    call ov_fill                          ; border block
+    ; inner background (inset by OV_BORDER)
+    mov edi, 0xFF18181E
+    call ov_set_fg
+    mov edi, [ov_cx]
+    add edi, OV_BORDER
+    mov esi, [ov_cy]
+    add esi, OV_BORDER
+    mov edx, [ov_cw]
+    sub edx, OV_BORDER*2
+    mov ecx, [ov_ch]
+    sub ecx, OV_BORDER*2
+    call ov_fill
+    ; shrink ov_cx/cy/cw/ch to the inner content area (for stripes)
+    mov eax, [ov_cx]
+    add eax, OV_BORDER
+    mov [ov_cx], eax
+    mov eax, [ov_cy]
+    add eax, OV_BORDER
+    mov [ov_cy], eax
+    mov eax, [ov_cw]
+    sub eax, OV_BORDER*2
+    mov [ov_cw], eax
+    mov eax, [ov_ch]
+    sub eax, OV_BORDER*2
+    mov [ov_ch], eax
+    ; count windows on this ws → r15d
+    xor r15d, r15d
+    xor r13d, r13d
+.dov_count:
+    cmp r13d, [client_count]
+    jge .dov_counted
+    movzx eax, byte [client_ws + r13]
+    cmp eax, r12d
+    jne .dov_count_next
+    inc r15d
+.dov_count_next:
+    inc r13d
+    jmp .dov_count
+.dov_counted:
+    test r15d, r15d
+    jz .dov_ws_next                       ; empty workspace, no stripes
+    ; stripeW = cw / n
+    mov eax, [ov_cw]
+    xor edx, edx
+    mov ecx, r15d
+    div ecx
+    mov ebx, eax                          ; ebx = stripeW
+    test ebx, ebx
+    jz .dov_ws_next
+    ; draw a stripe per client on this ws (index r14d)
+    xor r14d, r14d                        ; drawn index
+    xor r13d, r13d                        ; client i
+.dov_draw:
+    cmp r13d, [client_count]
+    jge .dov_ws_next
+    movzx eax, byte [client_ws + r13]
+    cmp eax, r12d
+    jne .dov_draw_next
+    ; fg = client colour
+    movzx eax, byte [client_color + r13]
+    call client_color_to_pixel
+    mov edi, eax
+    call ov_set_fg
+    ; x = cx + index*stripeW ; leave a 2px gap
+    mov edi, r14d
+    imul edi, ebx
+    add edi, [ov_cx]
+    mov esi, [ov_cy]
+    mov edx, ebx
+    sub edx, 2
+    jg .dov_wok
+    mov edx, 1
+.dov_wok:
+    mov ecx, [ov_ch]
+    call ov_fill
+    inc r14d
+.dov_draw_next:
+    inc r13d
+    jmp .dov_draw
+.dov_ws_next:
+    inc r12d
+    jmp .dov_ws
+.dov_done:
+    call x11_flush
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; open_overview — ACT_OVERVIEW. Map the overlay, grab the keyboard, draw.
+open_overview:
+    cmp byte [overview_active], 0
+    jne .oo_done
+    call ensure_overview_window
+    ; MapWindow
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_MAP_WINDOW
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov eax, [overview_window_id]
+    mov [rdi+4], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    call x11_buffer
+    inc dword [x11_seq]
+    ; GrabKeyboard(owner=0, grab-window=overview, time=0, ptr=async, kbd=async)
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_GRAB_KEYBOARD
+    mov byte [rdi+1], 0                    ; owner-events = False
+    mov word [rdi+2], 4
+    mov eax, [overview_window_id]
+    mov [rdi+4], eax
+    mov dword [rdi+8], 0                   ; time = CurrentTime
+    mov byte [rdi+12], 1                   ; pointer-mode = Async
+    mov byte [rdi+13], 1                   ; keyboard-mode = Async
+    mov word [rdi+14], 0
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    ; GrabKeyboard has a reply; drain it so it can't desync the event stream.
+    lea rdi, [recov_reply_buf]
+    call read_reply_or_queue
+    mov byte [overview_active], 1
+    call draw_overview
+.oo_done:
+    ret
+
+; close_overview — ungrab, unmap, clear active. Safe if already closed.
+close_overview:
+    cmp byte [overview_active], 0
+    je .co_done
+    mov byte [overview_active], 0
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_UNGRAB_KEYBOARD
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov dword [rdi+4], 0                   ; time = CurrentTime
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    call x11_buffer
+    inc dword [x11_seq]
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_UNMAP_WINDOW
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov eax, [overview_window_id]
+    mov [rdi+4], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    call x11_buffer
+    inc dword [x11_seq]
+    ; Repaint under the overlay. Re-flow the current workspace (repaints its
+    ; windows over the region), then a ClearArea on the root as a backstop.
+    ; A bare override-redirect unmap doesn't reliably repaint an empty region.
+    movzx eax, byte [current_ws]
+    call apply_workspace_layout
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CLEAR_AREA
+    mov byte [rdi+1], 0                   ; exposures = False
+    mov word [rdi+2], 4
+    mov eax, [x11_root_window]
+    mov [rdi+4], eax
+    mov dword [rdi+8], 0                  ; x=0, y=0
+    movzx eax, word [output_w]
+    mov [rdi+12], ax                      ; width
+    movzx eax, word [output_h]
+    mov [rdi+14], ax                      ; height
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    call x11_flush
+.co_done:
+    ret
+
+; overview_key — edi = X keycode of a KeyPress while the overview is open.
+; The digit row is keycodes 10..19 (1..9 then 0), Escape is 9 — the standard
+; PC mapping (X keycode = evdev + 8). '1'..'9' jump to that workspace, '0' to
+; workspace 10, Escape just closes. Caller always swallows the key.
+overview_key:
+    cmp edi, 9                            ; Escape
+    jne .ok_digit
+    call close_overview
+    ret
+.ok_digit:
+    cmp edi, 10
+    jl .ok_done
+    cmp edi, 18                           ; keycodes 10..18 = '1'..'9'
+    jle .ok_ws
+    cmp edi, 19                           ; keycode 19 = '0' → workspace 10
+    jne .ok_done
+    call close_overview
+    mov edi, 10
+    call switch_workspace
+    ret
+.ok_ws:
+    sub edi, 9                            ; keycode 10→ws1 .. 18→ws9
+    push rdi
+    call close_overview
+    pop rdi
+    call switch_workspace
+.ok_done:
     ret
 
 ; Publish bar state to root window props so strip's @workspaces
