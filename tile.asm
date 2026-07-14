@@ -297,10 +297,12 @@ ov_help_str:       db "j/k move   Enter go   Esc close", 0
 ov_ws_str:         db "WS ", 0
 ov_empty_str:      db "(no windows)", 0
 ov_nowin_str:      db "no windows open", 0
-; Keycodes the overview popup passively grabs while open: Up Down Return
-; KP_Enter Escape j k PgUp PgDn Home End.
-ov_grab_keys_tab:  db 111,116,36,104,9,44,45,112,117,110,115
-ov_grab_keys_n     equ $ - ov_grab_keys_tab
+; Keysyms the overview popup passively grabs while open: Up Down Return
+; KP_Enter Escape j k PgUp PgDn Home End. Resolved against the server keymap
+; on every open (ov_resolve_keys), so xmodmap/framerc remaps (e.g. Escape on
+; CapsLock) are honoured — keycodes must never be hardcoded here.
+ov_key_syms:       dd 0xFF52,0xFF54,0xFF0D,0xFF8D,0xFF1B,0x6A,0x6B,0xFF55,0xFF56,0xFF50,0xFF57
+ov_grab_keys_n     equ ($ - ov_key_syms) / 4
 ; EWMH PID hint — used by the SIGHUP dead-client sweep to look up the
 ; owning process of each top-level window. Apps set this via
 ; XChangeProperty(win, _NET_WM_PID, XA_CARDINAL, ...) at startup.
@@ -616,6 +618,7 @@ bar_window_id:           resd 1
 overview_window_id:      resd 1
 overview_gc_id:          resd 1
 overview_active:         resb 1
+ov_kc:                   resb ov_grab_keys_n  ; nav keycodes, keysym-resolved per open (0 = unresolved)
     alignb 4
 ov_W:                    resd 1        ; draw_overview scratch (screen + cell geom)
 ov_H:                    resd 1
@@ -11824,6 +11827,26 @@ draw_overview:
     ret
 
 ; ============================================================================
+; ov_resolve_keys — resolve ov_key_syms into ov_kc keycodes via the cached
+; keymap (same lookup the .tilerc binds use). 0 = unresolved, never matches.
+; Runs on every open: 11 scans over keysym_map, no syscalls, cold path.
+; ============================================================================
+ov_resolve_keys:
+    push rbx
+    xor ebx, ebx
+.ork_loop:
+    cmp ebx, ov_grab_keys_n
+    jge .ork_done
+    mov eax, [ov_key_syms + rbx*4]
+    call find_keycode_for_keysym
+    mov [ov_kc + rbx], al
+    inc ebx
+    jmp .ork_loop
+.ork_done:
+    pop rbx
+    ret
+
+; ============================================================================
 ; ov_grab_keys — edi=1 grab, 0 ungrab. Passive-grab the navigation keys on
 ; the root while the popup is open. tile's Mod4+ binds already prove passive
 ; grabs are delivered under frame; the active XGrabKeyboard the grid used
@@ -11837,7 +11860,9 @@ ov_grab_keys:
 .ogk_loop:
     cmp ebx, ov_grab_keys_n
     jge .ogk_done
-    movzx eax, byte [ov_grab_keys_tab + rbx]
+    movzx eax, byte [ov_kc + rbx]
+    test eax, eax
+    jz .ogk_next
     test r12d, r12d
     jz .ogk_ungrab
     lea rdi, [tmp_buf]
@@ -12768,7 +12793,8 @@ open_overview:
     inc dword [x11_seq]
     ; Passive-grab the navigation keys (the active XGrabKeyboard the grid used
     ; delivered nothing under frame; tile's own Mod4+ binds prove passive
-    ; grabs work).
+    ; grabs work). Resolve keysyms → keycodes first so remaps are honoured.
+    call ov_resolve_keys
     mov edi, 1
     call ov_grab_keys
     mov byte [overview_active], 1
@@ -12823,30 +12849,30 @@ close_overview:
 ; jump; Enter acts on the selected row (WS header → switch to that WS; client
 ; → make it the active tab AND switch); Escape closes. Caller swallows the key.
 overview_key:
-    cmp edi, 9                            ; Escape
+    cmp dil, [ov_kc + 4]                  ; Escape
     je .ok_close
     mov eax, [ov_row_count]
     test eax, eax
     jz .ok_done                          ; empty list: only Escape does anything
-    cmp edi, 111                          ; Up
+    cmp dil, [ov_kc + 0]                  ; Up
     je .ok_up
-    cmp edi, 45                           ; k
+    cmp dil, [ov_kc + 6]                  ; k
     je .ok_up
-    cmp edi, 116                          ; Down
+    cmp dil, [ov_kc + 1]                  ; Down
     je .ok_down
-    cmp edi, 44                           ; j
+    cmp dil, [ov_kc + 5]                  ; j
     je .ok_down
-    cmp edi, 36                           ; Return
+    cmp dil, [ov_kc + 2]                  ; Return
     je .ok_enter
-    cmp edi, 104                          ; KP_Enter
+    cmp dil, [ov_kc + 3]                  ; KP_Enter
     je .ok_enter
-    cmp edi, 110                          ; Home
+    cmp dil, [ov_kc + 9]                  ; Home
     je .ok_home
-    cmp edi, 115                          ; End
+    cmp dil, [ov_kc + 10]                 ; End
     je .ok_end
-    cmp edi, 112                          ; PageUp
+    cmp dil, [ov_kc + 7]                  ; PageUp
     je .ok_pgup
-    cmp edi, 117                          ; PageDown
+    cmp dil, [ov_kc + 8]                  ; PageDown
     je .ok_pgdn
     ret
 .ok_up:
