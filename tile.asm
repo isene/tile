@@ -97,6 +97,16 @@
 %define X11_FREE_GC             60
 %define X11_POLY_RECTANGLE      67
 %define X11_CLEAR_AREA          61
+%define X11_CREATE_PIXMAP       53
+%define X11_PUT_IMAGE           72
+; RENDER extension minor opcodes / constants (overview popup text path).
+%define RENDER_QUERY_PICT_FORMATS 1
+%define RENDER_CREATE_PICTURE     4
+%define RENDER_CREATE_GLYPH_SET   17
+%define RENDER_ADD_GLYPHS         20
+%define RENDER_COMPOSITE_GLYPHS32 25
+%define RENDER_OP_OVER            3
+%define RENDER_CP_REPEAT          0x01
 %define X11_POLY_FILL_RECT      70
 
 ; CW masks (for CreateWindow / ChangeWindowAttributes value mask)
@@ -278,6 +288,19 @@ net_active_window_str: db "_NET_ACTIVE_WINDOW"
 net_active_window_len equ 18
 net_wm_desktop_str: db "_NET_WM_DESKTOP"
 net_wm_desktop_len equ $ - net_wm_desktop_str
+; _NET_WM_NAME (UTF8) — read by the overview popup to label each window.
+net_wm_name_str:   db "_NET_WM_NAME"
+net_wm_name_len    equ $ - net_wm_name_str
+; Static labels for the overview popup header/footer + empty state.
+ov_hdr_str:        db "OVERVIEW", 0
+ov_help_str:       db "j/k move   Enter go   Esc close", 0
+ov_ws_str:         db "WS ", 0
+ov_empty_str:      db "(no windows)", 0
+ov_nowin_str:      db "no windows open", 0
+; Keycodes the overview popup passively grabs while open: Up Down Return
+; KP_Enter Escape j k PgUp PgDn Home End.
+ov_grab_keys_tab:  db 111,116,36,104,9,44,45,112,117,110,115
+ov_grab_keys_n     equ $ - ov_grab_keys_tab
 ; EWMH PID hint — used by the SIGHUP dead-client sweep to look up the
 ; owning process of each top-level window. Apps set this via
 ; XChangeProperty(win, _NET_WM_PID, XA_CARDINAL, ...) at startup.
@@ -543,6 +566,12 @@ default_glass_arg:
     db "glass", 0
 default_glass_arg_len equ $ - default_glass_arg - 1
 
+; Pre-rasterized A8 glyph atlas for the overview popup's text (shared with
+; strip; gen_strip_glyphs.py). Defines GLYPH_COUNT, GLYPH_ADVANCE,
+; GLYPH_ADDREQ_MAX, glyph_table, glyph_atlas. tile has no other text; the
+; whole engine is cold until the overview is first opened.
+%include "strip_glyphs.inc"
+
 
 ; ══════════════════════════════════════════════════════════════════════
 ; BSS
@@ -596,6 +625,43 @@ ov_cx:                   resd 1        ; current cell inner rect
 ov_cy:                   resd 1
 ov_cw:                   resd 1
 ov_ch:                   resd 1
+
+; --- Hyperlist overview popup: navigable per-workspace window list. ---
+%define OV_MAX_ROWS   192
+%define OV_LINE_MAX   140          ; max glyphs rendered per line
+%define OV_ARENA_SZ   32768        ; text arena for all row strings
+ov_render_ready:         resb 1    ; 1 once the RENDER glyph engine is built
+    alignb 4
+ov_row_count:            resd 1
+ov_sel:                  resd 1    ; selected row index
+ov_scroll:               resd 1    ; first visible row
+ov_arena_used:           resd 1
+ov_net_wm_name_atom:     resd 1
+ov_row_kind:             resb OV_MAX_ROWS    ; 0 = WS header, 1 = client
+ov_row_ws:               resb OV_MAX_ROWS    ; workspace number 1..10
+    alignb 4
+ov_row_xid:              resd OV_MAX_ROWS    ; client XID (0 for headers)
+ov_row_off:              resd OV_MAX_ROWS    ; byte offset into ov_arena
+ov_row_len:              resd OV_MAX_ROWS    ; byte length in arena
+ov_row_color:            resd OV_MAX_ROWS    ; client tab colour (bullet)
+ov_arena:                resb OV_ARENA_SZ
+; RENDER glyph-engine state (ported from strip.asm).
+ov_render_major:         resb 1
+    alignb 4
+ov_fmt_a8:               resd 1
+ov_fmt_argb32:           resd 1
+ov_fmt_dst:              resd 1
+ov_win_picture:          resd 1    ; Picture over the overview window (dst)
+ov_pen_pixmap:           resd 1
+ov_pen_gc:               resd 1
+ov_pen_picture:          resd 1
+ov_glyphset:             resd 1
+ov_pen_color_cur:        resd 1
+ov_text_color:           resd 1
+ov_prop_buf:             resb 4096 ; one GetProperty round-trip (title)
+ov_line_buf:             resb 1024 ; composed "class: title" for one client
+ov_fetch_pos:            resd 1    ; ov_fetch_title write cursor (no live reg)
+
 bar_gc_id:               resd 1
 client_color:            resb MAX_CLIENTS
 
@@ -5605,6 +5671,12 @@ intern_wm_atoms:
     mov esi, tile_bar_state_len
     call intern_one_atom
     mov [tile_bar_state_atom], eax
+
+    ; _NET_WM_NAME — the overview popup reads it per window for labels.
+    lea rdi, [net_wm_name_str]
+    mov esi, net_wm_name_len
+    call intern_one_atom
+    mov [ov_net_wm_name_atom], eax
 
     ; --- EWMH window-type atoms ---
     ; Intern the property atom + the float-class type atoms in one
@@ -11599,166 +11671,150 @@ ensure_overview_window:
 .eow_done:
     ret
 
-; draw_overview — repaint the whole map: 5x2 grid of workspace cells, each
-; with a dim/accent border (accent = current_ws) and equal-width colored
-; stripes for the windows on that workspace.
+; Overview popup layout constants (hyperlist tree).
+%define OV_LINE_H   22
+%define OV_BASE     16              ; text baseline within a line
+%define OV_CTOP     72              ; first row top (below title + help)
+%define OV_HDR_X    24              ; WS-header + title text x
+%define OV_CLI_BX   40              ; client colour-bullet x
+%define OV_CLI_X    60              ; client text x
+%define OV_BULLET   12
+
+; draw_overview — repaint the hyperlist: a title, a help line, then one line
+; per row (WS headers + indented client rows) with the selected row
+; highlighted. Re-drawn on every nav key; the row model (ov_build_list) is
+; built once on open. Reads the row arrays only — no property round-trips.
 draw_overview:
     push rbx
     push r12
     push r13
     push r14
     push r15
-    ; screen geom (primary output)
-    movzx eax, word [output_w]
-    mov [ov_W], eax
-    movzx eax, word [output_h]
-    mov [ov_H], eax
-    mov eax, [ov_W]
-    xor edx, edx
-    mov ecx, 5
-    div ecx
-    mov [ov_cellW], eax
-    mov eax, [ov_H]
-    xor edx, edx
-    mov ecx, 2
-    div ecx
-    mov [ov_cellH], eax
-    ; bg fill
+    ; --- background ---
     mov edi, 0xFF101014
     call ov_set_fg
     xor edi, edi
     xor esi, esi
-    mov edx, [ov_W]
-    mov ecx, [ov_H]
+    movzx edx, word [output_w]
+    movzx ecx, word [output_h]
     call ov_fill
-    ; per-workspace cells
-    mov r12d, 1                           ; ws = 1..10
-.dov_ws:
-    cmp r12d, 10
-    jg .dov_done
-    ; col = (ws-1)%5, row = (ws-1)/5
-    mov eax, r12d
-    dec eax
+    ; --- title + help ---
+    mov edi, OV_HDR_X
+    mov esi, OV_BASE + 8
+    lea rdx, [ov_hdr_str]
+    mov ecx, 8
+    mov r8d, 0xFF6F88FF
+    call ov_draw_str
+    mov edi, OV_HDR_X
+    mov esi, OV_BASE + 8 + 22
+    lea rdx, [ov_help_str]
+    mov ecx, 31
+    mov r8d, 0xFF707078
+    call ov_draw_str
+    ; --- empty list? ---
+    mov eax, [ov_row_count]
+    test eax, eax
+    jnz .dov_rows
+    mov edi, OV_HDR_X
+    mov esi, OV_CTOP + OV_BASE
+    lea rdx, [ov_nowin_str]
+    mov ecx, 15
+    mov r8d, 0xFFAAAAAA
+    call ov_draw_str
+    jmp .dov_flush
+.dov_rows:
+    ; --- visible rows VIS = (H - CTOP - 12) / LINE_H → r15d ---
+    movzx eax, word [output_h]
+    sub eax, OV_CTOP + 12
     xor edx, edx
-    mov ecx, 5
-    div ecx                               ; eax=row, edx=col
-    ; cell outer x = col*cellW, y = row*cellH
-    mov r13d, edx                         ; col
-    imul r13d, [ov_cellW]                 ; outer x
-    mov r14d, eax                         ; row
-    imul r14d, [ov_cellH]                 ; outer y
-    ; inner rect (+PAD)
-    lea ebx, [r13d + OV_PAD]
-    mov [ov_cx], ebx
-    lea ebx, [r14d + OV_PAD]
-    mov [ov_cy], ebx
-    mov ebx, [ov_cellW]
-    sub ebx, OV_PAD*2
-    mov [ov_cw], ebx
-    mov ebx, [ov_cellH]
-    sub ebx, OV_PAD*2
-    mov [ov_ch], ebx
-    ; border colour: accent if current ws, else dim grey
-    movzx eax, byte [current_ws]
-    cmp eax, r12d
-    jne .dov_dim
-    mov edi, [cfg_active_frame]
-    test edi, edi
-    jnz .dov_border
-    mov edi, 0xFF3070C0                   ; fallback accent
-    jmp .dov_border
-.dov_dim:
-    mov edi, 0xFF404048
-.dov_border:
-    call ov_set_fg
-    mov edi, [ov_cx]
-    mov esi, [ov_cy]
-    mov edx, [ov_cw]
-    mov ecx, [ov_ch]
-    call ov_fill                          ; border block
-    ; inner background (inset by OV_BORDER)
-    mov edi, 0xFF18181E
-    call ov_set_fg
-    mov edi, [ov_cx]
-    add edi, OV_BORDER
-    mov esi, [ov_cy]
-    add esi, OV_BORDER
-    mov edx, [ov_cw]
-    sub edx, OV_BORDER*2
-    mov ecx, [ov_ch]
-    sub ecx, OV_BORDER*2
-    call ov_fill
-    ; shrink ov_cx/cy/cw/ch to the inner content area (for stripes)
-    mov eax, [ov_cx]
-    add eax, OV_BORDER
-    mov [ov_cx], eax
-    mov eax, [ov_cy]
-    add eax, OV_BORDER
-    mov [ov_cy], eax
-    mov eax, [ov_cw]
-    sub eax, OV_BORDER*2
-    mov [ov_cw], eax
-    mov eax, [ov_ch]
-    sub eax, OV_BORDER*2
-    mov [ov_ch], eax
-    ; count windows on this ws → r15d
-    xor r15d, r15d
-    xor r13d, r13d
-.dov_count:
-    cmp r13d, [client_count]
-    jge .dov_counted
-    movzx eax, byte [client_ws + r13]
-    cmp eax, r12d
-    jne .dov_count_next
-    inc r15d
-.dov_count_next:
-    inc r13d
-    jmp .dov_count
-.dov_counted:
-    test r15d, r15d
-    jz .dov_ws_next                       ; empty workspace, no stripes
-    ; stripeW = cw / n
-    mov eax, [ov_cw]
-    xor edx, edx
-    mov ecx, r15d
+    mov ecx, OV_LINE_H
     div ecx
-    mov ebx, eax                          ; ebx = stripeW
-    test ebx, ebx
-    jz .dov_ws_next
-    ; draw a stripe per client on this ws (index r14d)
-    xor r14d, r14d                        ; drawn index
-    xor r13d, r13d                        ; client i
-.dov_draw:
-    cmp r13d, [client_count]
-    jge .dov_ws_next
-    movzx eax, byte [client_ws + r13]
-    cmp eax, r12d
-    jne .dov_draw_next
-    ; fg = client colour
-    movzx eax, byte [client_color + r13]
-    call client_color_to_pixel
-    mov edi, eax
+    mov r15d, eax
+    test r15d, r15d
+    jnz .dov_vis
+    mov r15d, 1
+.dov_vis:
+    ; --- scroll so the selection stays visible ---
+    mov eax, [ov_sel]
+    mov ecx, [ov_scroll]
+    cmp eax, ecx
+    jge .dov_scb
+    mov [ov_scroll], eax
+    jmp .dov_scdone
+.dov_scb:
+    mov edx, ecx
+    add edx, r15d
+    cmp eax, edx
+    jl .dov_scdone
+    mov ecx, eax
+    sub ecx, r15d
+    inc ecx
+    mov [ov_scroll], ecx
+.dov_scdone:
+    ; --- draw rows [scroll, scroll+VIS) ---
+    mov r12d, [ov_scroll]               ; row index
+    xor r13d, r13d                      ; visible index
+.dov_row:
+    cmp r13d, r15d
+    jge .dov_flush
+    cmp r12d, [ov_row_count]
+    jge .dov_flush
+    ; row top y = CTOP + vi*LINE_H → r14d
+    mov eax, r13d
+    imul eax, OV_LINE_H
+    add eax, OV_CTOP
+    mov r14d, eax
+    ; highlight bar if selected
+    mov eax, r12d
+    cmp eax, [ov_sel]
+    jne .dov_nohl
+    mov edi, 0xFF243448
     call ov_set_fg
-    ; x = cx + index*stripeW ; leave a 2px gap
-    mov edi, r14d
-    imul edi, ebx
-    add edi, [ov_cx]
-    mov esi, [ov_cy]
-    mov edx, ebx
-    sub edx, 2
-    jg .dov_wok
-    mov edx, 1
-.dov_wok:
-    mov ecx, [ov_ch]
+    xor edi, edi
+    mov esi, r14d
+    movzx edx, word [output_w]
+    mov ecx, OV_LINE_H
     call ov_fill
-    inc r14d
-.dov_draw_next:
-    inc r13d
-    jmp .dov_draw
-.dov_ws_next:
+.dov_nohl:
+    movzx eax, byte [ov_row_kind + r12]
+    test eax, eax
+    jnz .dov_client
+    ; --- WS header ---
+    mov edi, OV_HDR_X
+    lea esi, [r14 + OV_BASE]
+    mov edx, [ov_row_off + r12*4]
+    lea rdx, [ov_arena + rdx]
+    mov ecx, [ov_row_len + r12*4]
+    mov r8d, 0xFFFFFFFF
+    call ov_draw_str
+    jmp .dov_row_next
+.dov_client:
+    ; colour bullet
+    mov edi, [ov_row_color + r12*4]
+    call ov_set_fg
+    mov edi, OV_CLI_BX
+    lea esi, [r14 + (OV_LINE_H - OV_BULLET)/2]
+    mov edx, OV_BULLET
+    mov ecx, OV_BULLET
+    call ov_fill
+    ; text (white if selected, else light grey)
+    mov r8d, 0xFFCFCFD6
+    mov eax, r12d
+    cmp eax, [ov_sel]
+    jne .dov_cli_col
+    mov r8d, 0xFFFFFFFF
+.dov_cli_col:
+    mov edi, OV_CLI_X
+    lea esi, [r14 + OV_BASE]
+    mov edx, [ov_row_off + r12*4]
+    lea rdx, [ov_arena + rdx]
+    mov ecx, [ov_row_len + r12*4]
+    call ov_draw_str
+.dov_row_next:
     inc r12d
-    jmp .dov_ws
-.dov_done:
+    inc r13d
+    jmp .dov_row
+.dov_flush:
     call x11_flush
     pop r15
     pop r14
@@ -11767,11 +11823,938 @@ draw_overview:
     pop rbx
     ret
 
-; open_overview — ACT_OVERVIEW. Map the overlay, grab the keyboard, draw.
+; ============================================================================
+; ov_grab_keys — edi=1 grab, 0 ungrab. Passive-grab the navigation keys on
+; the root while the popup is open. tile's Mod4+ binds already prove passive
+; grabs are delivered under frame; the active XGrabKeyboard the grid used
+; silently dropped every key under frame, so we use passive grabs instead.
+; ============================================================================
+ov_grab_keys:
+    push rbx
+    push r12
+    mov r12d, edi
+    xor ebx, ebx
+.ogk_loop:
+    cmp ebx, ov_grab_keys_n
+    jge .ogk_done
+    movzx eax, byte [ov_grab_keys_tab + rbx]
+    test r12d, r12d
+    jz .ogk_ungrab
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_GRAB_KEY
+    mov byte [rdi+1], 0                  ; owner-events = False
+    mov word [rdi+2], 4
+    mov ecx, [x11_root_window]
+    mov [rdi+4], ecx
+    mov word [rdi+8], 0x8000             ; AnyModifier
+    mov [rdi+10], al                     ; keycode
+    mov byte [rdi+11], 1                 ; pointer-mode Async
+    mov byte [rdi+12], 1                 ; keyboard-mode Async
+    mov byte [rdi+13], 0
+    mov word [rdi+14], 0
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    jmp .ogk_next
+.ogk_ungrab:
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_UNGRAB_KEY
+    mov [rdi+1], al                      ; keycode
+    mov word [rdi+2], 3
+    mov ecx, [x11_root_window]
+    mov [rdi+4], ecx
+    mov word [rdi+8], 0x8000             ; AnyModifier
+    mov word [rdi+10], 0
+    lea rsi, [tmp_buf]
+    mov rdx, 12
+    call x11_buffer
+    inc dword [x11_seq]
+.ogk_next:
+    inc ebx
+    jmp .ogk_loop
+.ogk_done:
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; ov_build_list — walk workspaces 1..10; for each non-empty WS emit a header
+; row then one client row per window (with its fetched title). Fills the row
+; metadata arrays + text arena. Selection starts on the current WS's header.
+; ============================================================================
+ov_build_list:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov dword [ov_row_count], 0
+    mov dword [ov_arena_used], 0
+    mov dword [ov_sel], 0
+    mov dword [ov_scroll], 0
+    mov r12d, 1                          ; ws
+.obl_ws:
+    cmp r12d, 10
+    jg .obl_done
+    ; count clients on this ws
+    xor r13d, r13d
+    xor r14d, r14d
+.obl_cnt:
+    cmp r13d, [client_count]
+    jge .obl_cnted
+    movzx eax, byte [client_ws + r13]
+    cmp eax, r12d
+    jne .obl_cnt_n
+    inc r14d
+.obl_cnt_n:
+    inc r13d
+    jmp .obl_cnt
+.obl_cnted:
+    test r14d, r14d
+    jz .obl_wsnext                       ; skip empty ws
+    ; --- header row "WS <n>" ---
+    lea rdi, [ov_line_buf]
+    mov byte [rdi], 'W'
+    mov byte [rdi+1], 'S'
+    mov byte [rdi+2], ' '
+    add rdi, 3
+    mov eax, r12d
+    call ov_u32_dec
+    lea rcx, [ov_line_buf]
+    sub rdi, rcx                         ; length
+    mov ecx, edi
+    lea rsi, [ov_line_buf]
+    xor eax, eax                         ; kind = header
+    mov edx, r12d                        ; ws
+    xor r8d, r8d                         ; xid
+    xor r9d, r9d                         ; colour
+    call ov_add_row
+    ; selection default = current WS header
+    movzx eax, byte [current_ws]
+    cmp eax, r12d
+    jne .obl_notcur
+    mov eax, [ov_row_count]
+    dec eax
+    mov [ov_sel], eax
+.obl_notcur:
+    ; --- client rows ---
+    xor r13d, r13d
+.obl_cl:
+    cmp r13d, [client_count]
+    jge .obl_wsnext
+    movzx eax, byte [client_ws + r13]
+    cmp eax, r12d
+    jne .obl_cln
+    mov edi, [client_xids + r13*4]
+    call ov_fetch_title                  ; rax=ptr ecx=len
+    mov rsi, rax
+    mov r10d, ecx                        ; len (survives client_color_to_pixel)
+    movzx eax, byte [client_color + r13]
+    call client_color_to_pixel           ; eax = pixel
+    mov r9d, eax
+    mov ecx, r10d
+    mov r8d, [client_xids + r13*4]
+    mov eax, 1                           ; kind = client
+    mov edx, r12d                        ; ws
+    call ov_add_row
+.obl_cln:
+    inc r13d
+    jmp .obl_cl
+.obl_wsnext:
+    inc r12d
+    jmp .obl_ws
+.obl_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ov_add_row — eax=kind, dl=ws, r8d=xid, r9d=colour, rsi=text, ecx=len.
+; Appends one row, copying the text into ov_arena. Preserves rbx,r12-r15.
+ov_add_row:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12d, [ov_row_count]
+    cmp r12d, OV_MAX_ROWS
+    jae .oar_ret
+    mov [ov_row_kind + r12], al
+    mov [ov_row_ws + r12], dl
+    mov [ov_row_xid + r12*4], r8d
+    mov [ov_row_color + r12*4], r9d
+    mov r13d, [ov_arena_used]
+    mov r14d, ecx                        ; len
+    mov eax, OV_ARENA_SZ
+    sub eax, r13d
+    cmp r14d, eax
+    jbe .oar_lenok
+    mov r14d, eax
+.oar_lenok:
+    mov [ov_row_off + r12*4], r13d
+    mov [ov_row_len + r12*4], r14d
+    mov rbx, rsi                         ; src
+    lea rdi, [ov_arena + r13]
+    mov ecx, r14d
+    test ecx, ecx
+    jz .oar_copied
+.oar_cp:
+    mov al, [rbx]
+    mov [rdi], al
+    inc rbx
+    inc rdi
+    dec ecx
+    jnz .oar_cp
+.oar_copied:
+    add r13d, r14d
+    mov [ov_arena_used], r13d
+    inc dword [ov_row_count]
+.oar_ret:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ov_u32_dec — eax=value, rdi=dst. Writes unsigned decimal, returns rdi past
+; the last digit. Preserves rbx; clobbers rax,rcx,rdx,rsi.
+ov_u32_dec:
+    push rbx
+    xor ecx, ecx                         ; digit count
+    mov ebx, eax
+    test ebx, ebx
+    jnz .oud_loop
+    mov byte [rdi], '0'
+    inc rdi
+    pop rbx
+    ret
+.oud_loop:
+    test ebx, ebx
+    jz .oud_emit
+    mov eax, ebx
+    xor edx, edx
+    mov esi, 10
+    div esi
+    add dl, '0'
+    movzx edx, dl
+    push rdx
+    inc ecx
+    mov ebx, eax
+    jmp .oud_loop
+.oud_emit:
+    test ecx, ecx
+    jz .oud_done
+    pop rax
+    mov [rdi], al
+    inc rdi
+    dec ecx
+    jmp .oud_emit
+.oud_done:
+    pop rbx
+    ret
+
+; ov_fetch_title — edi=xid. Composes "<class>: <title>" into ov_line_buf using
+; WM_CLASS + _NET_WM_NAME (fallback WM_NAME). Returns rax=ptr, ecx=len.
+; Preserves rbx,r12-r15 (write cursor lives in ov_fetch_pos, no live reg
+; across the property round-trips).
+ov_fetch_title:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12d, edi
+    mov dword [ov_fetch_pos], 0
+    mov edi, r12d
+    call read_wm_class                   ; rax = class ptr or 0
+    test rax, rax
+    jz .oft_noclass
+    mov rsi, rax
+    mov ebx, 48
+.oft_cls:
+    test ebx, ebx
+    jz .oft_clsend
+    mov al, [rsi]
+    test al, al
+    jz .oft_clsend
+    mov edx, [ov_fetch_pos]
+    mov [ov_line_buf + rdx], al
+    inc dword [ov_fetch_pos]
+    inc rsi
+    dec ebx
+    jmp .oft_cls
+.oft_clsend:
+    mov edx, [ov_fetch_pos]
+    mov byte [ov_line_buf + rdx], ':'
+    mov byte [ov_line_buf + rdx + 1], ' '
+    add dword [ov_fetch_pos], 2
+.oft_noclass:
+    mov edi, r12d
+    mov esi, [ov_net_wm_name_atom]
+    call ov_get_prop
+    test ecx, ecx
+    jnz .oft_title
+    mov edi, r12d
+    mov esi, 39                          ; XA_WM_NAME
+    call ov_get_prop
+.oft_title:
+    test ecx, ecx
+    jz .oft_end
+    cmp ecx, 200
+    jbe .oft_tc
+    mov ecx, 200
+.oft_tc:
+    mov rsi, rax
+.oft_tl:
+    test ecx, ecx
+    jz .oft_end
+    mov al, [rsi]
+    cmp al, 10                           ; stop at LF
+    je .oft_end
+    cmp al, 13                           ; stop at CR
+    je .oft_end
+    cmp al, 9                            ; tab → space
+    jne .oft_notab
+    mov al, ' '
+.oft_notab:
+    mov edx, [ov_fetch_pos]
+    cmp edx, 1000
+    jae .oft_end
+    mov [ov_line_buf + rdx], al
+    inc dword [ov_fetch_pos]
+    inc rsi
+    dec ecx
+    jmp .oft_tl
+.oft_end:
+    mov ecx, [ov_fetch_pos]
+    test ecx, ecx
+    jnz .oft_ret
+    mov dword [ov_line_buf], '(win'
+    mov dword [ov_line_buf+4], 'dow)'
+    mov ecx, 8
+.oft_ret:
+    lea rax, [ov_line_buf]
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ov_get_prop — edi=xid, esi=atom. GetProperty(atom, AnyPropertyType, 0, 256
+; words) into ov_prop_buf. Returns rax=ptr(value), ecx=byte length (0 on
+; empty/fail). Preserves rbx,r12-r15.
+ov_get_prop:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12d, edi
+    mov ebx, esi
+    test ebx, ebx
+    jz .ogp_fail
+    call x11_flush
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_GET_PROPERTY
+    mov byte [rdi+1], 0                   ; delete = False
+    mov word [rdi+2], 6
+    mov [rdi+4], r12d
+    mov [rdi+8], ebx
+    mov dword [rdi+12], 0                 ; type = AnyPropertyType
+    mov dword [rdi+16], 0                 ; long-offset
+    mov dword [rdi+20], 256               ; long-length (1024 bytes)
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 24
+    syscall
+    inc dword [x11_seq]
+    lea rdi, [ov_prop_buf]
+    call read_reply_or_queue
+    test eax, eax
+    jz .ogp_fail
+    mov r13d, [ov_prop_buf + 16]         ; value byte length
+    test r13d, r13d
+    jz .ogp_fail
+    mov eax, [ov_prop_buf + 4]           ; reply length (4-byte units)
+    shl eax, 2
+    test eax, eax
+    jz .ogp_fail
+    cmp eax, 4096 - 32
+    jbe .ogp_lenok
+    mov eax, 4096 - 32
+.ogp_lenok:
+    mov r14d, eax                        ; remaining to read
+    lea r15, [ov_prop_buf + 32]
+.ogp_read:
+    test r14d, r14d
+    jz .ogp_done
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    mov rsi, r15
+    mov edx, r14d
+    syscall
+    test rax, rax
+    jle .ogp_fail
+    add r15, rax
+    sub r14d, eax
+    jmp .ogp_read
+.ogp_done:
+    cmp r13d, 4096 - 32
+    jbe .ogp_ok
+    mov r13d, 4096 - 32
+.ogp_ok:
+    lea rax, [ov_prop_buf + 32]
+    mov ecx, r13d
+    jmp .ogp_pop
+.ogp_fail:
+    lea rax, [ov_prop_buf + 32]
+    xor ecx, ecx
+.ogp_pop:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ov_draw_str — edi=x, esi=y(baseline), rdx=ptr, ecx=byte-len, r8d=colour.
+; UTF-8 decodes into codepoints (BE16 at tmp_buf+1024, capped OV_LINE_MAX),
+; then one CompositeGlyphs run. No-op if the RENDER engine isn't ready.
+ov_draw_str:
+    cmp byte [ov_render_ready], 1
+    jne .ods_ret
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12d, edi                        ; x
+    mov r13d, esi                        ; y
+    mov r14, rdx                         ; src
+    mov r15d, ecx                        ; remaining bytes
+    mov eax, r8d
+    mov [ov_text_color], eax
+    lea rbx, [tmp_buf + 1024]            ; codepoint out (BE16)
+    xor r10d, r10d                       ; glyph count
+.ods_loop:
+    test r15d, r15d
+    jz .ods_emit
+    cmp r10d, OV_LINE_MAX
+    jae .ods_emit
+    movzx eax, byte [r14]
+    cmp al, 0x80
+    jb .ods_ascii
+    cmp al, 0xE0
+    jb .ods_2
+    cmp al, 0xF0
+    jb .ods_3
+    ; 4-byte → clamp to '?' (BE16 can't hold >U+FFFF)
+    cmp r15d, 4
+    jb .ods_emit
+    mov eax, 0x3F
+    mov ecx, 4
+    jmp .ods_put
+.ods_3:
+    cmp r15d, 3
+    jb .ods_emit
+    movzx eax, byte [r14]
+    and eax, 0x0F
+    shl eax, 12
+    movzx ecx, byte [r14+1]
+    and ecx, 0x3F
+    shl ecx, 6
+    or eax, ecx
+    movzx ecx, byte [r14+2]
+    and ecx, 0x3F
+    or eax, ecx
+    mov ecx, 3
+    jmp .ods_put
+.ods_2:
+    cmp r15d, 2
+    jb .ods_emit
+    movzx eax, byte [r14]
+    and eax, 0x1F
+    shl eax, 6
+    movzx ecx, byte [r14+1]
+    and ecx, 0x3F
+    or eax, ecx
+    mov ecx, 2
+    jmp .ods_put
+.ods_ascii:
+    mov ecx, 1
+.ods_put:
+    mov edx, eax
+    shr edx, 8
+    mov [rbx], dl                        ; BE16 hi
+    mov [rbx+1], al                      ; BE16 lo
+    add rbx, 2
+    inc r10d
+    add r14, rcx
+    sub r15d, ecx
+    jmp .ods_loop
+.ods_emit:
+    test r10d, r10d
+    jz .ods_pop
+    mov edi, r12d
+    mov esi, r13d
+    mov edx, r10d
+    call ov_emit_glyphs
+.ods_pop:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+.ods_ret:
+    ret
+
+; ov_emit_glyphs — edi=x, esi=y, edx=count; codepoints (BE16) at tmp_buf+1024.
+; One CompositeGlyphs32 (pen → ov_win_picture) with the run. Ported from
+; strip's render_emit_glyphs.
+ov_emit_glyphs:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12d, edx                        ; count
+    mov r13d, edi                        ; x
+    mov r14d, esi                        ; y
+    mov eax, [ov_text_color]
+    call ov_set_pen
+    lea rdi, [tmp_buf]
+    mov bl, [ov_render_major]
+    mov [rdi], bl
+    mov byte [rdi+1], RENDER_COMPOSITE_GLYPHS32
+    mov byte [rdi+4], RENDER_OP_OVER
+    mov byte [rdi+5], 0
+    mov word [rdi+6], 0
+    mov eax, [ov_pen_picture]
+    mov [rdi+8], eax
+    mov eax, [ov_win_picture]
+    mov [rdi+12], eax
+    mov eax, [ov_fmt_a8]
+    mov [rdi+16], eax
+    mov eax, [ov_glyphset]
+    mov [rdi+20], eax
+    mov dword [rdi+24], 0
+    mov [rdi+28], r12b                   ; glyph count
+    mov byte [rdi+29], 0
+    mov word [rdi+30], 0
+    mov [rdi+32], r13w                   ; deltaX
+    mov [rdi+34], r14w                   ; deltaY
+    lea r15, [tmp_buf + 1024]            ; cps (BE16)
+    lea rbx, [tmp_buf + 36]              ; gid dst
+    mov r13d, r12d
+.oeg_loop:
+    test r13d, r13d
+    jz .oeg_send
+    movzx edi, byte [r15]
+    shl edi, 8
+    movzx eax, byte [r15+1]
+    or edi, eax
+    call ov_map_gid
+    mov [rbx], eax
+    add rbx, 4
+    add r15, 2
+    dec r13d
+    jmp .oeg_loop
+.oeg_send:
+    lea rsi, [tmp_buf]
+    mov rdx, rbx
+    sub rdx, rsi
+    mov rax, rdx
+    shr rax, 2
+    mov word [tmp_buf + 2], ax
+    call x11_buffer
+    inc dword [x11_seq]
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ov_map_gid — edi=codepoint → eax=glyph id (the cp if in the atlas, else 32
+; = space). Binary search over glyph_table. Preserves rbx,r12-r15.
+ov_map_gid:
+    xor ecx, ecx
+    mov edx, GLYPH_COUNT
+.omg_loop:
+    cmp ecx, edx
+    jge .omg_miss
+    lea eax, [rcx + rdx]
+    shr eax, 1
+    mov r8d, eax
+    imul r8, r8, 20
+    mov r9d, [glyph_table + r8]
+    cmp edi, r9d
+    je .omg_hit
+    jl .omg_lo
+    lea ecx, [rax + 1]
+    jmp .omg_loop
+.omg_lo:
+    mov edx, eax
+    jmp .omg_loop
+.omg_hit:
+    mov eax, edi
+    ret
+.omg_miss:
+    mov eax, 32
+    ret
+
+; ov_set_pen — eax=RGB. PutImage the opaque ARGB pixel into the 1x1 pen
+; pixmap unless it already holds it. Preserves r12-r15.
+ov_set_pen:
+    or eax, 0xFF000000
+    cmp eax, [ov_pen_color_cur]
+    je .osp_done
+    mov [ov_pen_color_cur], eax
+    mov r8d, eax
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_PUT_IMAGE
+    mov byte [rdi+1], 2                   ; ZPixmap
+    mov word [rdi+2], 7
+    mov eax, [ov_pen_pixmap]
+    mov [rdi+4], eax
+    mov eax, [ov_pen_gc]
+    mov [rdi+8], eax
+    mov word [rdi+12], 1
+    mov word [rdi+14], 1
+    mov dword [rdi+16], 0                 ; dstX,dstY
+    mov byte [rdi+20], 0                  ; left-pad
+    mov byte [rdi+21], 32                 ; depth
+    mov word [rdi+22], 0
+    mov [rdi+24], r8d
+    lea rsi, [tmp_buf]
+    mov rdx, 28
+    call x11_buffer
+    inc dword [x11_seq]
+.osp_done:
+    ret
+
+; ov_upload_glyphs — AddGlyphs every atlas entry into ov_glyphset. Ported
+; from strip's render_upload_glyphs.
+ov_upload_glyphs:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    lea r12, [glyph_table]
+    mov r13d, GLYPH_COUNT
+.oug_loop:
+    test r13d, r13d
+    jz .oug_done
+    movzx r14d, word [r12 + 4]
+    movzx r15d, word [r12 + 6]
+    mov eax, r14d
+    add eax, 3
+    and eax, ~3
+    imul eax, r15d
+    mov ebx, eax                         ; padded bytes
+    lea rdi, [tmp_buf]
+    mov dl, [ov_render_major]
+    mov [rdi], dl
+    mov byte [rdi+1], RENDER_ADD_GLYPHS
+    mov eax, ebx
+    add eax, 28
+    shr eax, 2
+    mov [rdi+2], ax
+    mov eax, [ov_glyphset]
+    mov [rdi+4], eax
+    mov dword [rdi+8], 1                  ; num_glyphs
+    mov eax, [r12 + 0]
+    mov [rdi+12], eax                     ; gid = cp
+    mov ax, [r12 + 4]
+    mov [rdi+16], ax                      ; w
+    mov ax, [r12 + 6]
+    mov [rdi+18], ax                      ; h
+    mov ax, [r12 + 8]
+    mov [rdi+20], ax                      ; x
+    mov ax, [r12 + 10]
+    mov [rdi+22], ax                      ; y
+    mov ax, [r12 + 12]
+    mov [rdi+24], ax                      ; xOff
+    mov word [rdi+26], 0                  ; yOff
+    mov eax, [r12 + 16]                   ; atlas offset
+    lea rsi, [glyph_atlas + rax]
+    lea rdi, [tmp_buf + 28]
+    mov ecx, ebx
+    rep movsb
+    lea rsi, [tmp_buf]
+    mov edx, ebx
+    add edx, 28
+    call x11_buffer
+    inc dword [x11_seq]
+    add r12, 20
+    dec r13d
+    jmp .oug_loop
+.oug_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ov_render_init — build the RENDER glyph engine once (QueryExtension,
+; QueryPictFormats, dst/pen Pictures, glyphset + atlas). ov_render_ready:
+; 0 untried, 1 ready, 2 failed. Ported from strip's render_init, retargeted
+; to the overview window (must exist — ensure_overview_window runs first).
+ov_render_init:
+    cmp byte [ov_render_ready], 0
+    jne .ori_ret
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    call x11_flush
+    ; QueryExtension "RENDER"
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_QUERY_EXTENSION
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov word [rdi+4], 6
+    mov word [rdi+6], 0
+    mov dword [rdi+8], 'REND'
+    mov word [rdi+12], 'ER'
+    mov word [rdi+14], 0
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    syscall
+    inc dword [x11_seq]
+    lea rdi, [recov_reply_buf]
+    call read_reply_or_queue
+    test eax, eax
+    jz .ori_fail
+    cmp byte [recov_reply_buf + 8], 0    ; present?
+    je .ori_fail
+    movzx eax, byte [recov_reply_buf + 9]
+    mov [ov_render_major], al
+    ; QueryPictFormats
+    mov al, [ov_render_major]
+    lea rdi, [tmp_buf]
+    mov [rdi], al
+    mov byte [rdi+1], RENDER_QUERY_PICT_FORMATS
+    mov word [rdi+2], 1
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 4
+    syscall
+    inc dword [x11_seq]
+    lea rdi, [conn_setup_buf]
+    call read_reply_or_queue
+    test eax, eax
+    jz .ori_fail
+    mov eax, [conn_setup_buf + 4]
+    shl eax, 2
+    mov r12d, eax
+    lea r13, [conn_setup_buf + 32]
+.ori_body:
+    test r12d, r12d
+    jz .ori_scan
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    mov rsi, r13
+    mov edx, r12d
+    syscall
+    test rax, rax
+    jle .ori_fail
+    add r13, rax
+    sub r12d, eax
+    jmp .ori_body
+.ori_scan:
+    mov r14d, [conn_setup_buf + 8]       ; num_formats
+    lea r15, [conn_setup_buf + 32]
+.ori_sc:
+    test r14d, r14d
+    jz .ori_scdone
+    cmp byte [r15+4], 1                   ; type == Direct
+    jne .ori_next
+    movzx eax, byte [r15+5]              ; depth
+    movzx ecx, word [r15+8]             ; r_shift
+    movzx edx, word [r15+12]            ; g_shift
+    movzx r8d,  word [r15+16]           ; b_shift
+    movzx r9d,  word [r15+20]           ; a_shift
+    movzx r10d, word [r15+22]           ; a_mask
+    cmp eax, 8
+    jne .ori_argb
+    mov r11d, ecx
+    or r11d, edx
+    or r11d, r8d
+    or r11d, r9d
+    jnz .ori_next
+    cmp r10d, 0xFF
+    jne .ori_next
+    cmp dword [ov_fmt_a8], 0
+    jne .ori_next
+    mov ebx, [r15]
+    mov [ov_fmt_a8], ebx
+    jmp .ori_next
+.ori_argb:
+    cmp eax, 32
+    jne .ori_dst
+    cmp ecx, 16
+    jne .ori_dst
+    cmp edx, 8
+    jne .ori_dst
+    test r8d, r8d
+    jnz .ori_dst
+    cmp r9d, 24
+    jne .ori_dst
+    cmp r10d, 0xFF
+    jne .ori_dst
+    cmp dword [ov_fmt_argb32], 0
+    jne .ori_next
+    mov ebx, [r15]
+    mov [ov_fmt_argb32], ebx
+    jmp .ori_next
+.ori_dst:
+    cmp ecx, 16
+    jne .ori_next
+    cmp edx, 8
+    jne .ori_next
+    test r8d, r8d
+    jnz .ori_next
+    movzx r11d, byte [x11_root_depth]
+    cmp eax, r11d
+    jne .ori_next
+    cmp dword [ov_fmt_dst], 0
+    jne .ori_next
+    mov ebx, [r15]
+    mov [ov_fmt_dst], ebx
+.ori_next:
+    add r15, 28
+    dec r14d
+    jmp .ori_sc
+.ori_scdone:
+    cmp dword [ov_fmt_a8], 0
+    je .ori_fail
+    cmp dword [ov_fmt_argb32], 0
+    je .ori_fail
+    cmp dword [ov_fmt_dst], 0
+    je .ori_fail
+    ; CreatePicture over the overview window (dst)
+    call alloc_xid
+    mov [ov_win_picture], eax
+    lea rdi, [tmp_buf]
+    mov bl, [ov_render_major]
+    mov [rdi], bl
+    mov byte [rdi+1], RENDER_CREATE_PICTURE
+    mov word [rdi+2], 5
+    mov eax, [ov_win_picture]
+    mov [rdi+4], eax
+    mov eax, [overview_window_id]
+    mov [rdi+8], eax
+    mov eax, [ov_fmt_dst]
+    mov [rdi+12], eax
+    mov dword [rdi+16], 0
+    lea rsi, [tmp_buf]
+    mov rdx, 20
+    call x11_buffer
+    inc dword [x11_seq]
+    ; 1x1 ARGB32 pen pixmap
+    call alloc_xid
+    mov [ov_pen_pixmap], eax
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CREATE_PIXMAP
+    mov byte [rdi+1], 32
+    mov word [rdi+2], 4
+    mov eax, [ov_pen_pixmap]
+    mov [rdi+4], eax
+    mov eax, [overview_window_id]
+    mov [rdi+8], eax
+    mov word [rdi+12], 1
+    mov word [rdi+14], 1
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    ; pen GC on the depth-32 pen pixmap
+    call alloc_xid
+    mov [ov_pen_gc], eax
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CREATE_GC
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov eax, [ov_pen_gc]
+    mov [rdi+4], eax
+    mov eax, [ov_pen_pixmap]
+    mov [rdi+8], eax
+    mov dword [rdi+12], 0
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+    ; pen Picture (Repeat)
+    call alloc_xid
+    mov [ov_pen_picture], eax
+    lea rdi, [tmp_buf]
+    mov bl, [ov_render_major]
+    mov [rdi], bl
+    mov byte [rdi+1], RENDER_CREATE_PICTURE
+    mov word [rdi+2], 6
+    mov eax, [ov_pen_picture]
+    mov [rdi+4], eax
+    mov eax, [ov_pen_pixmap]
+    mov [rdi+8], eax
+    mov eax, [ov_fmt_argb32]
+    mov [rdi+12], eax
+    mov dword [rdi+16], RENDER_CP_REPEAT
+    mov dword [rdi+20], 1                 ; RepeatNormal
+    lea rsi, [tmp_buf]
+    mov rdx, 24
+    call x11_buffer
+    inc dword [x11_seq]
+    ; CreateGlyphSet (A8)
+    call alloc_xid
+    mov [ov_glyphset], eax
+    lea rdi, [tmp_buf]
+    mov bl, [ov_render_major]
+    mov [rdi], bl
+    mov byte [rdi+1], RENDER_CREATE_GLYPH_SET
+    mov word [rdi+2], 3
+    mov eax, [ov_glyphset]
+    mov [rdi+4], eax
+    mov eax, [ov_fmt_a8]
+    mov [rdi+8], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 12
+    call x11_buffer
+    inc dword [x11_seq]
+    call ov_upload_glyphs
+    call x11_flush
+    mov byte [ov_render_ready], 1
+    jmp .ori_pop
+.ori_fail:
+    mov byte [ov_render_ready], 2
+.ori_pop:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+.ori_ret:
+    ret
+
+; open_overview — ACT_OVERVIEW. Build the list, init the text engine, map the
+; overlay, passive-grab the nav keys, draw.
 open_overview:
     cmp byte [overview_active], 0
     jne .oo_done
     call ensure_overview_window
+    call ov_render_init
+    call ov_build_list
     ; MapWindow
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_MAP_WINDOW
@@ -11783,43 +12766,24 @@ open_overview:
     mov rdx, 8
     call x11_buffer
     inc dword [x11_seq]
-    ; GrabKeyboard(owner=0, grab-window=overview, time=0, ptr=async, kbd=async)
-    lea rdi, [tmp_buf]
-    mov byte [rdi], X11_GRAB_KEYBOARD
-    mov byte [rdi+1], 0                    ; owner-events = False
-    mov word [rdi+2], 4
-    mov eax, [overview_window_id]
-    mov [rdi+4], eax
-    mov dword [rdi+8], 0                   ; time = CurrentTime
-    mov byte [rdi+12], 1                   ; pointer-mode = Async
-    mov byte [rdi+13], 1                   ; keyboard-mode = Async
-    mov word [rdi+14], 0
-    lea rsi, [tmp_buf]
-    mov rdx, 16
-    call x11_buffer
-    inc dword [x11_seq]
-    ; GrabKeyboard has a reply; drain it so it can't desync the event stream.
-    lea rdi, [recov_reply_buf]
-    call read_reply_or_queue
+    ; Passive-grab the navigation keys (the active XGrabKeyboard the grid used
+    ; delivered nothing under frame; tile's own Mod4+ binds prove passive
+    ; grabs work).
+    mov edi, 1
+    call ov_grab_keys
     mov byte [overview_active], 1
     call draw_overview
 .oo_done:
     ret
 
-; close_overview — ungrab, unmap, clear active. Safe if already closed.
+; close_overview — ungrab the nav keys, unmap, clear active. Safe if already
+; closed.
 close_overview:
     cmp byte [overview_active], 0
     je .co_done
     mov byte [overview_active], 0
-    lea rdi, [tmp_buf]
-    mov byte [rdi], X11_UNGRAB_KEYBOARD
-    mov byte [rdi+1], 0
-    mov word [rdi+2], 2
-    mov dword [rdi+4], 0                   ; time = CurrentTime
-    lea rsi, [tmp_buf]
-    mov rdx, 8
-    call x11_buffer
-    inc dword [x11_seq]
+    xor edi, edi
+    call ov_grab_keys
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_UNMAP_WINDOW
     mov byte [rdi+1], 0
@@ -11855,31 +12819,110 @@ close_overview:
     ret
 
 ; overview_key — edi = X keycode of a KeyPress while the overview is open.
-; The digit row is keycodes 10..19 (1..9 then 0), Escape is 9 — the standard
-; PC mapping (X keycode = evdev + 8). '1'..'9' jump to that workspace, '0' to
-; workspace 10, Escape just closes. Caller always swallows the key.
+; Up/k and Down/j move the selection (wraparound); Home/End/PageUp/PageDown
+; jump; Enter acts on the selected row (WS header → switch to that WS; client
+; → make it the active tab AND switch); Escape closes. Caller swallows the key.
 overview_key:
     cmp edi, 9                            ; Escape
-    jne .ok_digit
-    call close_overview
+    je .ok_close
+    mov eax, [ov_row_count]
+    test eax, eax
+    jz .ok_done                          ; empty list: only Escape does anything
+    cmp edi, 111                          ; Up
+    je .ok_up
+    cmp edi, 45                           ; k
+    je .ok_up
+    cmp edi, 116                          ; Down
+    je .ok_down
+    cmp edi, 44                           ; j
+    je .ok_down
+    cmp edi, 36                           ; Return
+    je .ok_enter
+    cmp edi, 104                          ; KP_Enter
+    je .ok_enter
+    cmp edi, 110                          ; Home
+    je .ok_home
+    cmp edi, 115                          ; End
+    je .ok_end
+    cmp edi, 112                          ; PageUp
+    je .ok_pgup
+    cmp edi, 117                          ; PageDown
+    je .ok_pgdn
     ret
-.ok_digit:
-    cmp edi, 10
-    jl .ok_done
-    cmp edi, 18                           ; keycodes 10..18 = '1'..'9'
-    jle .ok_ws
-    cmp edi, 19                           ; keycode 19 = '0' → workspace 10
-    jne .ok_done
-    call close_overview
-    mov edi, 10
+.ok_up:
+    mov eax, [ov_sel]
+    test eax, eax
+    jnz .ok_up_dec
+    mov eax, [ov_row_count]              ; wrap to last
+.ok_up_dec:
+    dec eax
+    mov [ov_sel], eax
+    call draw_overview
+    ret
+.ok_down:
+    mov eax, [ov_sel]
+    inc eax
+    cmp eax, [ov_row_count]
+    jl .ok_down_set
+    xor eax, eax                         ; wrap to first
+.ok_down_set:
+    mov [ov_sel], eax
+    call draw_overview
+    ret
+.ok_home:
+    mov dword [ov_sel], 0
+    call draw_overview
+    ret
+.ok_end:
+    mov eax, [ov_row_count]
+    dec eax
+    mov [ov_sel], eax
+    call draw_overview
+    ret
+.ok_pgup:
+    mov eax, [ov_sel]
+    sub eax, 8
+    jns .ok_pg_set
+    xor eax, eax
+.ok_pg_set:
+    mov [ov_sel], eax
+    call draw_overview
+    ret
+.ok_pgdn:
+    mov eax, [ov_sel]
+    add eax, 8
+    mov ecx, [ov_row_count]
+    dec ecx
+    cmp eax, ecx
+    jle .ok_pgd_set
+    mov eax, ecx
+.ok_pgd_set:
+    mov [ov_sel], eax
+    call draw_overview
+    ret
+.ok_enter:
+    mov eax, [ov_sel]
+    movzx edx, byte [ov_row_ws + rax]    ; target ws
+    movzx ecx, byte [ov_row_kind + rax]  ; 0 header / 1 client
+    mov r8d, [ov_row_xid + rax*4]        ; xid (client rows)
+    push rdx
+    push rcx
+    push r8
+    call close_overview                  ; ungrab + unmap + repaint first
+    pop r8
+    pop rcx
+    pop rdx
+    test ecx, ecx
+    jz .ok_enter_ws                      ; header → just switch
+    mov eax, r8d                         ; client → set it active on its ws
+    mov esi, edx
+    call set_active_tab_on_ws
+.ok_enter_ws:
+    mov edi, edx
     call switch_workspace
     ret
-.ok_ws:
-    sub edi, 9                            ; keycode 10→ws1 .. 18→ws9
-    push rdi
+.ok_close:
     call close_overview
-    pop rdi
-    call switch_workspace
 .ok_done:
     ret
 

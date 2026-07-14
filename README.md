@@ -2,12 +2,12 @@
 
 <img src="img/tile.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.39-blue)
+![Version](https://img.shields.io/badge/version-0.1.40-blue)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
 ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue)
 ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
-![Binary](https://img.shields.io/badge/binary-~71KB-orange)
+![Binary](https://img.shields.io/badge/binary-~136KB-orange)
 ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600)
 
 Tiling window manager written in x86_64 Linux assembly. No libc, no
@@ -142,12 +142,31 @@ Actions: `exec`, `exec-here`, `kill`, `exit`, `workspace`, `move-to`,
 `focus`, `move-tab`, `tab-color-cycle`, `stash`, `unstash`, `layout`,
 `spawn-split`, `reload`, `restart`, `overview`.
 
-The `overview` action opens a schematic map of all 10 workspaces: a 5x2
-grid where each cell shows colored boxes for the windows on that
-workspace (coloured by tab palette), with the current workspace framed
-in the accent colour. Press a workspace number (1-9, 0 for 10) to jump
-there, or Esc to close. No pixels are captured, so it costs nothing when
-closed and is instant to open. Bind it with e.g. `bind Mod4+Alt+e
+The `overview` action opens a navigable **HyperList of every window**,
+grouped by workspace:
+
+```
+WS 1
+   glass: Pointer ~/src
+   glass: vim main.asm
+WS 7
+   Firefox: Example Docs
+WS 8
+   glass: htop
+```
+
+Each row is one window, labelled `class: title` (from `WM_CLASS` +
+`_NET_WM_NAME`) with a colour bullet matching its tab colour. Walk the
+list with **↑/↓** (or `j`/`k`, with wraparound), `Home`/`End`,
+`PageUp`/`PageDown`. **Enter** jumps: on a `WS N` header it switches to
+that workspace; on a window row it makes that window the active tab
+*and* switches to its workspace. **Esc** closes. Selection starts on the
+current workspace.
+
+Text is drawn with an embedded A8 glyph atlas via the X RENDER extension
+(the same path `strip` uses), so tile needs no font server. The whole
+engine is cold until the overview is first opened — nothing is captured
+or polled when it's closed. Bind it with e.g. `bind Mod4+Alt+e
 overview`.
 
 ## License
