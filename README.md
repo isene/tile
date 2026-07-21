@@ -169,6 +169,26 @@ engine is cold until the overview is first opened — nothing is captured
 or polled when it's closed. Bind it with e.g. `bind Mod4+e
 overview`.
 
+## Packages
+
+**Debian/Ubuntu**: every release ships a dependency-free static amd64
+`.deb` — grab it from the
+[latest release](https://github.com/isene/tile/releases/latest) and:
+
+```bash
+sudo apt install ./tile_*_amd64.deb
+```
+
+**Arch**: a `PKGBUILD` is included in the repo root:
+
+```bash
+git clone https://github.com/isene/tile.git && cd tile && makepkg -si
+```
+
+The packages install the strip status bar as `tile-strip`
+(`/usr/bin/strip` belongs to binutils).
+
+
 ## License
 
 [Unlicense](https://unlicense.org/) (public domain)

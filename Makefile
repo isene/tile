@@ -90,4 +90,20 @@ xephyr-gdb: tile xephyr-clean
 clean:
 	rm -f tile tile.o strip strip.o
 
-.PHONY: all install uninstall clean xephyr xephyr-clean xephyr-multi xephyr-gdb strip
+.PHONY: all install uninstall clean xephyr xephyr-clean xephyr-multi xephyr-gdb strip deb
+
+# ── Debian package ─────────────────────────────────────────────────────
+# Version comes from the README badge (the repo's single version marker).
+# The strip binary installs as tile-strip: /usr/bin/strip is binutils'.
+VERSION := $(shell grep -oP 'version-\K[0-9.]+(?=-blue)' README.md)
+
+deb: tile strip
+	rm -rf pkgroot
+	install -Dm755 tile pkgroot/usr/bin/tile
+	install -Dm755 strip pkgroot/usr/bin/tile-strip
+	install -Dm644 tilerc.example pkgroot/usr/share/doc/tile/tilerc.example
+	install -Dm644 LICENSE pkgroot/usr/share/doc/tile/copyright
+	install -d pkgroot/DEBIAN
+	printf 'Package: tile\nVersion: $(VERSION)\nArchitecture: amd64\nMaintainer: Geir Isene <g@isene.com>\nSection: x11\nPriority: optional\nHomepage: https://github.com/isene/tile\nDescription: Tiling window manager in x86_64 assembly\n No libc, pure syscalls, X11 wire protocol. Ten workspaces, tabs,\n splits, multi-output with workspace pinning, exposé. Ships the strip\n status bar as /usr/bin/tile-strip (the name strip belongs to binutils).\n' > pkgroot/DEBIAN/control
+	dpkg-deb --build --root-owner-group pkgroot tile_$(VERSION)_amd64.deb
+	rm -rf pkgroot

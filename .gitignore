@@ -2,3 +2,5 @@ tile
 strip
 *.o
 *.swp
+*.deb
+pkgroot/
