@@ -166,7 +166,7 @@ current workspace.
 Text is drawn with an embedded A8 glyph atlas via the X RENDER extension
 (the same path `strip` uses), so tile needs no font server. The whole
 engine is cold until the overview is first opened — nothing is captured
-or polled when it's closed. Bind it with e.g. `bind Mod4+Alt+e
+or polled when it's closed. Bind it with e.g. `bind Mod4+e
 overview`.
 
 ## License
