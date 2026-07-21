@@ -405,6 +405,10 @@ wt_title_buf:        resb WT_TITLE_MAX
 ws10_app:            resb 17              ; WS-10 active-app class from
                                           ; _TILE_BAR_STATE bytes 22..37 —
                                           ; rendered as "[0: app]" in @wintitle
+    alignb 4
+pend_ev_buf:         resb 32*4            ; structure events discarded by the
+pend_ev_count:       resd 1               ; sync-reply reads, replayed at
+                                          ; .drf_done (tray ghost gaps)
 
 ; @workspaces builtin state. Subscribes to PropertyChangeMask on root
 ; (set already by @wintitle if both are configured) and reads
@@ -914,6 +918,32 @@ drain_ready_fds:
     inc ebx
     jmp .drf_loop
 .drf_done:
+    ; Replay structure events the sync-reply reads discarded, through
+    ; the same undock logic the live handlers use — heals tray ghost
+    ; gaps from icons that died mid-fetch. Zero cost when none pended.
+    xor ebx, ebx
+.drf_replay:
+    cmp ebx, [pend_ev_count]
+    jge .drf_replay_done
+    mov eax, ebx
+    shl eax, 5
+    lea rcx, [pend_ev_buf + rax]
+    movzx eax, byte [rcx]
+    and al, 0x7F
+    cmp al, EV_REPARENT_NOTIFY
+    jne .drf_replay_undock
+    mov eax, [rcx + 12]                   ; new parent
+    cmp eax, [window_id]
+    je .drf_replay_next                   ; still our child — keep it
+.drf_replay_undock:
+    mov eax, [rcx + 8]                    ; window XID
+    call tray_undock_icon
+.drf_replay_next:
+    inc ebx
+    jmp .drf_replay
+.drf_replay_done:
+    mov dword [pend_ev_count], 0
+
     ; If we processed at least one X event this cycle, pull root state
     ; once before returning. Sync GetProperty in any of the per-event
     ; handlers may have silently discarded a follow-up PropertyNotify
@@ -5113,15 +5143,38 @@ wt_get_property:
     ; under frame the notify was reliably lost and strip never respawned
     ; with fresh monitor state (no WS-10 purple, stale width). Exit now,
     ; exactly like the main-loop handler — strip-watchdog respawns us.
-    cmp byte [randr_n_monitors], 0
-    je .wgp_read
     movzx eax, byte [tmp_buf]
     and al, 0x7F                          ; strip the SendEvent bit
+    cmp byte [randr_n_monitors], 0
+    je .wgp_not_rr
     cmp al, byte [randr_event_base]
-    jne .wgp_read
+    jne .wgp_not_rr
     mov rax, SYS_EXIT_GROUP
     xor edi, edi
     syscall
+.wgp_not_rr:
+    ; Structure events must not vanish here either: a tray icon dying
+    ; mid-fetch (killing an app fires property traffic AND the icon's
+    ; DestroyNotify in the same instant) left its XID in tray_icons[]
+    ; and a ghost gap in the layout. Stash Destroy/Unmap/Reparent for
+    ; replay once the event batch finishes (.drf_done).
+    cmp al, EV_DESTROY_NOTIFY
+    je .wgp_stash
+    cmp al, EV_UNMAP_NOTIFY
+    je .wgp_stash
+    cmp al, EV_REPARENT_NOTIFY
+    jne .wgp_read
+.wgp_stash:
+    mov ecx, [pend_ev_count]
+    cmp ecx, 4
+    jge .wgp_read                         ; ring full → drop
+    shl ecx, 5
+    lea rdi, [pend_ev_buf + rcx]
+    lea rsi, [tmp_buf]
+    mov ecx, 32
+    rep movsb
+    inc dword [pend_ev_count]
+    jmp .wgp_read
 .wgp_fail:
     mov rax, -1
     pop r14
