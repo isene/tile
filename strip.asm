@@ -402,6 +402,9 @@ wt_seg_idx:          resd 1               ; segment slot, -1 if no @wintitle
 wt_max_chars:        resd 1               ; truncation width in codepoints
 wt_title_len:        resd 1               ; bytes in wt_title_buf
 wt_title_buf:        resb WT_TITLE_MAX
+ws10_app:            resb 17              ; WS-10 active-app class from
+                                          ; _TILE_BAR_STATE bytes 22..37 —
+                                          ; rendered as "[0: app]" in @wintitle
 
 ; @workspaces builtin state. Subscribes to PropertyChangeMask on root
 ; (set already by @wintitle if both are configured) and reads
@@ -4935,7 +4938,69 @@ wt_refetch_title:
     dec ecx
     jmp .wrt_cp
 .wrt_publish:
+    call wt_apply_ws10_suffix
     call wt_publish_segment
+    ret
+
+; Prepend "[0: <app>] " to wt_title_buf when a second monitor is
+; attached and tile reports an app on WS 10. Prepend, not append: the
+; publish truncation keeps the FIRST wt_max_chars codepoints, and the
+; WS-10 tag must survive long browser titles. Called only by
+; wt_refetch_title, right after the title lands fresh — never dups.
+wt_apply_ws10_suffix:
+    cmp byte [randr_n_monitors], 2
+    jb .was_ret
+    cmp byte [ws10_app], 0
+    je .was_ret
+    ; prefix length = 4 ("[0: ") + strlen(app) + 2 ("] ")
+    lea rsi, [ws10_app]
+    xor ecx, ecx
+.was_len:
+    cmp byte [rsi + rcx], 0
+    je .was_len_done
+    inc ecx
+    jmp .was_len
+.was_len_done:
+    lea r8d, [ecx + 6]                    ; total prefix bytes
+    mov eax, [wt_title_len]
+    lea edx, [eax + r8d]
+    cmp edx, WT_TITLE_MAX
+    ja .was_ret                           ; no room
+    ; shift the title right by r8 bytes (copy backwards, overlap-safe)
+    test eax, eax
+    jz .was_shift_done
+    lea rsi, [wt_title_buf + rax - 1]     ; last title byte
+    lea rdi, [rsi + r8]
+.was_shift:
+    mov dl, [rsi]
+    mov [rdi], dl
+    dec rsi
+    dec rdi
+    dec eax
+    jnz .was_shift
+.was_shift_done:
+    lea rdi, [wt_title_buf]
+    mov byte [rdi+0], '['
+    mov byte [rdi+1], '0'
+    mov byte [rdi+2], ':'
+    mov byte [rdi+3], ' '
+    add rdi, 4
+    lea rsi, [ws10_app]
+.was_cp:
+    movzx eax, byte [rsi]
+    test al, al
+    jz .was_close
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    jmp .was_cp
+.was_close:
+    mov byte [rdi], ']'
+    mov byte [rdi+1], ' '
+    mov eax, [wt_title_len]
+    add eax, r8d
+    mov [wt_title_len], eax
+.was_ret:
     ret
 
 ; ChangeWindowAttributes(window=edi, value-mask=CWEventMask, mask=esi).
@@ -5041,10 +5106,22 @@ wt_get_property:
     pop rbx
     ret
 .wgp_event_skip:
-    ; 32 bytes already read into tmp_buf as an event packet. Discard.
-    ; drain_ready_fds's post-drain root-state pull (gated on drf_x11_seen)
-    ; catches anything that mattered.
-    jmp .wgp_read
+    ; 32 bytes already read into tmp_buf as an event packet. Discard —
+    ; EXCEPT RRScreenChangeNotify: the main loop will never see this
+    ; byte (it is eaten here), and a hotplug always lands mid-property-
+    ; storm (tile retiles + republishes bar state the same instant), so
+    ; under frame the notify was reliably lost and strip never respawned
+    ; with fresh monitor state (no WS-10 purple, stale width). Exit now,
+    ; exactly like the main-loop handler — strip-watchdog respawns us.
+    cmp byte [randr_n_monitors], 0
+    je .wgp_read
+    movzx eax, byte [tmp_buf]
+    and al, 0x7F                          ; strip the SendEvent bit
+    cmp al, byte [randr_event_base]
+    jne .wgp_read
+    mov rax, SYS_EXIT_GROUP
+    xor edi, edi
+    syscall
 .wgp_fail:
     mov rax, -1
     pop r14
@@ -5365,12 +5442,12 @@ ws_refetch_state:
     mov [ws_current], ebx
 .wrs_no_current:
 
-    ; Fetch _TILE_BAR_STATE (currently 22 bytes, request 6 longs = 24
-    ; for headroom so format extensions don't silently truncate).
+    ; Fetch _TILE_BAR_STATE (38 bytes since tile v0.1.42, request 10
+    ; longs = 40 for headroom so format extensions don't truncate).
     mov edi, [x11_root_window]
     mov esi, [ws_atom_state]
     xor edx, edx
-    mov ecx, 6                            ; 24 bytes
+    mov ecx, 10                           ; 40 bytes
     call wt_get_property
     test eax, eax
     js .wrs_publish
@@ -5401,6 +5478,23 @@ ws_refetch_state:
     mov [ws_tab_count], al
     mov al, [tmp_buf + 32 + 21]
     mov [ws_tab_index], al
+
+    ; Bytes 22..37 = WS-10 active-app class (absent on pre-v0.1.42
+    ; tile). On CHANGE, refetch the title so its "[0: app]" tag updates.
+    mov ecx, [tmp_buf + 16]
+    cmp ecx, 38
+    jb .wrs_publish
+    lea rsi, [tmp_buf + 32 + 22]
+    lea rdi, [ws10_app]
+    mov ecx, 16
+    repe cmpsb
+    je .wrs_publish                       ; unchanged
+    lea rsi, [tmp_buf + 32 + 22]
+    lea rdi, [ws10_app]
+    mov ecx, 16
+    rep movsb
+    mov byte [ws10_app + 16], 0
+    call wt_refetch_title
 
 .wrs_publish:
     call ws_publish_segment

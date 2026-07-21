@@ -944,6 +944,10 @@ current_ws:              resb 1
 prev_ws:                 resb 1
 workspace_populated:     resb WS_COUNT
 ws_active_xid:           resd WS_COUNT
+ws10_pub_xid:            resd 1        ; ws_active_xid[9] at last class fetch
+ws10_class:              resb 16       ; its WM_CLASS class half, NUL-padded —
+                                       ; published in _TILE_BAR_STATE 22..37 so
+                                       ; strip's title can show the WS-10 app
 
 ; ICCCM atoms (resolved at startup via InternAtom).
 wm_protocols_atom:   resd 1
@@ -12962,6 +12966,58 @@ overview_key:
 publish_bar_state:
     push rbx
     push r12
+    ; ── WS-10 active-app class (property bytes 22..37, for the strip
+    ; title's "[0: app]" tag). WM_CLASS is immutable per window, so
+    ; refetch only when WS 10's active tab CHANGES — event-driven,
+    ; zero idle cost, one event-safe round-trip per change.
+    mov eax, [ws_active_xid + 36]         ; ws 10 = index 9
+    cmp eax, [ws10_pub_xid]
+    je .pbs_ws10_ok
+    mov [ws10_pub_xid], eax
+    xor ecx, ecx
+    mov [ws10_class], ecx
+    mov [ws10_class+4], ecx
+    mov [ws10_class+8], ecx
+    mov [ws10_class+12], ecx
+    test eax, eax
+    jz .pbs_ws10_ok
+    mov edi, eax
+    call read_wm_class
+    test eax, eax
+    jz .pbs_ws10_ok
+    ; wm_class_buf: 32-byte header, then "instance\0class\0"; value
+    ; byte count at +16. Skip the instance half, copy ≤15 class bytes.
+    mov ecx, [wm_class_buf + 16]
+    cmp ecx, WM_CLASS_BUF_SIZE - 32
+    jbe .pbs_wc_len_ok
+    mov ecx, WM_CLASS_BUF_SIZE - 32
+.pbs_wc_len_ok:
+    lea rsi, [wm_class_buf + 32]
+.pbs_wc_skip:
+    test ecx, ecx
+    jz .pbs_ws10_ok                       ; no class half found
+    movzx eax, byte [rsi]
+    inc rsi
+    dec ecx
+    test al, al
+    jnz .pbs_wc_skip
+    lea rdi, [ws10_class]                 ; rsi → class string
+    mov edx, 15
+.pbs_wc_copy:
+    test ecx, ecx
+    jz .pbs_ws10_ok
+    test edx, edx
+    jz .pbs_ws10_ok
+    movzx eax, byte [rsi]
+    test al, al
+    jz .pbs_ws10_ok
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec ecx
+    dec edx
+    jmp .pbs_wc_copy
+.pbs_ws10_ok:
     mov eax, [net_current_desktop_atom]
     test eax, eax
     jz .pbs_done
@@ -13001,13 +13057,15 @@ publish_bar_state:
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_CHANGE_PROPERTY
     mov byte [rdi+1], 0
-    ; Property layout: 22 bytes (CARD8 array, format=8):
+    ; Property layout: 38 bytes (CARD8 array, format=8):
     ;   bytes 0..9   = workspace_populated[0..9]
     ;   bytes 10..19 = ws_layout[0..9]
     ;   byte  20     = tab_count on current_ws (= workspace_populated[current-1])
     ;   byte  21     = tab_index of active tab on current_ws (1-based, 0=none)
-    ; 22 data bytes pad to 24 bytes wire = 6 words. + 6 base words = 12 words.
-    mov word [rdi+2], 12
+    ;   bytes 22..37 = WM_CLASS class of WS 10's active tab (NUL-padded,
+    ;                  all-zero when WS 10 is empty) — strip's "[0: app]"
+    ; 38 data bytes pad to 40 bytes wire = 10 words. + 6 base words = 16.
+    mov word [rdi+2], 16
     mov [rdi+4], ebx                       ; root window
     mov [rdi+8], eax                       ; property atom
     mov dword [rdi+12], 6                  ; type = CARDINAL
@@ -13015,7 +13073,7 @@ publish_bar_state:
     mov byte [rdi+17], 0
     mov byte [rdi+18], 0
     mov byte [rdi+19], 0
-    mov dword [rdi+20], 22                 ; value-length (bytes)
+    mov dword [rdi+20], 38                 ; value-length (bytes)
     ; Copy 10 bytes of populated counts.
     xor ecx, ecx
 .pbs_pop_loop:
@@ -13076,10 +13134,14 @@ publish_bar_state:
     mov byte [rdi + 44], 0
     mov byte [rdi + 45], 0
 .pbs_send:
-    ; Pad bytes 22..23 with zero (X11 properties are word-aligned).
-    mov word [rdi + 46], 0
+    ; Bytes 22..37 = WS-10 active-app class (kept fresh above).
+    mov rax, [ws10_class]
+    mov [rdi + 46], rax
+    mov rax, [ws10_class + 8]
+    mov [rdi + 54], rax
+    mov word [rdi + 62], 0                 ; pad bytes 38..39 (word-aligned)
     lea rsi, [tmp_buf]
-    mov rdx, 48                            ; 24 base + 24 padded data
+    mov rdx, 64                            ; 24 base + 40 padded data
     call x11_buffer
     inc dword [x11_seq]
 .pbs_done:
