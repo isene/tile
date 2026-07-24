@@ -116,8 +116,7 @@ DISPLAY=:9 glass                        # or: DISPLAY=:9 xterm
   `[1 2 3]·[4 5 6]·[7 8 9]·[0]` with configurable per-WS colour
   overrides, vertical separator bar, layout-mode glyph (TABBED ☰,
   SPLIT_H ▌▐, SPLIT_V ▀▄, MASTER ▌▘▖), then the tab strip
-  (current = bright, others dimmed). `tab-color-cycle` rotates a
-  per-tab colour through `tab_palette`.
+  (current = bright, others dimmed).
 - **strip status row** (companion bar) with text segments fed by
   the [chasm-bits](https://github.com/isene/chasm-bits) asmites
   (clock, battery, cpu, mem, disk, net, mailbox, brightness, vol,
@@ -139,7 +138,7 @@ statements: `bind <chord> <action> [arg]`, `exec <cmdline>`,
 `key = value` for bar appearance, `# comments`.
 Modifiers: `Shift`, `Ctrl`/`Control`, `Alt`/`Mod1`, `Mod4`/`Win`/`Super`.
 Actions: `exec`, `exec-here`, `kill`, `exit`, `workspace`, `move-to`,
-`focus`, `move-tab`, `tab-color-cycle`, `stash`, `unstash`, `layout`,
+`focus`, `move-tab`, `stash`, `unstash`, `layout`,
 `spawn-split`, `reload`, `restart`, `overview`.
 
 The `overview` action opens a navigable **HyperList of every window**,
