@@ -1,6 +1,6 @@
 # Maintainer: Geir Isene <g@isene.com>
 pkgname=tile
-pkgver=0.1.42
+pkgver=0.1.43
 pkgrel=1
 pkgdesc="Tiling window manager in x86_64 assembly. No libc, pure syscalls. Ships the strip status bar as tile-strip."
 arch=('x86_64')
