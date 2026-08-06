@@ -664,6 +664,13 @@ ov_text_color:           resd 1
 ov_prop_buf:             resb 4096 ; one GetProperty round-trip (title)
 ov_line_buf:             resb 1024 ; composed "class: title" for one client
 ov_fetch_pos:            resd 1    ; ov_fetch_title write cursor (no live reg)
+; Absolute wall-clock deadline (ms) for the WHOLE ov_build_list title pass.
+; Each ov_fetch_title does up to three GetProperty round-trips, and each of
+; those can burn read_reply_or_queue's 100ms budget if the server never
+; answers. With no aggregate cap that is 3 * 100ms * clients of a fully deaf
+; WM — seconds of dropped keys on a busy desktop. Past the deadline we stop
+; asking and fall back to the "(window)" label. 0 = no deadline set.
+ov_build_deadline:       resq 1
 
 bar_gc_id:               resd 1
 client_color:            resb MAX_CLIENTS
@@ -994,7 +1001,12 @@ recent_unmap_head:    resd 1                  ; next slot to overwrite
 ; GetProperty during the exec-here action) accidentally drains an
 ; event from the wire. event_loop drains the queue before reading the
 ; socket, so no event is lost.
-%define PENDING_MAX 16
+; Ring depth for events that arrive while we're blocked on a synchronous
+; reply (GetProperty, GrabKeyboard, …). Was 16, which the overview's
+; title pass could overrun: it issues up to three round-trips per client,
+; and once the ring is full read_reply_or_queue DISCARDS further events —
+; including KeyPress, so selector navigation lost keys. 64 costs 2 KB BSS.
+%define PENDING_MAX 64
 pending_events:      resb 32 * PENDING_MAX
 pending_count:       resd 1
 pending_head:        resd 1
@@ -6422,7 +6434,10 @@ read_reply_or_queue:
     ; Event — append to pending queue.
     mov ecx, [pending_count]
     cmp ecx, PENDING_MAX
-    jge .rrq_loop                         ; queue full — drop oldest by reading next
+    jge .rrq_loop                         ; queue full — this event is DROPPED
+                                          ; (we keep reading for the reply).
+                                          ; Lossy by design; PENDING_MAX is
+                                          ; sized so real bursts fit.
     mov ebx, [pending_head]
     add ebx, ecx
     cmp ebx, PENDING_MAX
@@ -11922,6 +11937,13 @@ ov_build_list:
     mov dword [ov_arena_used], 0
     mov dword [ov_sel], 0
     mov dword [ov_scroll], 0
+    ; Budget the whole title pass at 300ms. Healthy GetProperty replies are
+    ; sub-millisecond (the X server answers from its own property store, not
+    ; the client), so this never trips in normal use; it only bounds the
+    ; pathological case where replies go missing.
+    call clock_ms
+    add rax, 300
+    mov [ov_build_deadline], rax
     mov r12d, 1                          ; ws
 .obl_ws:
     cmp r12d, 10
@@ -12097,6 +12119,18 @@ ov_fetch_title:
     push r15
     mov r12d, edi
     mov dword [ov_fetch_pos], 0
+    ; Budget check: once ov_build_list's deadline has passed, stop issuing
+    ; round-trips entirely and take the "(window)" fallback at .oft_end.
+    ; Checked once per client, so the cost is one clock_gettime per row.
+    mov rax, [ov_build_deadline]
+    test rax, rax
+    jz .oft_budget_ok                    ; no deadline set — unbudgeted caller
+    push rax
+    call clock_ms
+    pop rcx
+    cmp rax, rcx
+    jae .oft_end                         ; over budget — skip all fetches
+.oft_budget_ok:
     mov edi, r12d
     call read_wm_class                   ; rax = class ptr or 0
     test rax, rax
@@ -12946,7 +12980,14 @@ overview_key:
     jz .ok_enter_ws                      ; header → just switch
     mov eax, r8d                         ; client → set it active on its ws
     mov esi, edx
+    ; edx (target ws) must survive this call. set_active_tab_on_ws runs
+    ; ~9 calls including x11_flush, whose write() clobbers rdx (syscall
+    ; arg3, caller-saved). Without this the switch_workspace below got a
+    ; garbage workspace: picking a WS header worked (it skips this call),
+    ; picking an app landed on the wrong workspace. Pitfall #4b.
+    push rdx
     call set_active_tab_on_ws
+    pop rdx
 .ok_enter_ws:
     mov edi, edx
     call switch_workspace
