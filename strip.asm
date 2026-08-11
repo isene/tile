@@ -406,7 +406,7 @@ ws10_app:            resb 17              ; WS-10 active-app class from
                                           ; _TILE_BAR_STATE bytes 22..37 —
                                           ; rendered as "[0: app]" in @wintitle
     alignb 4
-pend_ev_buf:         resb 32*4            ; structure events discarded by the
+pend_ev_buf:         resb 32*8            ; structure events discarded by the
 pend_ev_count:       resd 1               ; sync-reply reads, replayed at
                                           ; .drf_done (tray ghost gaps)
 
@@ -930,6 +930,8 @@ drain_ready_fds:
     lea rcx, [pend_ev_buf + rax]
     movzx eax, byte [rcx]
     and al, 0x7F
+    cmp al, EV_CLIENT_MESSAGE
+    je .drf_replay_clientmsg
     cmp al, EV_REPARENT_NOTIFY
     jne .drf_replay_undock
     mov eax, [rcx + 12]                   ; new parent
@@ -938,6 +940,22 @@ drain_ready_fds:
 .drf_replay_undock:
     mov eax, [rcx + 8]                    ; window XID
     call tray_undock_icon
+    jmp .drf_replay_next
+.drf_replay_clientmsg:
+    ; Same shape as the live .drf_x11_clientmsg handler, read out of the
+    ; stashed copy instead of x11_read_buf.
+    mov eax, [rcx + 8]                    ; message_type
+    cmp eax, [tray_atom_op]
+    jne .drf_replay_next
+    mov eax, [rcx + 16]                   ; data.l[1] = opcode
+    cmp eax, SYS_TRAY_REQUEST_DOCK
+    jne .drf_replay_next
+    mov eax, [rcx + 20]                   ; data.l[2] = icon XID
+    test eax, eax
+    jz .drf_replay_next
+    push rbx
+    call tray_dock_icon
+    pop rbx
 .drf_replay_next:
     inc ebx
     jmp .drf_replay
@@ -5162,11 +5180,18 @@ wt_get_property:
     je .wgp_stash
     cmp al, EV_UNMAP_NOTIFY
     je .wgp_stash
+    ; ClientMessage carries the tray dock request. An app launched long
+    ; after strip (Discord, 2026-08-11) asks to dock at a moment when we
+    ; are mid-@wintitle round-trip, the request got eaten here, and the
+    ; icon sat at the root window forever while icons that docked at
+    ; session start were fine. Fourth event class lost to this hole.
+    cmp al, EV_CLIENT_MESSAGE
+    je .wgp_stash
     cmp al, EV_REPARENT_NOTIFY
     jne .wgp_read
 .wgp_stash:
     mov ecx, [pend_ev_count]
-    cmp ecx, 4
+    cmp ecx, 8
     jge .wgp_read                         ; ring full → drop
     shl ecx, 5
     lea rdi, [pend_ev_buf + rcx]
