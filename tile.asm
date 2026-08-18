@@ -4620,6 +4620,115 @@ action_kill_focused:
     call x11_flush
     ret
 .akf_no_transient:
+    ; Kill what the user SEES, not a hidden tab. ws_active_xid only
+    ; knows tracked tabs. A window mapped untracked (zathura
+    ; 2026-08-18: GTK maps it tiny → the <100px filter skips tracking
+    ; → the app resizes itself to full and takes focus on its own)
+    ; covers the whole workspace while Mod4+q WM_DELETEs the active
+    ; tab BENEATH it — that is how closing a PDF view nuked kastrup.
+    ; Ask the server for the real focus window; when it is an
+    ; untracked toplevel (parent == root; tile never reparents) and
+    ; not root/None/our bar, kill THAT and return. Cold path — two
+    ; bounded synchronous round-trips, only on the kill action.
+    push rbx
+    call x11_flush
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_GET_INPUT_FOCUS
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 1
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 4
+    syscall
+    inc dword [x11_seq]
+    lea rdi, [recov_reply_buf]
+    call read_reply_or_queue
+    test rax, rax
+    jz .akf_tab_kill                      ; no reply → tab behaviour
+    mov ebx, [recov_reply_buf + 8]        ; focus window
+    cmp ebx, 1
+    jbe .akf_tab_kill                     ; None(0) / PointerRoot(1)
+    cmp ebx, [x11_root_window]
+    je .akf_tab_kill
+    cmp ebx, [bar_window_id]
+    je .akf_tab_kill
+    mov eax, ebx
+    call find_client_index
+    cmp eax, -1
+    jne .akf_tab_kill                     ; tracked → normal tab kill
+    ; Untracked focus-holder. Confirm it is a toplevel via QueryTree:
+    ; a subwindow focus means a toolkit moved focus inside a normal
+    ; client — the tab path is the right one there. The 32-byte header
+    ; goes through read_reply_or_queue (event-safe); the children tail
+    ; is part of the same reply, so events cannot interleave inside it
+    ; and a raw discard drain is safe.
+    call x11_flush
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_QUERY_TREE
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov [rdi+4], ebx
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    syscall
+    inc dword [x11_seq]
+    lea rdi, [recov_reply_buf]
+    call read_reply_or_queue
+    test rax, rax
+    jz .akf_tab_kill
+    mov r8d, [recov_reply_buf + 4]        ; reply length (4-byte units)
+    shl r8d, 2                            ; children tail in bytes
+.akf_qt_tail:
+    test r8d, r8d
+    jle .akf_qt_done
+    mov edx, 1024
+    cmp r8d, edx
+    jge .akf_qt_rd
+    mov edx, r8d
+.akf_qt_rd:
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [qt_reply_buf]
+    syscall
+    cmp eax, -4                           ; EINTR → retry
+    je .akf_qt_tail
+    test eax, eax
+    jle .akf_qt_done                      ; EOF/error → use what we have
+    sub r8d, eax
+    jmp .akf_qt_tail
+.akf_qt_done:
+    mov eax, [recov_reply_buf + 12]       ; parent
+    cmp eax, [x11_root_window]
+    jne .akf_tab_kill                     ; subwindow focus → tab path
+    ; Kill the floater: WM_DELETE, KillClient when atoms are missing.
+    mov ecx, [wm_protocols_atom]
+    test ecx, ecx
+    jz .akf_f_force
+    mov ecx, [wm_delete_atom]
+    test ecx, ecx
+    jz .akf_f_force
+    mov edi, ebx
+    call send_delete_message
+    jmp .akf_f_done
+.akf_f_force:
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_KILL_CLIENT
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov [rdi+4], ebx
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    call x11_buffer
+    inc dword [x11_seq]
+.akf_f_done:
+    call x11_flush
+    pop rbx
+    ret
+.akf_tab_kill:
+    pop rbx
     movzx ecx, byte [current_ws]
     test ecx, ecx
     jz .akf_none
