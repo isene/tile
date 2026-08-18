@@ -420,6 +420,8 @@ key_table:
     dd 0xffc8
     db "F12", 0
     dd 0xffc9
+    db "F23", 0                ; the Copilot key: the kernel emits the
+    dd 0xffd4                  ; macro Meta+Shift+F23 for it
     db "plus", 0
     dd 0x002b
     db "minus", 0
