@@ -4386,8 +4386,9 @@ untrack_client:
     inc ebx
     jmp .uc_find
 .uc_remove:
-    ; Debug: log "tile: untrk x=N c=N i=N\n" so destroy/untrack events
-    ; aren't silent. Cheap (untracks are rare, not in any hot path).
+    ; Log "tile: untrk x=N c=N i=N": the only record of a window leaving
+    ; the table, which is the half that matters when a ghost tab outlives
+    ; its client. Fires once per window close, so it is human-rate.
     push rax
     push rcx
     push rdx
@@ -4398,33 +4399,19 @@ untrack_client:
     push r10
     push r11
     lea rdi, [dkp_buf]
-    mov byte [rdi+0], 't'
-    mov byte [rdi+1], 'i'
-    mov byte [rdi+2], 'l'
-    mov byte [rdi+3], 'e'
-    mov byte [rdi+4], ':'
-    mov byte [rdi+5], ' '
-    mov byte [rdi+6], 'u'
-    mov byte [rdi+7], 'n'
-    mov byte [rdi+8], 't'
-    mov byte [rdi+9], 'r'
-    mov byte [rdi+10], 'k'
-    mov byte [rdi+11], ' '
-    mov byte [rdi+12], 'x'
-    mov byte [rdi+13], '='
-    add rdi, 14
+    lea rsi, [.uc_pre]
+    mov ecx, .uc_pre_len
+    rep movsb
     mov eax, r12d
     call dbg_u32_dec
-    mov byte [rdi], ' '
-    mov byte [rdi+1], 'c'
-    mov byte [rdi+2], '='
-    add rdi, 3
+    lea rsi, [.uc_c]
+    mov ecx, 3
+    rep movsb
     mov eax, [client_count]
     call dbg_u32_dec
-    mov byte [rdi], ' '
-    mov byte [rdi+1], 'i'
-    mov byte [rdi+2], '='
-    add rdi, 3
+    lea rsi, [.uc_i]
+    mov ecx, 3
+    rep movsb
     mov eax, ebx
     call dbg_u32_dec
     mov byte [rdi], 10
@@ -4482,6 +4469,10 @@ untrack_client:
     pop r12
     pop rbx
     ret
+.uc_pre:     db "tile: untrk x="
+.uc_pre_len  equ $ - .uc_pre
+.uc_c:       db " c="
+.uc_i:       db " i="
 
 ; Returns the index of the client with XID = eax, or -1 in eax if not
 ; present.
