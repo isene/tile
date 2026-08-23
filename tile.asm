@@ -129,6 +129,7 @@
 %define EV_UNMAP_NOTIFY         18
 %define EV_MAP_NOTIFY           19
 %define EV_MAP_REQUEST          20
+%define EV_CLIENT_MESSAGE       33
 %define EV_CONFIGURE_NOTIFY     22
 %define EV_CONFIGURE_REQUEST    23
 %define EV_PROPERTY_NOTIFY      28
@@ -2590,6 +2591,8 @@ event_loop:
     je .ev_destroy_notify
     cmp al, EV_EXPOSE
     je .ev_expose
+    cmp al, EV_CLIENT_MESSAGE
+    je .ev_client_message
     ; RandR ScreenChangeNotify? Only check if RandR was successfully set
     ; up at startup (otherwise randr_event_base could collide with 0).
     cmp byte [randr_present], 0
@@ -2602,6 +2605,50 @@ event_loop:
 
 .ev_rr_screen_change:
     call rediscover_outputs
+    jmp event_loop
+
+.ev_client_message:
+    ; _NET_ACTIVE_WINDOW from a pager (beam, wmctrl -ia): raise that
+    ; window's tab on its own workspace. set_active_tab_on_ws maps it
+    ; when the workspace is on screen (WS10 on the external) and only
+    ; records it otherwise. The visible workspace and the input focus
+    ; never change, so driving the external monitor cannot yank the
+    ; screen being typed on. ClientMessage layout: window at +4,
+    ; message_type atom at +8.
+    mov eax, [x11_read_buf + 8]
+    cmp eax, [net_active_window_atom]
+    jne event_loop
+    mov eax, [x11_read_buf + 4]
+    call find_client_index
+    cmp eax, -1
+    je event_loop
+    movzx esi, byte [client_ws + rax]
+    ; Remember who has the keyboard: set_active_tab_on_ws focuses what
+    ; it maps, which is right for a same-workspace switch and wrong for
+    ; a remote one. Restore focus afterwards when the target workspace
+    ; is not the one being typed on.
+    mov r14d, [focused_xid]
+    movzx r15d, byte [current_ws]
+    mov eax, [x11_read_buf + 4]
+    call set_active_tab_on_ws
+    movzx eax, byte [current_ws]
+    cmp eax, r15d
+    jne .ev_cm_done
+    mov eax, [x11_read_buf + 4]
+    movzx ecx, byte [current_ws]
+    ; Target on the current workspace: the focus follows the tab, as a
+    ; local switch always has. Only a cross-workspace beam restores.
+    call find_client_index
+    cmp eax, -1
+    je .ev_cm_done
+    movzx ecx, byte [client_ws + rax]
+    cmp ecx, r15d
+    je .ev_cm_done
+    test r14d, r14d
+    jz .ev_cm_done
+    mov eax, r14d
+    call set_input_focus
+.ev_cm_done:
     jmp event_loop
 
 .ev_expose:
