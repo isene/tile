@@ -1131,6 +1131,16 @@ _start:
     jg .start_argv_loop
 .start_argv_done:
 
+    ; Anchor the working directory at $HOME. Everything tile spawns
+    ; inherits its cwd, and tile's own cwd is an accident of wherever
+    ; the shell that launched it happened to be — a `tile` typed in a
+    ; project directory, or a Mod4+Shift+x restart, which re-execs in
+    ; place and carries the old cwd along. That left every keybound
+    ; glass opening in a random tree. `exec-here` is the action that
+    ; deliberately follows the focused window's shell; plain `exec`
+    ; should be predictable instead.
+    call chdir_home
+
     ; Open /tmp/tile.log so config warnings, X errors, and any future
     ; runtime diagnostics survive even when tile is launched under
     ; gdm-x-session (which redirects stderr off-screen). Cold path:
@@ -9621,6 +9631,38 @@ action_focus_dir:
 ; ══════════════════════════════════════════════════════════════════════
 ; Config file: ~/.tilerc
 ; ══════════════════════════════════════════════════════════════════════
+
+; chdir to $HOME. No-op if HOME is unset or the chdir fails: an odd
+; cwd is better than refusing to start. Runs once, at startup.
+chdir_home:
+    push rdi
+    push rsi
+    push rcx
+    push r11
+    mov rdi, [envp]
+.ch_loop:
+    mov rax, [rdi]
+    test rax, rax
+    jz .ch_done
+    cmp dword [rax], 'HOME'
+    jne .ch_next
+    cmp byte [rax + 4], '='
+    jne .ch_next
+    lea rdi, [rax + 5]
+    cmp byte [rdi], 0                ; HOME= with nothing after it
+    je .ch_done
+    mov rax, 80                      ; SYS_CHDIR
+    syscall
+    jmp .ch_done
+.ch_next:
+    add rdi, 8
+    jmp .ch_loop
+.ch_done:
+    pop r11
+    pop rcx
+    pop rsi
+    pop rdi
+    ret
 
 ; Build $HOME/.tilerc into config_path. Returns rax=ptr or NULL if
 ; HOME isn't set.
