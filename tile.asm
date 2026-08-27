@@ -960,6 +960,9 @@ client_count:            resd 1
 ;                              actually mapped at any given time.
 current_ws:              resb 1
 prev_ws:                 resb 1
+; Which workspace tile lands on at startup (~/.tilerc: startup_workspace
+; = N, 1..10, 0 means 10). Default 1. Applied after discover_outputs.
+cfg_startup_ws:          resb 1
 workspace_populated:     resb WS_COUNT
 ws_active_xid:           resd WS_COUNT
 ws10_pub_xid:            resd 1        ; ws_active_xid[9] at last class fetch
@@ -1172,8 +1175,9 @@ _start:
     ; Reserve arg_pool[0] as the "no arg" sentinel and load ~/.tilerc.
     mov dword [arg_pool_pos], 1
     mov byte [arg_pool], 0
-    ; Start on workspace 1.
+    ; Start on workspace 1 (startup_workspace in ~/.tilerc overrides).
     mov byte [current_ws], 1
+    mov byte [cfg_startup_ws], 1
     mov byte [prev_ws], 0
     ; Bar defaults (~/.tilerc may override).
     mov word [bar_height], DEFAULT_BAR_HEIGHT
@@ -1229,6 +1233,16 @@ _start:
     call discover_outputs
     call dbg_dump_outputs
     call apply_pin_overrides
+
+    ; startup_workspace: land on the configured workspace (default 1)
+    ; instead of WS1. Show it on whichever output it is pinned to
+    ; (single-screen: output 0), and make it the global current_ws.
+    movzx eax, byte [cfg_startup_ws]
+    mov [current_ws], al
+    movzx ecx, al
+    dec ecx                                   ; ws index (0-based)
+    movzx edx, byte [ws_pinned_output + rcx]  ; output this ws lives on
+    mov [output_current_ws + rdx], al
 
     ; Resolve every bind's keysym to a keycode and grab them on root.
     call resolve_and_grab_binds
@@ -11128,6 +11142,11 @@ apply_setting:
     test eax, eax
     jnz .as_master_ratio
     mov rdi, r13
+    lea rsi, [.as_kw_startup_ws]
+    call .as_streq
+    test eax, eax
+    jnz .as_startup_ws
+    mov rdi, r13
     lea rsi, [.as_kw_strip_height]
     call .as_streq
     test eax, eax
@@ -11273,6 +11292,23 @@ apply_setting:
 .as_mr_ok:
     mov [cfg_master_ratio], al
     jmp .as_done
+.as_startup_ws:
+    mov rdi, r12
+    call parse_decimal_byte               ; 0..N; 0 = workspace 10 (Mod4+0)
+    test eax, eax
+    jnz .as_sw_nz
+    mov eax, 10
+.as_sw_nz:
+    cmp eax, 1                             ; clamp to 1..10
+    jge .as_sw_hi
+    mov eax, 1
+.as_sw_hi:
+    cmp eax, 10
+    jle .as_sw_ok
+    mov eax, 10
+.as_sw_ok:
+    mov [cfg_startup_ws], al
+    jmp .as_done
 .as_strip_height:
     mov rdi, r12
     call parse_decimal_byte
@@ -11337,6 +11373,7 @@ apply_setting:
 .as_kw_border_focused:  db "border_focused", 0
 .as_kw_border_unfocused: db "border_unfocused", 0
 .as_kw_master_ratio:    db "master_ratio", 0
+.as_kw_startup_ws:      db "startup_workspace", 0
 .as_kw_strip_height:    db "strip_height", 0
 .as_kw_bar_pad:         db "bar_pad", 0
 .as_kw_bar_pad_bottom:  db "bar_pad_bottom", 0
