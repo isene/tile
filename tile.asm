@@ -290,6 +290,14 @@ net_active_window_len equ 18
 net_wm_desktop_str: db "_NET_WM_DESKTOP"
 net_wm_desktop_len equ $ - net_wm_desktop_str
 ; _NET_WM_NAME (UTF8) — read by the overview popup to label each window.
+net_supporting_wm_check_str: db "_NET_SUPPORTING_WM_CHECK"
+net_supporting_wm_check_len  equ $ - net_supporting_wm_check_str
+net_supported_str:  db "_NET_SUPPORTED"
+net_supported_len   equ $ - net_supported_str
+utf8_string_str:    db "UTF8_STRING"
+utf8_string_len     equ $ - utf8_string_str
+wm_check_name_str:  db "tile"
+wm_check_name_len   equ $ - wm_check_name_str
 net_wm_name_str:   db "_NET_WM_NAME"
 net_wm_name_len    equ $ - net_wm_name_str
 ; Static labels for the overview popup header/footer + empty state.
@@ -966,6 +974,10 @@ tile_shell_pid_atom: resd 1
 net_active_window_atom: resd 1
 net_wm_desktop_atom:    resd 1
 net_current_desktop_atom: resd 1
+net_supporting_wm_check_atom: resd 1
+net_supported_atom:     resd 1
+utf8_string_atom:       resd 1
+wm_check_window:        resd 1
 net_wm_pid_atom:        resd 1
 tile_bar_state_atom:    resd 1
 
@@ -5916,8 +5928,153 @@ intern_wm_atoms:
     call intern_one_atom
     mov [net_wm_pid_atom], eax
 
+    ; --- EWMH "a window manager is running" handshake ---
+    lea rdi, [net_supporting_wm_check_str]
+    mov esi, net_supporting_wm_check_len
+    call intern_one_atom
+    mov [net_supporting_wm_check_atom], eax
+    lea rdi, [net_supported_str]
+    mov esi, net_supported_len
+    call intern_one_atom
+    mov [net_supported_atom], eax
+    lea rdi, [utf8_string_str]
+    mov esi, utf8_string_len
+    call intern_one_atom
+    mov [utf8_string_atom], eax
+    call ewmh_publish_wm_check
+
     pop r12
     pop rbx
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
+; ewmh_publish_wm_check — the handshake that tells toolkits a window
+; manager is here. GDK reads _NET_SUPPORTING_WM_CHECK on the root on
+; every key press; finding nothing, it stops trusting _NET_ACTIVE_WINDOW
+; and falls back to working focus out for itself. Without this, tile's
+; active-window hint was published to nobody.
+;
+; Spec dance: a never-mapped child window points at itself, the root
+; points at it, and the child carries the WM's name. _NET_SUPPORTED then
+; lists what tile actually honours.
+; ══════════════════════════════════════════════════════════════════════
+ewmh_publish_wm_check:
+    push rbx
+    push r12
+    cmp dword [net_supporting_wm_check_atom], 0
+    je .epw_done                          ; intern failed — skip quietly
+    call alloc_xid
+    mov [wm_check_window], eax
+    mov r12d, eax
+
+    ; CreateWindow(1x1, override-redirect, never mapped)
+    lea rdi, [tmp_buf]
+    movzx eax, byte [x11_root_depth]
+    mov [rdi+1], al                       ; depth
+    mov byte [rdi], X11_CREATE_WINDOW
+    mov word [rdi+2], 9                   ; 8 header + 1 value
+    mov [rdi+4], r12d                     ; wid
+    mov eax, [x11_root_window]
+    mov [rdi+8], eax                      ; parent
+    mov word [rdi+12], 0                  ; x
+    mov word [rdi+14], 0                  ; y
+    mov word [rdi+16], 1                  ; width
+    mov word [rdi+18], 1                  ; height
+    mov word [rdi+20], 0                  ; border-width
+    mov word [rdi+22], 1                  ; class = InputOutput
+    mov dword [rdi+24], 0                 ; visual = CopyFromParent
+    mov dword [rdi+28], CW_OVERRIDE_REDIRECT
+    mov dword [rdi+32], 1
+    lea rsi, [tmp_buf]
+    mov rdx, 36
+    call x11_buffer
+    inc dword [x11_seq]
+
+    ; root._NET_SUPPORTING_WM_CHECK = check window
+    mov eax, [x11_root_window]
+    mov ebx, [net_supporting_wm_check_atom]
+    mov ecx, r12d
+    call ewmh_set_window_prop
+    ; check._NET_SUPPORTING_WM_CHECK = itself
+    mov eax, r12d
+    mov ebx, [net_supporting_wm_check_atom]
+    mov ecx, r12d
+    call ewmh_set_window_prop
+
+    ; check._NET_WM_NAME = "tile" (UTF8_STRING)
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_PROPERTY
+    mov byte [rdi+1], 0                   ; Replace
+    mov word [rdi+2], 7                   ; 6 header + 1 data word
+    mov [rdi+4], r12d                     ; window
+    mov eax, [ov_net_wm_name_atom]
+    mov [rdi+8], eax                      ; property
+    mov eax, [utf8_string_atom]
+    mov [rdi+12], eax                     ; type
+    mov byte [rdi+16], 8                  ; format
+    mov byte [rdi+17], 0
+    mov word [rdi+18], 0
+    mov dword [rdi+20], wm_check_name_len
+    mov eax, "tile"
+    mov [rdi+24], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 28
+    call x11_buffer
+    inc dword [x11_seq]
+
+    ; root._NET_SUPPORTED = the hints tile actually honours
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_PROPERTY
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 11                  ; 6 header + 5 atoms
+    mov eax, [x11_root_window]
+    mov [rdi+4], eax
+    mov eax, [net_supported_atom]
+    mov [rdi+8], eax
+    mov dword [rdi+12], 4                 ; type = ATOM
+    mov byte [rdi+16], 32
+    mov byte [rdi+17], 0
+    mov word [rdi+18], 0
+    mov dword [rdi+20], 5
+    mov eax, [net_supporting_wm_check_atom]
+    mov [rdi+24], eax
+    mov eax, [net_active_window_atom]
+    mov [rdi+28], eax
+    mov eax, [net_current_desktop_atom]
+    mov [rdi+32], eax
+    mov eax, [net_wm_desktop_atom]
+    mov [rdi+36], eax
+    mov eax, [ov_net_wm_name_atom]
+    mov [rdi+40], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 44
+    call x11_buffer
+    inc dword [x11_seq]
+    call x11_flush
+.epw_done:
+    pop r12
+    pop rbx
+    ret
+
+; eax = window, ebx = property atom, ecx = window-id value.
+; ChangeProperty(window, prop, type WINDOW, format 32, 1 item).
+ewmh_set_window_prop:
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CHANGE_PROPERTY
+    mov byte [rdi+1], 0                   ; Replace
+    mov word [rdi+2], 7                   ; 6 header + 1 data word
+    mov [rdi+4], eax                      ; window
+    mov [rdi+8], ebx                      ; property
+    mov dword [rdi+12], 33                ; type = WINDOW
+    mov byte [rdi+16], 32                 ; format
+    mov byte [rdi+17], 0
+    mov word [rdi+18], 0
+    mov dword [rdi+20], 1                 ; value length
+    mov [rdi+24], ecx                     ; the window id
+    lea rsi, [tmp_buf]
+    mov rdx, 28
+    call x11_buffer
+    inc dword [x11_seq]
     ret
 
 ; rdi = name pointer, esi = name length. Returns interned atom in eax
