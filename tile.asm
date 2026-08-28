@@ -5957,7 +5957,9 @@ intern_wm_atoms:
     mov esi, utf8_string_len
     call intern_one_atom
     mov [utf8_string_atom], eax
-    call ewmh_publish_wm_check
+    ; ewmh_publish_wm_check is NOT called from here. Doing so broke the
+    ; restart adopt: QueryTree came back reporting zero children and
+    ; every window was dropped. See v0.1.50.
 
     pop r12
     pop rbx
