@@ -431,6 +431,8 @@ key_table:
     dd 0xffc9
     db "F23", 0                ; the Copilot key: the kernel emits the
     dd 0xffd4                  ; macro Meta+Shift+F23 for it
+    db "Print", 0              ; PrtScr. frame maps keycode 107 to it;
+    dd 0xff61                  ; without this entry the bind was dropped
     db "plus", 0
     dd 0x002b
     db "minus", 0
