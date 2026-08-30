@@ -174,6 +174,9 @@ randr_name_len    equ $ - randr_name
 ; Default exec arg vectors for fork_segment.
 sh_path:         db "/bin/sh", 0
 sh_dash_c:       db "-c", 0
+; Characters that mean a segment command actually needs a shell. Anything
+; without one of these, and with an absolute path, is exec'd directly.
+sh_meta_chars:   db "|&;<>()$`", 0x5C, 0x22, 0x27, "*?[]~#{}!", 10, 0
 
 ; Empty placeholder for segments awaiting first run.
 empty_str:       db " ", 0
@@ -1254,6 +1257,82 @@ fork_segment:
     mov edi, ecx
     syscall
 .fs_no_close_w:
+    ; Exec the command directly when it needs no shell.
+    ;
+    ; Every segment used to go through /bin/sh -c, which costs an extra
+    ; fork+exec of dash per refresh for a command that is usually just a
+    ; path and a flag. With cpu at 4 s and mem/vol/bri/bat at 10 s, that
+    ; was around 63,000 needless process creations a day.
+    ;
+    ; Conditions for the direct path, both required:
+    ;   - the command starts with '/', so no PATH lookup is needed
+    ;   - it holds no shell metacharacter
+    ; The weather segment uses $( ) and a pipe, so it still gets a shell.
+    ; Splitting is done in place: this is the child, so the copy is ours.
+    mov eax, [r13 + SEG_OFF_CMD_OFF]
+    lea r8, [arg_pool]
+    add r8, rax                           ; r8 = command string
+    cmp byte [r8], '/'
+    jne .fs_use_shell                     ; relative name → let sh find it
+    mov rdi, r8
+.fs_meta_scan:
+    movzx eax, byte [rdi]
+    test eax, eax
+    je .fs_direct
+    lea r9, [sh_meta_chars]
+.fs_meta_one:
+    movzx edx, byte [r9]
+    test edx, edx
+    je .fs_meta_next
+    cmp eax, edx
+    je .fs_use_shell
+    inc r9
+    jmp .fs_meta_one
+.fs_meta_next:
+    inc rdi
+    jmp .fs_meta_scan
+
+.fs_direct:
+    ; Build argv by splitting on spaces, NUL-terminating in place.
+    sub rsp, 8 * 18
+    mov r10, rsp                          ; argv array
+    mov rdi, r8                           ; cursor
+    xor ecx, ecx                          ; argc
+.fs_split:
+    cmp byte [rdi], ' '
+    jne .fs_split_tok
+    mov byte [rdi], 0
+    inc rdi
+    jmp .fs_split
+.fs_split_tok:
+    cmp byte [rdi], 0
+    je .fs_split_done
+    cmp ecx, 16
+    jge .fs_split_done                    ; more args than we hold → truncate
+    mov [r10 + rcx*8], rdi
+    inc ecx
+.fs_split_scan:
+    inc rdi
+    cmp byte [rdi], 0
+    je .fs_split_done
+    cmp byte [rdi], ' '
+    jne .fs_split_scan
+    jmp .fs_split
+.fs_split_done:
+    mov qword [r10 + rcx*8], 0
+    mov rax, SYS_EXECVE
+    mov rdi, r8
+    mov rsi, r10
+    mov rdx, [envp]
+    syscall
+    ; Direct exec failed. sh would fail too (absolute path, no expansion
+    ; needed), and the string is split now, so report the same 127 the
+    ; shell path reports.
+    mov rax, SYS_EXIT
+    mov edi, 127
+    syscall
+
+.fs_use_shell:
     ; Build argv = ["/bin/sh", "-c", cmd, NULL] on the stack.
     sub rsp, 32
     lea rax, [sh_path]
