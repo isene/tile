@@ -82,6 +82,12 @@
 ; ClientMessage event type and SubstructureNotify mask.
 %define EV_CLIENT_MESSAGE       33
 %define EV_DESTROY_NOTIFY       17
+; Ring for events the sync-reply reader has to read past. tile uses 64
+; and queues every event; strip used to keep 8 and only four chosen
+; types, which is how a snixembed restart could still lose an undock:
+; three icons dying at once produce nine Unmap/Reparent/Destroy events,
+; one more than the ring held, and the surplus was dropped in silence.
+%define PEND_EV_MAX 64
 %define EV_UNMAP_NOTIFY         18
 %define EV_REPARENT_NOTIFY      21
 %define EV_CONFIGURE_NOTIFY     22
@@ -409,7 +415,10 @@ ws10_app:            resb 17              ; WS-10 active-app class from
                                           ; _TILE_BAR_STATE bytes 22..37 —
                                           ; rendered as "[0: app]" in @wintitle
     alignb 4
-pend_ev_buf:         resb 32*8            ; structure events discarded by the
+pend_ev_buf:         resb 32*PEND_EV_MAX  ; events discarded by the
+pend_ev_head:        resd 1               ; sync-reply reads, replayed at
+pend_ev_drop:        resd 1               ; ring overflows (diagnostic)
+drf_replaying:       resb 1               ; 1 while draining the ring
 pend_ev_count:       resd 1               ; sync-reply reads, replayed at
                                           ; .drf_done (tray ghost gaps)
 
@@ -723,6 +732,8 @@ drain_ready_fds:
     syscall
     cmp rax, 32
     jl .drf_next
+.drf_dispatch:
+    ; Entry point for a replayed event: x11_read_buf is already filled.
     movzx eax, byte [x11_read_buf]
     and al, 0x7F
     test al, al
@@ -918,52 +929,41 @@ drain_ready_fds:
     call tray_undock_icon
     jmp .drf_next
 .drf_next:
+    cmp byte [drf_replaying], 0
+    jne .drf_replay_loop                  ; replayed event handled → next one
     inc ebx
     jmp .drf_loop
 .drf_done:
-    ; Replay structure events the sync-reply reads discarded, through
-    ; the same undock logic the live handlers use — heals tray ghost
-    ; gaps from icons that died mid-fetch. Zero cost when none pended.
-    xor ebx, ebx
-.drf_replay:
-    cmp ebx, [pend_ev_count]
-    jge .drf_replay_done
-    mov eax, ebx
+    ; Drain the ring the sync-reply reader filled, through the SAME
+    ; dispatcher the live path uses. The old code re-implemented a
+    ; subset of the handlers here, so any event class the replay did not
+    ; know about stayed lost even after it was queued. Now a replayed
+    ; event is indistinguishable from a freshly read one: copy it into
+    ; x11_read_buf and jump into .drf_dispatch. drf_replaying tells
+    ; .drf_next to come back here instead of walking the poll set, which
+    ; the loop has already finished with.
+    mov byte [drf_replaying], 1
+.drf_replay_loop:
+    cmp dword [pend_ev_count], 0
+    je .drf_replay_done
+    mov eax, [pend_ev_head]
     shl eax, 5
-    lea rcx, [pend_ev_buf + rax]
-    movzx eax, byte [rcx]
-    and al, 0x7F
-    cmp al, EV_CLIENT_MESSAGE
-    je .drf_replay_clientmsg
-    cmp al, EV_REPARENT_NOTIFY
-    jne .drf_replay_undock
-    mov eax, [rcx + 12]                   ; new parent
-    cmp eax, [window_id]
-    je .drf_replay_next                   ; still our child — keep it
-.drf_replay_undock:
-    mov eax, [rcx + 8]                    ; window XID
-    call tray_undock_icon
-    jmp .drf_replay_next
-.drf_replay_clientmsg:
-    ; Same shape as the live .drf_x11_clientmsg handler, read out of the
-    ; stashed copy instead of x11_read_buf.
-    mov eax, [rcx + 8]                    ; message_type
-    cmp eax, [tray_atom_op]
-    jne .drf_replay_next
-    mov eax, [rcx + 16]                   ; data.l[1] = opcode
-    cmp eax, SYS_TRAY_REQUEST_DOCK
-    jne .drf_replay_next
-    mov eax, [rcx + 20]                   ; data.l[2] = icon XID
-    test eax, eax
-    jz .drf_replay_next
-    push rbx
-    call tray_dock_icon
-    pop rbx
-.drf_replay_next:
-    inc ebx
-    jmp .drf_replay
+    lea rsi, [pend_ev_buf + rax]
+    lea rdi, [x11_read_buf]
+    mov ecx, 32
+    rep movsb
+    mov eax, [pend_ev_head]
+    inc eax
+    cmp eax, PEND_EV_MAX
+    jl .drf_head_ok
+    xor eax, eax
+.drf_head_ok:
+    mov [pend_ev_head], eax
+    dec dword [pend_ev_count]
+    jmp .drf_dispatch
 .drf_replay_done:
-    mov dword [pend_ev_count], 0
+    mov byte [drf_replaying], 0
+    mov dword [pend_ev_head], 0
 
     ; If we processed at least one X event this cycle, pull root state
     ; once before returning. Sync GetProperty in any of the per-event
@@ -5250,34 +5250,30 @@ wt_get_property:
     xor edi, edi
     syscall
 .wgp_not_rr:
-    ; Structure events must not vanish here either: a tray icon dying
-    ; mid-fetch (killing an app fires property traffic AND the icon's
-    ; DestroyNotify in the same instant) left its XID in tray_icons[]
-    ; and a ghost gap in the layout. Stash Destroy/Unmap/Reparent for
-    ; replay once the event batch finishes (.drf_done).
-    cmp al, EV_DESTROY_NOTIFY
-    je .wgp_stash
-    cmp al, EV_UNMAP_NOTIFY
-    je .wgp_stash
-    ; ClientMessage carries the tray dock request. An app launched long
-    ; after strip (Discord, 2026-08-11) asks to dock at a moment when we
-    ; are mid-@wintitle round-trip, the request got eaten here, and the
-    ; icon sat at the root window forever while icons that docked at
-    ; session start were fine. Fourth event class lost to this hole.
-    cmp al, EV_CLIENT_MESSAGE
-    je .wgp_stash
-    cmp al, EV_REPARENT_NOTIFY
-    jne .wgp_read
+    ; Every event read here is queued, not just a chosen few. Picking
+    ; types was the bug: each new feature found another class that had
+    ; been silently dropped (tray dock ClientMessage, icon Destroy, the
+    ; @wintitle PropertyNotify), and the fix was always another cmp.
+    ; Queue the lot and let the normal dispatcher decide, the way tile
+    ; does. Errors and replies are not events and must not be queued.
 .wgp_stash:
     mov ecx, [pend_ev_count]
-    cmp ecx, 8
-    jge .wgp_read                         ; ring full → drop
+    cmp ecx, PEND_EV_MAX
+    jge .wgp_overflow
+    add ecx, [pend_ev_head]
+    cmp ecx, PEND_EV_MAX
+    jl .wgp_stash_at
+    sub ecx, PEND_EV_MAX
+.wgp_stash_at:
     shl ecx, 5
     lea rdi, [pend_ev_buf + rcx]
     lea rsi, [tmp_buf]
     mov ecx, 32
     rep movsb
     inc dword [pend_ev_count]
+    jmp .wgp_read
+.wgp_overflow:
+    inc dword [pend_ev_drop]              ; 64 deep and still overflowing
     jmp .wgp_read
 .wgp_fail:
     mov rax, -1
