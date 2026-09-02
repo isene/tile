@@ -1069,11 +1069,17 @@ x11_read_buf:        resb 65536
 x11_write_buf:       resb 65536
 x11_write_pos:       resq 1
 dkp_buf:             resb 64
+; Log every KeyPress? Off by default. It was unconditional, and when the
+; adopt desync made tile spin on garbage keycodes it wrote 4.9 million
+; lines and 98 MB into /tmp in one session. Set TILE_LOG_KEYS=1 to get
+; it back for a debugging run.
+cfg_log_keys:        resb 1
 ; QueryTree reply buffer for adopt_existing_windows. 32-byte fixed
 ; header + up to 1024 children × 4 bytes. 1024 is far more than any
 ; real X session (~50 top-levels max in normal use). Used only at
 ; restart startup; idle thereafter.
 qt_reply_buf:        resb 32 + 1024*4
+qt_sink:             resb 1024            ; tail bytes past the cap, read and dropped
 
 ; ══════════════════════════════════════════════════════════════════════
 ; Code
@@ -1117,6 +1123,34 @@ _start:
     lea rax, [rdi + 1]
     lea rcx, [rsi + rax*8]
     mov [envp], rcx
+    ; TILE_LOG_KEYS=1 turns the per-KeyPress log back on. It used to be
+    ; unconditional; when the adopt desync made tile spin on garbage
+    ; keycodes it wrote 4.9 million lines and 98 MB into /tmp.
+    push rdi
+    push rsi
+    mov rsi, rcx
+.start_lk_loop:
+    mov rax, [rsi]
+    test rax, rax
+    jz .start_lk_done
+    cmp dword [rax], 'TILE'
+    jne .start_lk_next
+    cmp dword [rax+4], '_LOG'
+    jne .start_lk_next
+    cmp dword [rax+8], '_KEY'
+    jne .start_lk_next
+    cmp word [rax+12], 'S='
+    jne .start_lk_next
+    cmp byte [rax+14], '1'
+    jne .start_lk_done
+    mov byte [cfg_log_keys], 1
+    jmp .start_lk_done
+.start_lk_next:
+    add rsi, 8
+    jmp .start_lk_loop
+.start_lk_done:
+    pop rsi
+    pop rdi
     ; Scan argv[1..argc-1] for --no-autostart (set by action_restart so
     ; the re-exec'd tile doesn't fire another firefox/strip/glass).
     mov rcx, rdi                 ; argc
@@ -1913,84 +1947,67 @@ adopt_existing_windows:
     syscall
     inc dword [x11_seq]
 
-    ; Drain the QueryTree reply with our own POLL+READ loop so we
-    ; control exactly how much we consume (read_reply_or_queue is
-    ; hard-wired to 32-byte chunks and doesn't drain reply tails —
-    ; we'd lose synchronisation between the 32-byte header and the
-    ; 4N-byte children list). Read up to 4128 bytes (32 fixed + 1024
-    ; children × 4) into qt_reply_buf, looping as long as the kernel
-    ; trickles data in.
+    ; Read the QueryTree reply through read_reply_or_queue, which takes
+    ; exactly 32 bytes at a time and queues any events that arrive in
+    ; the meantime, then consume the reply's variable tail in full.
     ;
-    ; Events that arrive interleaved (MapNotify, etc.) get drained
-    ; into qt_reply_buf too — we filter on byte 0 == 1 (reply) when
-    ; locating the QueryTree response within the buffer.
-    xor ebx, ebx                          ; bytes drained so far
-    lea r14, [qt_reply_buf]
-.aew_qt_drain:
-    cmp ebx, 32                           ; minimum: 32-byte fixed reply
-    jge .aew_qt_drain_more_check
-    jmp .aew_qt_poll
-.aew_qt_drain_more_check:
-    ; After 32 bytes we know reply-length; compute total bytes wanted.
-    mov eax, [qt_reply_buf + 4]           ; reply-length in 4-byte units
-    shl eax, 2                            ; bytes after fixed 32
-    add eax, 32
-    cmp ebx, eax
-    jge .aew_qt_drained
-.aew_qt_poll:
-    sub rsp, 16
-    mov eax, [x11_fd]
-    mov [rsp + 0], eax
-    mov word [rsp + 4], 1                 ; POLLIN
-    mov word [rsp + 6], 0
-    mov rax, SYS_POLL
-    lea rdi, [rsp]
-    mov esi, 1
-    mov edx, 100
-    syscall
-    add rsp, 16
+    ; This used to be a hand-rolled poll+read loop that pulled up to
+    ; 4 KB in one go, mixing events and the reply, then scanned 32-byte
+    ; boundaries for a byte 0 == 1 to find the reply. Two ways it broke,
+    ; and on 2026-09-02 it took the whole session down:
+    ;
+    ; - read(4096) does not respect message boundaries. Consuming the
+    ;   first 20 bytes of a 32-byte event leaves the stream permanently
+    ;   misaligned. Every later 32-byte read is garbage, and garbage
+    ;   parses as KeyPress keycode 0. The log filled with 4.86 million
+    ;   "kp=000 m=0x05" lines and tile never blocked again.
+    ; - The reply's children list is 4 bytes per window, not 32-byte
+    ;   messages, so the boundary scan could match a window id whose
+    ;   first byte is 0x01 and read num_children out of the middle of
+    ;   the list. That is the "QueryTree returned 0 children" line.
+    ;
+    ; Because Mod4+Shift+x grabs the keyboard, and the spinning tile
+    ; never saw the release, nothing typed anywhere until the session
+    ; was killed.
+    lea rdi, [qt_reply_buf]
+    call read_reply_or_queue
     test rax, rax
-    jle .aew_qt_drained                   ; timeout — work with what we have
+    jz .aew_done                          ; no reply within the deadline
+
+    ; Consume the tail: reply-length is in 4-byte units. Every byte of
+    ; it must leave the socket, even the part we have no room to keep,
+    ; or the next read starts mid-message.
+    mov r15d, [qt_reply_buf + 4]
+    shl r15d, 2                           ; bytes of tail still to read
+    lea r14, [qt_reply_buf + 32]
+    xor ebx, ebx                          ; bytes stored so far
+.aew_tail_loop:
+    test r15d, r15d
+    jz .aew_tail_done
+    mov edx, r15d
+    cmp edx, 1024
+    jle .aew_tail_chunk
+    mov edx, 1024
+.aew_tail_chunk:
+    mov rsi, r14
+    mov eax, ebx
+    add eax, edx
+    cmp eax, 1024*4
+    jle .aew_tail_dst
+    lea rsi, [qt_sink]                    ; past our cap: read and drop
+.aew_tail_dst:
     mov rax, SYS_READ
     mov rdi, [x11_fd]
-    mov rsi, r14
-    mov edx, 4096                         ; up to 4KB per call
     syscall
     test rax, rax
-    jle .aew_qt_drained
+    jle .aew_done                         ; EOF or error mid-tail
+    sub r15d, eax
+    cmp rsi, r14
+    jne .aew_tail_loop                    ; dropped chunk: nothing stored
     add r14, rax
     add ebx, eax
-    cmp ebx, 4128                         ; cap
-    jge .aew_qt_drained
-    jmp .aew_qt_drain
-.aew_qt_drained:
-
-    ; We have ebx bytes in qt_reply_buf. Find a Reply (byte 0 == 1)
-    ; aligned at a 32-byte boundary; that's our QueryTree response.
-    cmp ebx, 32
-    jl .aew_done                          ; not even one full message
-    xor ecx, ecx                          ; offset
-.aew_qt_find:
-    cmp ecx, ebx
-    jge .aew_done
-    cmp byte [qt_reply_buf + rcx], 1
-    je .aew_qt_found
-    add ecx, 32
-    jmp .aew_qt_find
-.aew_qt_found:
-    ; Found reply at offset rcx. Move it to start of qt_reply_buf so
-    ; offsets 16/32 are at fixed positions.
-    test ecx, ecx
-    jz .aew_qt_at_zero
-    ; Memmove qt_reply_buf+rcx → qt_reply_buf, length = ebx - rcx
-    mov edx, ebx
-    sub edx, ecx
-    lea rsi, [qt_reply_buf + rcx]
-    lea rdi, [qt_reply_buf]
-    push rcx
-    mov rcx, rdx
-    rep movsb
-    pop rcx
+    jmp .aew_tail_loop
+.aew_tail_done:
 .aew_qt_at_zero:
 
     ; num_children at bytes 16-17 (CARD16 LE) of the QueryTree reply.
@@ -2381,6 +2398,12 @@ grab_one_key:
     push r13
     mov r12d, edi              ; keycode
     mov r13d, esi              ; base modifiers
+    ; A bind whose keysym is not in the current keymap resolves to
+    ; keycode 0 (the XF86MonBrightness* lines do this on Geir's board).
+    ; Grabbing 0 asks the server to grab "no key", which is at best
+    ; wasted round-trips and at worst a grab nobody can release.
+    test r12d, r12d
+    jz .gok_done
     xor ebx, ebx               ; iterator: 0..3 over lock combinations
 .gok_loop:
     mov ecx, r13d
@@ -2412,6 +2435,7 @@ grab_one_key:
     inc ebx
     cmp ebx, 4
     jl .gok_loop
+.gok_done:
     pop r13
     pop r12
     pop rbx
@@ -3246,7 +3270,10 @@ event_loop:
     and edx, ~(MOD_LOCK | MOD_MOD2)      ; strip locks
     push rax
     push rdx
+    cmp byte [cfg_log_keys], 0            ; off unless TILE_LOG_KEYS=1
+    je .ekp_no_keylog
     call dbg_keypress
+.ekp_no_keylog:
     pop rdx
     pop rax
     call dispatch_keypress
