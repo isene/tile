@@ -630,6 +630,7 @@ bar_window_id:           resd 1
 ; jump there, Esc to close. Created lazily, reused. Zero cost when closed.
 overview_window_id:      resd 1
 overview_gc_id:          resd 1
+ov_win_h:                resw 1        ; overlay height: output_h minus strip + bar
 overview_active:         resb 1
 ov_kc:                   resb ov_grab_keys_n  ; nav keycodes, keysym-resolved per open (0 = unresolved)
     alignb 4
@@ -8321,6 +8322,32 @@ reload_runtime:
     inc ebx
     jmp .rr_border_loop
 .rr_border_done:
+    ; Re-fit the cached overview overlay to the (possibly changed) strip
+    ; band. A ConfigureWindow keeps its GC and RENDER picture valid.
+    mov eax, [overview_window_id]
+    test eax, eax
+    jz .rr_ov_keep
+    call ov_calc_geom                     ; eax = y, ov_win_h = h
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CONFIGURE_WINDOW
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 7
+    mov ecx, [overview_window_id]
+    mov [rdi+4], ecx
+    mov word [rdi+8], 0x000F              ; x, y, width, height
+    mov word [rdi+10], 0
+    movzx ecx, word [output_x]
+    mov [rdi+12], ecx
+    mov [rdi+16], eax
+    movzx ecx, word [output_w]
+    mov [rdi+20], ecx
+    movzx ecx, word [ov_win_h]
+    mov [rdi+24], ecx
+    lea rsi, [tmp_buf]
+    mov rdx, 28
+    call x11_buffer
+    inc dword [x11_seq]
+.rr_ov_keep:
     ; Re-apply layout for every output's currently visible workspace.
     ; Picks up changed gap_inner / strip_height / border_width on
     ; already-mapped windows. Skips outputs with no current ws.
@@ -12054,8 +12081,39 @@ ov_fill:
     pop r8
     ret
 
-; ensure_overview_window — create the full-screen override-redirect overlay
-; + its GC once, lazily. Uses the primary output's rect.
+; Overview popup layout constants (hyperlist tree).
+%define OV_LINE_H   22
+%define OV_BASE     16              ; text baseline within a line
+%define OV_CTOP     72              ; first row top (below title + help)
+%define OV_HDR_X    24              ; WS-header + title text x
+%define OV_CLI_BX   40              ; client colour-bullet x
+%define OV_CLI_X    60              ; client text x
+%define OV_BULLET   12
+
+; ov_calc_geom — eax = overlay y (output_y + strip + bar), and stores the
+; overlay height in ov_win_h (output_h minus that band, never less than
+; one visible row). The band is the one managed windows reserve, so the
+; status bar and the square row stay readable while the map is open
+; (v0.1.54). Clobbers ecx, edx.
+ov_calc_geom:
+    movzx ecx, word [bar_height]
+    movzx edx, word [cfg_strip_height]
+    add ecx, edx                          ; reserved band = strip + bar
+    movzx eax, word [output_h]
+    sub eax, ecx
+    cmp eax, OV_CTOP + 12 + OV_LINE_H
+    jge .ocg_ok
+    mov eax, OV_CTOP + 12 + OV_LINE_H
+.ocg_ok:
+    mov [ov_win_h], ax
+    movzx eax, word [output_y]
+    add eax, ecx
+    ret
+
+; ensure_overview_window — create the override-redirect overlay + its GC
+; once, lazily, at the geometry ov_calc_geom gives. reload_runtime
+; re-configures the cached window, so a changed strip_height lands on the
+; next open without rebuilding the RENDER pictures.
 ensure_overview_window:
     cmp dword [overview_window_id], 0
     jne .eow_done
@@ -12072,11 +12130,11 @@ ensure_overview_window:
     mov [rdi+8], ecx
     movzx eax, word [output_x]
     mov [rdi+12], ax
-    movzx eax, word [output_y]
+    call ov_calc_geom                     ; eax = y below the band, ov_win_h set
     mov [rdi+14], ax
     movzx eax, word [output_w]
     mov [rdi+16], ax
-    movzx eax, word [output_h]
+    movzx eax, word [ov_win_h]
     mov [rdi+18], ax
     mov word [rdi+20], 0                  ; border-width
     mov word [rdi+22], 1                  ; InputOutput
@@ -12109,15 +12167,6 @@ ensure_overview_window:
 .eow_done:
     ret
 
-; Overview popup layout constants (hyperlist tree).
-%define OV_LINE_H   22
-%define OV_BASE     16              ; text baseline within a line
-%define OV_CTOP     72              ; first row top (below title + help)
-%define OV_HDR_X    24              ; WS-header + title text x
-%define OV_CLI_BX   40              ; client colour-bullet x
-%define OV_CLI_X    60              ; client text x
-%define OV_BULLET   12
-
 ; draw_overview — repaint the hyperlist: a title, a help line, then one line
 ; per row (WS headers + indented client rows) with the selected row
 ; highlighted. Re-drawn on every nav key; the row model (ov_build_list) is
@@ -12134,7 +12183,7 @@ draw_overview:
     xor edi, edi
     xor esi, esi
     movzx edx, word [output_w]
-    movzx ecx, word [output_h]
+    movzx ecx, word [ov_win_h]
     call ov_fill
     ; --- title + help ---
     mov edi, OV_HDR_X
@@ -12162,7 +12211,7 @@ draw_overview:
     jmp .dov_flush
 .dov_rows:
     ; --- visible rows VIS = (H - CTOP - 12) / LINE_H → r15d ---
-    movzx eax, word [output_h]
+    movzx eax, word [ov_win_h]
     sub eax, OV_CTOP + 12
     xor edx, edx
     mov ecx, OV_LINE_H
