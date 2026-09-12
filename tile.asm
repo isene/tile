@@ -310,8 +310,11 @@ ov_ws_str:         db "WS ", 0
 ov_empty_str:      db "(no windows)", 0
 ov_nowin_str:      db "no windows open", 0
 kr_hdr_str:        db "KEYS", 0
-kr_help_str:       db "any key closes   live from chasm-keys", 0
-%define KR_HELP_LEN 37
+kr_help_desc:      db "type to search   Tab shows the commands   Esc closes   live from chasm-keys"
+kr_help_desc_len   equ $ - kr_help_desc
+kr_help_cmd:       db "type to search   Tab shows what they do   Esc closes   live from chasm-keys"
+kr_help_cmd_len    equ $ - kr_help_cmd
+kr_slash_str:      db "/ "
 kr_env_path:       db "/usr/bin/env", 0
 kr_arg_name:       db "chasm-keys", 0
 kr_arg_flag:       db "--popup", 0
@@ -658,8 +661,13 @@ kr_type:                 resb KR_MAX
 kr_grp:                  resb KR_MAX   ; group index → palette colour
 kr_p1:                   resq KR_MAX   ; header text / combo
 kr_l1:                   resd KR_MAX
-kr_p2:                   resq KR_MAX   ; action (R rows only)
+kr_p2:                   resq KR_MAX   ; command (R rows only)
 kr_l2:                   resd KR_MAX
+kr_p3:                   resq KR_MAX   ; description (R rows only, may be empty)
+kr_l3:                   resd KR_MAX
+kr_qlen:                 resd 1        ; search query length
+kr_query:                resb 64       ; search query, lower-cased ASCII
+kr_view:                 resb 1        ; 0 = descriptions (default), 1 = commands
 overview_active:         resb 1
 ov_kc:                   resb ov_grab_keys_n  ; nav keycodes, keysym-resolved per open (0 = unresolved)
     alignb 4
@@ -13313,11 +13321,131 @@ ov_render_init:
 ; Key reference popup (ACT_KEYS, v0.1.55). Same overlay window and text
 ; engine as the workspace map; the content is the live output of
 ; `chasm-keys --popup`, so a key changed in any rc file shows up on the
-; next open. Any key closes it.
+; next open. v0.1.56: typing filters (matching rows get a highlight bar,
+; the rest dim), Tab flips between what a key does and the command
+; behind it, Esc/Return or any Mod4/Ctrl/Alt chord closes. The popup
+; holds an active keyboard grab while open, so every key reaches it.
 ; ══════════════════════════════════════════════════════════════════════
 %define KR_COL_CHARS 74                ; column pitch in glyph advances
 %define KR_ACT_COL   26                ; action text starts at this column
 %define KR_LINE_H    18                ; tighter than the map: ~140 rows must fit
+
+; kr_find — rdx=ptr, ecx=len. eax=1 if kr_query (kr_qlen bytes, lower
+; case) occurs in the text, ASCII case-folded; else 0. Clobbers ecx, edx.
+kr_find:
+    push rbx
+    push rsi
+    push rdi
+    mov ebx, [kr_qlen]
+    cmp ecx, ebx
+    jb .kf_no
+    sub ecx, ebx
+    inc ecx                               ; start positions to try
+    mov rsi, rdx
+.kf_pos:
+    xor edi, edi
+.kf_cmp:
+    cmp edi, ebx
+    jae .kf_yes
+    movzx eax, byte [rsi + rdi]
+    cmp al, 'A'
+    jb .kf_folded
+    cmp al, 'Z'
+    ja .kf_folded
+    add al, 32
+.kf_folded:
+    cmp al, [kr_query + rdi]
+    jne .kf_next
+    inc edi
+    jmp .kf_cmp
+.kf_next:
+    inc rsi
+    dec ecx
+    jnz .kf_pos
+.kf_no:
+    xor eax, eax
+    jmp .kf_ret
+.kf_yes:
+    mov eax, 1
+.kf_ret:
+    pop rdi
+    pop rsi
+    pop rbx
+    ret
+
+; kr_match — rbx = record index. eax=1 if the query occurs in the combo,
+; the command or the description of that R row.
+kr_match:
+    mov rdx, [kr_p1 + rbx*8]
+    mov ecx, [kr_l1 + rbx*4]
+    call kr_find
+    test eax, eax
+    jnz .km_ret
+    mov rdx, [kr_p2 + rbx*8]
+    mov ecx, [kr_l2 + rbx*4]
+    call kr_find
+    test eax, eax
+    jnz .km_ret
+    mov rdx, [kr_p3 + rbx*8]
+    mov ecx, [kr_l3 + rbx*4]
+    call kr_find
+.km_ret:
+    ret
+
+; kr_row_text — rbx = record index. rdx/ecx = the text for the current
+; view: the description (the command when a row has none), or the
+; command when kr_view = 1.
+kr_row_text:
+    cmp byte [kr_view], 1
+    je .krt_cmd
+    mov ecx, [kr_l3 + rbx*4]
+    test ecx, ecx
+    jz .krt_cmd
+    mov rdx, [kr_p3 + rbx*8]
+    ret
+.krt_cmd:
+    mov rdx, [kr_p2 + rbx*8]
+    mov ecx, [kr_l2 + rbx*4]
+    ret
+
+; kr_grab_kbd — active keyboard grab on the overlay, so every key reaches
+; the popup while it is open (letters included; passive grabs would need
+; one request per key). The 32-byte reply is consumed here so it never
+; lands in the event loop. The workspace map keeps its passive nav grabs.
+kr_grab_kbd:
+    call x11_flush
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_GRAB_KEYBOARD
+    mov byte [rdi+1], 0                   ; owner-events = False
+    mov word [rdi+2], 4
+    mov eax, [overview_window_id]
+    mov [rdi+4], eax
+    mov dword [rdi+8], 0                  ; time = CurrentTime
+    mov byte [rdi+12], 1                  ; pointer-mode Async
+    mov byte [rdi+13], 1                  ; keyboard-mode Async
+    mov word [rdi+14], 0
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    syscall
+    inc dword [x11_seq]
+    lea rdi, [ov_prop_buf]
+    call read_reply_or_queue
+    ret
+
+; kr_ungrab_kbd — release the active grab (no reply).
+kr_ungrab_kbd:
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_UNGRAB_KEYBOARD
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov dword [rdi+4], 0                  ; time = CurrentTime
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    call x11_buffer
+    inc dword [x11_seq]
+    ret
 
 ; keyref_load — run `chasm-keys --popup` through a pipe and parse its
 ; tagged lines (H<tab>text, S<tab>text, R<tab>combo<tab>action, blank)
@@ -13419,6 +13547,8 @@ keyref_load:
     mov dword [kr_l1 + rbx*4], 0
     mov qword [kr_p2 + rbx*8], 0
     mov dword [kr_l2 + rbx*4], 0
+    mov qword [kr_p3 + rbx*8], 0
+    mov dword [kr_l3 + rbx*4], 0
     cmp rcx, 2
     jb .kl_rec_done                       ; blank spacer
     cmp byte [rsi + 1], 9                 ; tag + TAB?
@@ -13458,9 +13588,28 @@ keyref_load:
     mov [kr_l1 + rbx*4], ecx              ; combo length
     inc rax
     mov [kr_p2 + rbx*8], rax
+    mov rdx, rax                          ; command start
+.kl_r_tab2:                               ; second TAB splits command | description
+    cmp rax, rdi
+    jae .kl_r_nodesc
+    cmp byte [rax], 9
+    je .kl_r_desc
+    inc rax
+    jmp .kl_r_tab2
+.kl_r_desc:
+    mov rcx, rax
+    sub rcx, rdx
+    mov [kr_l2 + rbx*4], ecx              ; command length
+    inc rax
+    mov [kr_p3 + rbx*8], rax
     mov rcx, rdi
     sub rcx, rax
-    mov [kr_l2 + rbx*4], ecx              ; action length
+    mov [kr_l3 + rbx*4], ecx              ; description length
+    jmp .kl_rec_done
+.kl_r_nodesc:
+    mov rcx, rdi
+    sub rcx, rdx
+    mov [kr_l2 + rbx*4], ecx              ; command length, no description
     jmp .kl_rec_done
 .kl_r_notab:
     sub ecx, 2
@@ -13513,10 +13662,31 @@ draw_keyref:
     mov ecx, 4
     mov r8d, 0xFF6F88FF
     call ov_draw_str
+    ; search field: "/ " then the query and a cursor
+    mov edi, OV_HDR_X + 8 * GLYPH_ADVANCE
+    mov esi, OV_BASE + 8
+    lea rdx, [kr_slash_str]
+    mov ecx, 2
+    mov r8d, 0xFF6F88FF
+    call ov_draw_str
+    mov ecx, [kr_qlen]
+    mov byte [kr_query + rcx], '_'        ; cursor; qlen stays under 64
+    inc ecx
+    mov edi, OV_HDR_X + 10 * GLYPH_ADVANCE
+    mov esi, OV_BASE + 8
+    lea rdx, [kr_query]
+    mov r8d, 0xFFFFFFFF
+    call ov_draw_str
+    ; help line, worded for the current view
+    lea rdx, [kr_help_desc]
+    mov ecx, kr_help_desc_len
+    cmp byte [kr_view], 1
+    jne .dkr_help
+    lea rdx, [kr_help_cmd]
+    mov ecx, kr_help_cmd_len
+.dkr_help:
     mov edi, OV_HDR_X
     mov esi, OV_BASE + 8 + 22
-    lea rdx, [kr_help_str]
-    mov ecx, KR_HELP_LEN
     mov r8d, 0xFF707078
     call ov_draw_str
     ; rows per column, column pitch, capacity
@@ -13579,6 +13749,31 @@ draw_keyref:
     call ov_draw_str
     jmp .dkr_next
 .dkr_row:
+    mov r9d, 0xFFC0CAF5                   ; text: light
+    cmp dword [kr_qlen], 0
+    je .dkr_row_draw
+    call kr_match
+    test eax, eax
+    jz .dkr_row_dim
+    push r8                               ; match: highlight bar, white text
+    push r9
+    mov edi, 0xFF243448
+    call ov_set_fg
+    mov edi, r14d
+    sub edi, 4
+    mov esi, r15d
+    sub esi, OV_BASE
+    mov edx, KR_COL_CHARS * GLYPH_ADVANCE - 8
+    mov ecx, KR_LINE_H
+    call ov_fill
+    pop r9
+    pop r8
+    mov r9d, 0xFFFFFFFF
+    jmp .dkr_row_draw
+.dkr_row_dim:                             ; no match: both texts fade
+    mov r8d, 0xFF45464F
+    mov r9d, 0xFF45464F
+.dkr_row_draw:
     mov edi, r14d
     mov esi, r15d
     mov rdx, [kr_p1 + rbx*8]
@@ -13587,8 +13782,10 @@ draw_keyref:
     jbe .dkr_combo_len_ok
     mov ecx, KR_ACT_COL - 1
 .dkr_combo_len_ok:
+    push r9
     call ov_draw_str                      ; combo in the group colour
-    mov ecx, [kr_l2 + rbx*4]
+    pop r9
+    call kr_row_text                      ; rdx/ecx = description or command
     test ecx, ecx
     jz .dkr_next
     cmp ecx, KR_COL_CHARS - KR_ACT_COL - 2
@@ -13598,8 +13795,7 @@ draw_keyref:
     mov edi, r14d
     add edi, KR_ACT_COL * GLYPH_ADVANCE
     mov esi, r15d
-    mov rdx, [kr_p2 + rbx*8]
-    mov r8d, 0xFFC0CAF5                   ; action: light
+    mov r8d, r9d
     call ov_draw_str
 .dkr_next:
     inc ebx
@@ -13625,6 +13821,8 @@ toggle_keyref:
     call ensure_overview_window
     call ov_render_init
     call keyref_load
+    mov dword [kr_qlen], 0
+    mov byte [kr_view], 0                 ; descriptions first
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_MAP_WINDOW
     mov byte [rdi+1], 0
@@ -13635,9 +13833,7 @@ toggle_keyref:
     mov rdx, 8
     call x11_buffer
     inc dword [x11_seq]
-    call ov_resolve_keys
-    mov edi, 1
-    call ov_grab_keys
+    call kr_grab_kbd
     mov byte [overview_active], 1
     mov byte [ov_mode], 1
     call draw_keyref
@@ -13679,9 +13875,15 @@ close_overview:
     cmp byte [overview_active], 0
     je .co_done
     mov byte [overview_active], 0
-    mov byte [ov_mode], 0
+    cmp byte [ov_mode], 1
+    jne .co_nav
+    call kr_ungrab_kbd                    ; key reference: active grab
+    jmp .co_ungrabbed
+.co_nav:
     xor edi, edi
-    call ov_grab_keys
+    call ov_grab_keys                     ; workspace map: passive nav grabs
+.co_ungrabbed:
+    mov byte [ov_mode], 0
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_UNMAP_WINDOW
     mov byte [rdi+1], 0
@@ -13721,8 +13923,8 @@ close_overview:
 ; jump; Enter acts on the selected row (WS header → switch to that WS; client
 ; → make it the active tab AND switch); Escape closes. Caller swallows the key.
 overview_key:
-    cmp byte [ov_mode], 1                 ; key reference: any key closes it
-    je .ok_close
+    cmp byte [ov_mode], 1                 ; key reference: search + views
+    je .ok_keyref
     cmp dil, [ov_kc + 4]                  ; Escape
     je .ok_close
     mov eax, [ov_row_count]
@@ -13827,6 +14029,53 @@ overview_key:
 .ok_enter_ws:
     mov edi, edx
     call switch_workspace
+    ret
+.ok_keyref:
+    ; Key reference. The level-0 keysym of the keycode decides (so Shift
+    ; still types, lower-cased; the search is case-folded anyway). Any
+    ; Mod4/Ctrl/Alt chord closes, which keeps the toggle bind a toggle.
+    movzx eax, word [x11_read_buf + 28]  ; KeyPress state
+    test eax, MOD_MOD4 | MOD_CONTROL | MOD_MOD1
+    jnz .ok_close
+    movzx eax, dil
+    shl eax, 3
+    mov eax, [keysym_map + rax*4]
+    cmp eax, 0xFF1B                      ; Escape
+    je .ok_close
+    cmp eax, 0xFF0D                      ; Return
+    je .ok_close
+    cmp eax, 0xFF8D                      ; KP_Enter
+    je .ok_close
+    cmp eax, 0xFF09                      ; Tab: flip the view
+    je .ok_kr_tab
+    cmp eax, 0xFF08                      ; BackSpace: shorten the query
+    je .ok_kr_bs
+    cmp eax, 0x20
+    jb .ok_done
+    cmp eax, 0x7E
+    ja .ok_done                          ; not printable ASCII: ignore
+    mov ecx, [kr_qlen]
+    cmp ecx, 63
+    jae .ok_done
+    cmp al, 'A'
+    jb .ok_kr_put
+    cmp al, 'Z'
+    ja .ok_kr_put
+    add al, 32
+.ok_kr_put:
+    mov [kr_query + rcx], al
+    inc dword [kr_qlen]
+    call draw_keyref
+    ret
+.ok_kr_tab:
+    xor byte [kr_view], 1
+    call draw_keyref
+    ret
+.ok_kr_bs:
+    cmp dword [kr_qlen], 0
+    je .ok_done
+    dec dword [kr_qlen]
+    call draw_keyref
     ret
 .ok_close:
     call close_overview
