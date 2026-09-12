@@ -13392,6 +13392,35 @@ kr_match:
 .km_ret:
     ret
 
+; kr_block_len — rbx = index of an H or S record. eax = how many records
+; follow it before its block ends: a spacer, the next H, or (for an S)
+; the next S. Clobbers edx.
+kr_block_len:
+    push rbx
+    push rcx
+    movzx ecx, byte [kr_type + rbx]       ; 'H' or 'S'
+    xor eax, eax
+.kbl_loop:
+    inc ebx
+    cmp ebx, [kr_count]
+    jge .kbl_done
+    movzx edx, byte [kr_type + rbx]
+    test edx, edx
+    jz .kbl_done
+    cmp dl, 'H'
+    je .kbl_done
+    cmp dl, 'S'
+    jne .kbl_count
+    cmp cl, 'S'
+    je .kbl_done
+.kbl_count:
+    inc eax
+    jmp .kbl_loop
+.kbl_done:
+    pop rcx
+    pop rbx
+    ret
+
 ; kr_row_text — rbx = record index. rdx/ecx = the text for the current
 ; view: the description (the command when a row has none), or the
 ; command when kr_view = 1.
@@ -13715,26 +13744,58 @@ draw_keyref:
     jnz .dkr_cols_ok
     mov eax, 1
 .dkr_cols_ok:
-    imul eax, r12d
-    mov [rsp], eax                        ; records that fit
+    mov [rsp], eax                        ; columns that fit
+    mov dword [rsp+4], 0                  ; column cursor
+    mov dword [rsp+8], 0                  ; row cursor
     xor ebx, ebx
 .dkr_loop:
     cmp ebx, [kr_count]
     jge .dkr_done
-    cmp ebx, [rsp]
-    jge .dkr_done
-    mov eax, ebx
-    xor edx, edx
-    div r12d                              ; eax = column, edx = row
+    mov eax, [rsp+4]
+    cmp eax, [rsp]
+    jge .dkr_done                         ; out of columns
+    movzx eax, byte [kr_type + rbx]
+    test eax, eax
+    jnz .dkr_typed
+    cmp dword [rsp+8], 0                  ; spacer: nothing at the top of a
+    je .dkr_skip                          ; column, else one empty row
+    jmp .dkr_next
+.dkr_typed:
+    cmp al, 'R'
+    je .dkr_place
+    ; A header stays with the first lines of its block: the header plus
+    ; up to three records (H: sub-header + two rows; S: two rows). When
+    ; the column has fewer rows left, the header opens the next column.
+    call kr_block_len                     ; eax = records in the block
+    mov ecx, 2
+    cmp byte [kr_type + rbx], 'H'
+    jne .dkr_need_s
+    mov ecx, 3
+.dkr_need_s:
+    cmp eax, ecx
+    jbe .dkr_need_ok
+    mov eax, ecx
+.dkr_need_ok:
+    inc eax                               ; the header itself
+    mov ecx, r12d
+    sub ecx, [rsp+8]                      ; rows left in this column
+    cmp ecx, eax
+    jge .dkr_place
+    cmp dword [rsp+8], 0
+    je .dkr_place                         ; a fresh column cannot do better
+    inc dword [rsp+4]                     ; break the column before the header
+    mov dword [rsp+8], 0
+    jmp .dkr_loop
+.dkr_place:
+    mov eax, [rsp+4]
     imul eax, r13d
     add eax, OV_HDR_X
     mov r14d, eax                         ; x
+    mov edx, [rsp+8]
     imul edx, KR_LINE_H
     add edx, OV_CTOP + OV_BASE
     mov r15d, edx                         ; y baseline
     movzx eax, byte [kr_type + rbx]
-    test eax, eax
-    jz .dkr_next                          ; spacer
     movzx ecx, byte [kr_grp + rbx]
     and ecx, 3
     mov r8d, [kr_palette + rcx*4]         ; group colour
@@ -13804,6 +13865,13 @@ draw_keyref:
     mov r8d, r9d
     call ov_draw_str
 .dkr_next:
+    inc dword [rsp+8]                     ; next row, wrapping to a new column
+    mov eax, [rsp+8]
+    cmp eax, r12d
+    jl .dkr_skip
+    inc dword [rsp+4]
+    mov dword [rsp+8], 0
+.dkr_skip:
     inc ebx
     jmp .dkr_loop
 .dkr_done:
