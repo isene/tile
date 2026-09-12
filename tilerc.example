@@ -81,7 +81,7 @@ bind Mod4+Shift+Return  exec-here glass
 
 # === Window management ===
 bind Mod4+q             kill
-bind Mod4+e             overview      # navigable window map (j/k, Enter, Esc)
+bind Mod4+o             overview      # navigable window map (j/k, Enter, Esc)
 bind Mod4+Shift+plus    keys          # key reference popup, live from chasm-keys
 bind Mod4+Shift+q       exit
 
@@ -136,7 +136,7 @@ bind Mod4+d             spawn-split down  glass
 
 # === Stash (replaces i3's scratchpad) ===
 bind Mod4+i             stash
-bind Mod4+o             unstash
+bind Mod4+Shift+i       unstash       # pops the most recently stashed (LIFO)
 
 # === Lock screen ===
 bind Mod4+Escape        exec i3lock -c 000000
