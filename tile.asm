@@ -13617,7 +13617,13 @@ keyref_load:
 .kl_rec_done:
     mov eax, [kr_cur_grp]
     mov [kr_grp + rbx], al
-    inc ebx
+    test ebx, ebx
+    jnz .kl_rec_keep
+    cmp byte [kr_type + rbx], 0
+    je .kl_rec_skip                       ; a spacer before the first record:
+.kl_rec_keep:                             ; drop it so column 1 starts level
+    inc ebx                               ; with the others
+.kl_rec_skip:
     lea rsi, [rdi + 1]                    ; past the newline
     jmp .kl_line
 .kl_parse_done:
