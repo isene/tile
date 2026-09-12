@@ -23,6 +23,8 @@
 %define SYS_EXECVE      59
 %define SYS_EXIT        60
 %define SYS_WAIT4       61
+%define SYS_PIPE        22
+%define SYS_DUP2        33
 %define SYS_RT_SIGACTION    13
 %define SYS_RT_SIGRETURN    15
 %define SYS_RT_SIGPROCMASK  14
@@ -191,6 +193,7 @@
 %define ACT_RESTART     15
 %define ACT_GATHER      16
 %define ACT_OVERVIEW    17
+%define ACT_KEYS        18             ; key reference popup (chasm-keys)
 
 %define MAX_STASH       8
 
@@ -306,6 +309,14 @@ ov_help_str:       db "j/k move   Enter go   Esc close", 0
 ov_ws_str:         db "WS ", 0
 ov_empty_str:      db "(no windows)", 0
 ov_nowin_str:      db "no windows open", 0
+kr_hdr_str:        db "KEYS", 0
+kr_help_str:       db "any key closes   live from chasm-keys", 0
+%define KR_HELP_LEN 37
+kr_env_path:       db "/usr/bin/env", 0
+kr_arg_name:       db "chasm-keys", 0
+kr_arg_flag:       db "--popup", 0
+kr_argv:           dq kr_env_path, kr_arg_name, kr_arg_flag, 0
+kr_palette:        dd 0xFF9ECE6A, 0xFFE0AF68, 0xFF7AA2F7, 0xFFBB9AF7   ; per group header
 ; Keysyms the overview popup passively grabs while open: Up Down Return
 ; KP_Enter Escape j k PgUp PgDn Home End. Resolved against the server keymap
 ; on every open (ov_resolve_keys), so xmodmap/framerc remaps (e.g. Escape on
@@ -510,6 +521,8 @@ action_table:
     db ACT_GATHER, 0
     db "overview", 0
     db ACT_OVERVIEW, 0
+    db "keys", 0
+    db ACT_KEYS, 0
     db 0                       ; terminator
 
 ; layout arg keyword table: `layout tabbed | split-h | split-v | toggle`.
@@ -631,6 +644,22 @@ bar_window_id:           resd 1
 overview_window_id:      resd 1
 overview_gc_id:          resd 1
 ov_win_h:                resw 1        ; overlay height: output_h minus strip + bar
+ov_mode:                 resb 1        ; overlay content: 0 workspace map, 1 key reference
+; Key reference (ACT_KEYS): `chasm-keys --popup` output, parsed into
+; tagged records. H = group header, S = sub-header, R = combo + action,
+; 0 = blank spacer. Filled on every open, so it never drifts from the
+; live rc files.
+%define KR_BUF_MAX  32768
+%define KR_MAX      512
+kr_buf:                  resb KR_BUF_MAX
+kr_count:                resd 1
+kr_cur_grp:              resd 1
+kr_type:                 resb KR_MAX
+kr_grp:                  resb KR_MAX   ; group index → palette colour
+kr_p1:                   resq KR_MAX   ; header text / combo
+kr_l1:                   resd KR_MAX
+kr_p2:                   resq KR_MAX   ; action (R rows only)
+kr_l2:                   resd KR_MAX
 overview_active:         resb 1
 ov_kc:                   resb ov_grab_keys_n  ; nav keycodes, keysym-resolved per open (0 = unresolved)
     alignb 4
@@ -7491,9 +7520,14 @@ dispatch_keypress:
     je .dk_gather
     cmp eax, ACT_OVERVIEW
     je .dk_overview
+    cmp eax, ACT_KEYS
+    je .dk_keys
     jmp .dk_done
 .dk_overview:
     call open_overview
+    jmp .dk_done
+.dk_keys:
+    call toggle_keyref
     jmp .dk_done
 .dk_exec:
     test edx, edx
@@ -13275,6 +13309,340 @@ ov_render_init:
 .ori_ret:
     ret
 
+; ══════════════════════════════════════════════════════════════════════
+; Key reference popup (ACT_KEYS, v0.1.55). Same overlay window and text
+; engine as the workspace map; the content is the live output of
+; `chasm-keys --popup`, so a key changed in any rc file shows up on the
+; next open. Any key closes it.
+; ══════════════════════════════════════════════════════════════════════
+%define KR_COL_CHARS 74                ; column pitch in glyph advances
+%define KR_ACT_COL   26                ; action text starts at this column
+%define KR_LINE_H    18                ; tighter than the map: ~140 rows must fit
+
+; keyref_load — run `chasm-keys --popup` through a pipe and parse its
+; tagged lines (H<tab>text, S<tab>text, R<tab>combo<tab>action, blank)
+; into the kr_* arrays. kr_count = 0 on any failure. One fork per open.
+keyref_load:
+    push rbx
+    push r12
+    push r13
+    mov dword [kr_count], 0
+    mov dword [kr_cur_grp], -1
+    sub rsp, 16
+    mov rax, SYS_PIPE
+    mov rdi, rsp
+    syscall
+    test rax, rax
+    js .kl_fail_sp
+    mov ebx, [rsp]                        ; read end
+    mov r12d, [rsp + 4]                   ; write end
+    add rsp, 16
+    mov rax, SYS_FORK
+    syscall
+    test rax, rax
+    js .kl_fail_fds
+    jnz .kl_parent
+    ; child: stdout → pipe, then env's PATH lookup finds chasm-keys
+    mov rax, SYS_DUP2
+    mov edi, r12d
+    mov esi, 1
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, ebx
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, r12d
+    syscall
+    mov rax, SYS_EXECVE
+    lea rdi, [kr_env_path]
+    lea rsi, [kr_argv]
+    mov rdx, [envp]
+    syscall
+    mov rax, SYS_EXIT
+    mov edi, 127
+    syscall
+.kl_parent:
+    mov r13, rax                          ; child pid
+    mov rax, SYS_CLOSE
+    mov edi, r12d
+    syscall
+    xor r12d, r12d                        ; bytes read so far
+.kl_read:
+    cmp r12d, KR_BUF_MAX
+    jge .kl_read_done
+    mov rax, SYS_READ
+    mov edi, ebx
+    lea rsi, [kr_buf + r12]
+    mov edx, KR_BUF_MAX
+    sub edx, r12d
+    syscall
+    cmp rax, -4                           ; EINTR: try again
+    je .kl_read
+    test rax, rax
+    jle .kl_read_done
+    add r12d, eax
+    jmp .kl_read
+.kl_read_done:
+    mov rax, SYS_CLOSE
+    mov edi, ebx
+    syscall
+    sub rsp, 16
+    mov rax, SYS_WAIT4
+    mov rdi, r13
+    mov rsi, rsp
+    xor edx, edx
+    xor r10d, r10d
+    syscall
+    add rsp, 16
+    ; --- parse r12d bytes at kr_buf into records ---
+    lea rsi, [kr_buf]                     ; line start
+    lea r13, [kr_buf + r12]               ; end of data
+    xor ebx, ebx                          ; record index
+.kl_line:
+    cmp rsi, r13
+    jae .kl_parse_done
+    cmp ebx, KR_MAX
+    jge .kl_parse_done
+    mov rdi, rsi
+.kl_eol:
+    cmp rdi, r13
+    jae .kl_eol_found
+    cmp byte [rdi], 10
+    je .kl_eol_found
+    inc rdi
+    jmp .kl_eol
+.kl_eol_found:
+    mov rcx, rdi
+    sub rcx, rsi                          ; line length
+    mov byte [kr_type + rbx], 0
+    mov qword [kr_p1 + rbx*8], 0
+    mov dword [kr_l1 + rbx*4], 0
+    mov qword [kr_p2 + rbx*8], 0
+    mov dword [kr_l2 + rbx*4], 0
+    cmp rcx, 2
+    jb .kl_rec_done                       ; blank spacer
+    cmp byte [rsi + 1], 9                 ; tag + TAB?
+    jne .kl_rec_done                      ; untagged → spacer
+    movzx eax, byte [rsi]
+    cmp al, 'H'
+    je .kl_tag_h
+    cmp al, 'S'
+    je .kl_tag_s
+    cmp al, 'R'
+    je .kl_tag_r
+    jmp .kl_rec_done
+.kl_tag_h:
+    inc dword [kr_cur_grp]                ; new group → next palette colour
+.kl_tag_s:
+    mov [kr_type + rbx], al
+    lea rdx, [rsi + 2]
+    mov [kr_p1 + rbx*8], rdx
+    sub ecx, 2
+    mov [kr_l1 + rbx*4], ecx
+    jmp .kl_rec_done
+.kl_tag_r:
+    mov [kr_type + rbx], al
+    lea rdx, [rsi + 2]
+    mov [kr_p1 + rbx*8], rdx
+    mov rax, rdx
+.kl_r_tab:
+    cmp rax, rdi
+    jae .kl_r_notab
+    cmp byte [rax], 9
+    je .kl_r_tab_found
+    inc rax
+    jmp .kl_r_tab
+.kl_r_tab_found:
+    mov rcx, rax
+    sub rcx, rdx
+    mov [kr_l1 + rbx*4], ecx              ; combo length
+    inc rax
+    mov [kr_p2 + rbx*8], rax
+    mov rcx, rdi
+    sub rcx, rax
+    mov [kr_l2 + rbx*4], ecx              ; action length
+    jmp .kl_rec_done
+.kl_r_notab:
+    sub ecx, 2
+    mov [kr_l1 + rbx*4], ecx
+.kl_rec_done:
+    mov eax, [kr_cur_grp]
+    mov [kr_grp + rbx], al
+    inc ebx
+    lea rsi, [rdi + 1]                    ; past the newline
+    jmp .kl_line
+.kl_parse_done:
+    mov [kr_count], ebx
+    jmp .kl_ret
+.kl_fail_fds:
+    mov rax, SYS_CLOSE
+    mov edi, ebx
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, r12d
+    syscall
+    jmp .kl_ret
+.kl_fail_sp:
+    add rsp, 16
+.kl_ret:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; draw_keyref — paint the key reference: title, help, then the records
+; flowed top-down into as many columns as fit. Group headers and combos
+; take the group's palette colour, sub-headers are dimmed, actions light.
+draw_keyref:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 16
+    mov edi, 0xFF101014
+    call ov_set_fg
+    xor edi, edi
+    xor esi, esi
+    movzx edx, word [output_w]
+    movzx ecx, word [ov_win_h]
+    call ov_fill
+    mov edi, OV_HDR_X
+    mov esi, OV_BASE + 8
+    lea rdx, [kr_hdr_str]
+    mov ecx, 4
+    mov r8d, 0xFF6F88FF
+    call ov_draw_str
+    mov edi, OV_HDR_X
+    mov esi, OV_BASE + 8 + 22
+    lea rdx, [kr_help_str]
+    mov ecx, KR_HELP_LEN
+    mov r8d, 0xFF707078
+    call ov_draw_str
+    ; rows per column, column pitch, capacity
+    movzx eax, word [ov_win_h]
+    sub eax, OV_CTOP + 12
+    xor edx, edx
+    mov ecx, KR_LINE_H
+    div ecx
+    test eax, eax
+    jnz .dkr_rows_ok
+    mov eax, 1
+.dkr_rows_ok:
+    mov r12d, eax                         ; rows per column
+    mov r13d, KR_COL_CHARS * GLYPH_ADVANCE
+    movzx eax, word [output_w]
+    sub eax, OV_HDR_X * 2
+    xor edx, edx
+    div r13d
+    test eax, eax
+    jnz .dkr_cols_ok
+    mov eax, 1
+.dkr_cols_ok:
+    imul eax, r12d
+    mov [rsp], eax                        ; records that fit
+    xor ebx, ebx
+.dkr_loop:
+    cmp ebx, [kr_count]
+    jge .dkr_done
+    cmp ebx, [rsp]
+    jge .dkr_done
+    mov eax, ebx
+    xor edx, edx
+    div r12d                              ; eax = column, edx = row
+    imul eax, r13d
+    add eax, OV_HDR_X
+    mov r14d, eax                         ; x
+    imul edx, KR_LINE_H
+    add edx, OV_CTOP + OV_BASE
+    mov r15d, edx                         ; y baseline
+    movzx eax, byte [kr_type + rbx]
+    test eax, eax
+    jz .dkr_next                          ; spacer
+    movzx ecx, byte [kr_grp + rbx]
+    and ecx, 3
+    mov r8d, [kr_palette + rcx*4]         ; group colour
+    cmp al, 'R'
+    je .dkr_row
+    cmp al, 'S'
+    jne .dkr_text
+    mov r8d, 0xFF7A7F9A                   ; sub-header: dim
+.dkr_text:
+    mov edi, r14d
+    mov esi, r15d
+    mov rdx, [kr_p1 + rbx*8]
+    mov ecx, [kr_l1 + rbx*4]
+    cmp ecx, KR_COL_CHARS - 2             ; stay inside the column
+    jbe .dkr_text_len_ok
+    mov ecx, KR_COL_CHARS - 2
+.dkr_text_len_ok:
+    call ov_draw_str
+    jmp .dkr_next
+.dkr_row:
+    mov edi, r14d
+    mov esi, r15d
+    mov rdx, [kr_p1 + rbx*8]
+    mov ecx, [kr_l1 + rbx*4]
+    cmp ecx, KR_ACT_COL - 1
+    jbe .dkr_combo_len_ok
+    mov ecx, KR_ACT_COL - 1
+.dkr_combo_len_ok:
+    call ov_draw_str                      ; combo in the group colour
+    mov ecx, [kr_l2 + rbx*4]
+    test ecx, ecx
+    jz .dkr_next
+    cmp ecx, KR_COL_CHARS - KR_ACT_COL - 2
+    jbe .dkr_act_len_ok
+    mov ecx, KR_COL_CHARS - KR_ACT_COL - 2   ; cut, never spill over
+.dkr_act_len_ok:
+    mov edi, r14d
+    add edi, KR_ACT_COL * GLYPH_ADVANCE
+    mov esi, r15d
+    mov rdx, [kr_p2 + rbx*8]
+    mov r8d, 0xFFC0CAF5                   ; action: light
+    call ov_draw_str
+.dkr_next:
+    inc ebx
+    jmp .dkr_loop
+.dkr_done:
+    call x11_flush
+    add rsp, 16
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; toggle_keyref — ACT_KEYS. Close the overlay if it is up (either mode),
+; else load the key list, map the overlay, grab the nav keys and draw.
+toggle_keyref:
+    cmp byte [overview_active], 0
+    je .tk_open
+    call close_overview
+    ret
+.tk_open:
+    call ensure_overview_window
+    call ov_render_init
+    call keyref_load
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_MAP_WINDOW
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 2
+    mov eax, [overview_window_id]
+    mov [rdi+4], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    call x11_buffer
+    inc dword [x11_seq]
+    call ov_resolve_keys
+    mov edi, 1
+    call ov_grab_keys
+    mov byte [overview_active], 1
+    mov byte [ov_mode], 1
+    call draw_keyref
+    ret
+
 ; open_overview — ACT_OVERVIEW. Build the list, init the text engine, map the
 ; overlay, passive-grab the nav keys, draw.
 open_overview:
@@ -13311,6 +13679,7 @@ close_overview:
     cmp byte [overview_active], 0
     je .co_done
     mov byte [overview_active], 0
+    mov byte [ov_mode], 0
     xor edi, edi
     call ov_grab_keys
     lea rdi, [tmp_buf]
@@ -13352,6 +13721,8 @@ close_overview:
 ; jump; Enter acts on the selected row (WS header → switch to that WS; client
 ; → make it the active tab AND switch); Escape closes. Caller swallows the key.
 overview_key:
+    cmp byte [ov_mode], 1                 ; key reference: any key closes it
+    je .ok_close
     cmp dil, [ov_kc + 4]                  ; Escape
     je .ok_close
     mov eax, [ov_row_count]
