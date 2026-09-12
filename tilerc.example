@@ -81,6 +81,8 @@ bind Mod4+Shift+Return  exec-here glass
 
 # === Window management ===
 bind Mod4+q             kill
+bind Mod4+e             overview      # navigable window map (j/k, Enter, Esc)
+bind Mod4+Shift+plus    keys          # key reference popup, live from chasm-keys
 bind Mod4+Shift+q       exit
 
 # === Tabs (within a workspace) ===

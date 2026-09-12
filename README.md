@@ -2,7 +2,7 @@
 
 <img src="img/tile.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.54-blue)
+![Version](https://img.shields.io/badge/version-0.1.55-blue)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
 ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue)
@@ -139,7 +139,7 @@ statements: `bind <chord> <action> [arg]`, `exec <cmdline>`,
 Modifiers: `Shift`, `Ctrl`/`Control`, `Alt`/`Mod1`, `Mod4`/`Win`/`Super`.
 Actions: `exec`, `exec-here`, `kill`, `exit`, `workspace`, `move-to`,
 `focus`, `move-tab`, `stash`, `unstash`, `layout`,
-`spawn-split`, `reload`, `restart`, `overview`.
+`spawn-split`, `reload`, `restart`, `overview`, `keys`.
 
 The `overview` action opens a navigable **HyperList of every window**,
 grouped by workspace:
@@ -164,9 +164,19 @@ current workspace.
 
 Text is drawn with an embedded A8 glyph atlas via the X RENDER extension
 (the same path `strip` uses), so tile needs no font server. The whole
-engine is cold until the overview is first opened — nothing is captured
+engine is cold until the overview is first opened; nothing is captured
 or polled when it's closed. Bind it with e.g. `bind Mod4+e
 overview`.
+
+The `keys` action opens a **key reference** on the same overlay: every
+key combo the CHasm suite owns, in columns, one colour per group (tile,
+frame, glass). The content is the live output of
+[`chasm-keys --popup`](https://github.com/isene/chasm/blob/master/chasm-keys),
+which reads the three rc files on every open.
+
+A rebound key therefore shows up the next time you look. Any key closes
+it. Bind it with e.g. `bind Mod4+Shift+plus keys` (on a Norwegian layout
+that is Mod4+?). Both popups leave the strip and the square row visible.
 
 ## Packages
 
