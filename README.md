@@ -2,7 +2,7 @@
 
 <img src="img/tile.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.55-blue)
+![Version](https://img.shields.io/badge/version-0.1.56-blue)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
 ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue)
@@ -174,9 +174,11 @@ frame, glass). The content is the live output of
 [`chasm-keys --popup`](https://github.com/isene/chasm/blob/master/chasm-keys),
 which reads the three rc files on every open.
 
-A rebound key therefore shows up the next time you look. Any key closes
-it. Bind it with e.g. `bind Mod4+Shift+plus keys` (on a Norwegian layout
-that is Mod4+?). Both popups leave the strip and the square row visible.
+A rebound key therefore shows up the next time you look. Type to search:
+rows that match light up, the rest fade. `Tab` flips between what a key
+does (the default) and the command behind it. `Esc` closes. Bind it with
+e.g. `bind Mod4+Shift+plus keys` (on a Norwegian layout that is Mod4+?).
+Both popups leave the strip and the square row visible.
 
 ## Packages
 
