@@ -2,7 +2,7 @@
 
 <img src="img/tile.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.58-blue)
+![Version](https://img.shields.io/badge/version-0.1.59-blue)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
 ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue)
@@ -131,6 +131,9 @@ DISPLAY=:9 glass                        # or: DISPLAY=:9 xterm
   without losing any X clients (X owns the windows, WM just
   reconnects).
 - WM-initiated unmaps don't get treated as window-closed
+- **Pager requests**: a `_NET_ACTIVE_WINDOW` ClientMessage raises that
+  window's tab, a `_NET_CURRENT_DESKTOP` one (`wmctrl -s N`, 0-based)
+  switches workspace, so other programs never have to fake Mod4+N
 - `~/.tilerc` and `~/.striprc` config parsers (reload via SIGUSR1)
 
 See `tilerc.example` for the full config syntax. Recognised

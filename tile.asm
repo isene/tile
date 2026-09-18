@@ -2714,8 +2714,24 @@ event_loop:
     ; records it otherwise. The visible workspace and the input focus
     ; never change, so driving the external monitor cannot yank the
     ; screen being typed on. ClientMessage layout: window at +4,
-    ; message_type atom at +8.
+    ; message_type atom at +8, data.l[0] at +12.
     mov eax, [x11_read_buf + 8]
+    cmp eax, [net_current_desktop_atom]
+    jne .ev_cm_active
+    ; _NET_CURRENT_DESKTOP to the root (EWMH pager request: fleet, wmctrl
+    ; -s): data.l[0] is the 0-based desktop, so 9 is workspace 10. Faking
+    ; Mod4+N through XTEST merged with keys the user held (a held Shift
+    ; made it move-to N); this is the honest way in (v0.1.59).
+    mov ecx, [x11_read_buf + 4]
+    cmp ecx, [x11_root_window]
+    jne event_loop
+    mov eax, [x11_read_buf + 12]
+    cmp eax, WS_COUNT
+    jae event_loop                        ; out of range, negative included
+    lea edi, [rax + 1]
+    call switch_workspace
+    jmp event_loop
+.ev_cm_active:
     cmp eax, [net_active_window_atom]
     jne event_loop
     mov eax, [x11_read_buf + 4]
