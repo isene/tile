@@ -194,6 +194,7 @@
 %define ACT_GATHER      16
 %define ACT_OVERVIEW    17
 %define ACT_KEYS        18             ; key reference popup (chasm-keys)
+%define ACT_FULLSCREEN  19             ; focused window owns the whole output
 
 %define MAX_STASH       8
 
@@ -526,6 +527,8 @@ action_table:
     db ACT_OVERVIEW, 0
     db "keys", 0
     db ACT_KEYS, 0
+    db "fullscreen", 0
+    db ACT_FULLSCREEN, 0
     db 0                       ; terminator
 
 ; layout arg keyword table: `layout tabbed | split-h | split-v | toggle`.
@@ -950,6 +953,10 @@ output_current_ws:       resb MAX_OUTPUTS
 ; Per-workspace layout (LAYOUT_TABBED / LAYOUT_SPLIT_H / LAYOUT_SPLIT_V).
 ; Default 0 = TABBED.
 ws_layout:               resb WS_COUNT
+; Fullscreen window per workspace (XID, 0 = none). The window covers its
+; whole output, strip included, and keeps no border. Cleared when that
+; window closes.
+ws_fullscreen:           resd WS_COUNT
 
 ; Stash: a small LIFO of "hidden" client XIDs. `stash` unmaps the
 ; currently focused tab and pushes its XID; `unstash` pops and
@@ -7233,6 +7240,17 @@ client_closed:
     jne .cc_no_focus_clear
     mov dword [focused_xid], 0   ; X has already moved focus away
 .cc_no_focus_clear:
+    xor eax, eax                 ; a fullscreen window that dies leaves
+.cc_fs_loop:                     ; its workspace fullscreen forever
+    cmp eax, WS_COUNT
+    jge .cc_fs_done
+    cmp [ws_fullscreen + rax*4], r12d
+    jne .cc_fs_next
+    mov dword [ws_fullscreen + rax*4], 0
+.cc_fs_next:
+    inc eax
+    jmp .cc_fs_loop
+.cc_fs_done:
     mov eax, r12d
     call untrack_client
     xor ebx, ebx                 ; ws index 0..9
@@ -7546,6 +7564,11 @@ dispatch_keypress:
     je .dk_overview
     cmp eax, ACT_KEYS
     je .dk_keys
+    cmp eax, ACT_FULLSCREEN
+    je .dk_fullscreen
+    jmp .dk_done
+.dk_fullscreen:
+    call action_fullscreen
     jmp .dk_done
 .dk_overview:
     call open_overview
@@ -8996,6 +9019,61 @@ passthrough_configure_request:
 ; layout: configures and maps every client that should be visible,
 ; unmaps any that shouldn't. No-op if the workspace isn't currently
 ; on any output. Safe to call repeatedly.
+; ----------------------------------------------------------------------------
+; configure_fullscreen — rdi = XID, esi = x, edx = y, ecx = w, r8d = h.
+; One ConfigureWindow carrying geometry, a zero border and StackMode
+; Above, so the window covers the whole output and sits over the strip.
+; ----------------------------------------------------------------------------
+configure_fullscreen:
+    push rbx
+    mov ebx, edi
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CONFIGURE_WINDOW
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 9                   ; 3 header + 6 values
+    mov [rdi+4], ebx
+    mov word [rdi+8], CFG_X | CFG_Y | CFG_WIDTH | CFG_HEIGHT | CFG_BORDER | CFG_STACK
+    mov word [rdi+10], 0
+    mov [rdi+12], esi                     ; x
+    mov [rdi+16], edx                     ; y
+    mov [rdi+20], ecx                     ; width
+    mov [rdi+24], r8d                     ; height
+    mov dword [rdi+28], 0                 ; border width
+    mov dword [rdi+32], 0                 ; stack-mode = Above
+    lea rsi, [tmp_buf]
+    mov rdx, 36
+    call x11_buffer
+    inc dword [x11_seq]
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; action_fullscreen — toggle the focused window between filling its
+; output and the workspace's normal layout.
+; ----------------------------------------------------------------------------
+action_fullscreen:
+    movzx ecx, byte [current_ws]
+    test ecx, ecx
+    jz .af_done
+    dec ecx
+    mov eax, [ws_fullscreen + rcx*4]
+    test eax, eax
+    jz .af_enter
+    mov dword [ws_fullscreen + rcx*4], 0  ; leave
+    jmp .af_apply
+.af_enter:
+    mov eax, [focused_xid]
+    test eax, eax
+    jz .af_done
+    mov [ws_fullscreen + rcx*4], eax
+.af_apply:
+    movzx eax, byte [current_ws]
+    call apply_workspace_layout
+    call render_bar
+    call x11_flush
+.af_done:
+    ret
+
 apply_workspace_layout:
     push rbx
     push r12
@@ -9026,6 +9104,23 @@ apply_workspace_layout:
     movzx edx, word [output_y + r14*2]    ; ax_y
     movzx ecx, word [output_w + r14*2]    ; ax_w
     movzx r12d, word [output_h + r14*2]   ; ax_h
+    ; Fullscreen first: the rect in hand is the whole output, before the
+    ; strip reservation and the gaps, which is exactly what a fullscreen
+    ; window wants. One ConfigureWindow sizes it, drops its border and
+    ; raises it over the strip; the others stay mapped underneath.
+    mov eax, r13d
+    dec eax
+    mov r15d, [ws_fullscreen + rax*4]
+    test r15d, r15d
+    jz .awl_no_fullscreen
+    mov edi, r15d
+    mov r8d, r12d
+    call configure_fullscreen
+    mov eax, r15d
+    call send_map_window
+    call x11_flush
+    jmp .awl_done
+.awl_no_fullscreen:
     test r14d, r14d
     jnz .awl_no_bar
     movzx eax, word [bar_height]

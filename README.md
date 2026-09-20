@@ -2,7 +2,7 @@
 
 <img src="img/tile.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.59-blue)
+![Version](https://img.shields.io/badge/version-0.1.60-blue)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
 ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue)
@@ -142,7 +142,12 @@ statements: `bind <chord> <action> [arg]`, `exec <cmdline>`,
 Modifiers: `Shift`, `Ctrl`/`Control`, `Alt`/`Mod1`, `Mod4`/`Win`/`Super`.
 Actions: `exec`, `exec-here`, `kill`, `exit`, `workspace`, `move-to`,
 `focus`, `move-tab`, `stash`, `unstash`, `layout`,
-`spawn-split`, `reload`, `restart`, `overview`, `keys`.
+`spawn-split`, `reload`, `restart`, `overview`, `keys`, `fullscreen`.
+
+The `fullscreen` action gives the focused window the whole output, strip
+included, with no border, and raises it. Pressing it again restores the
+workspace layout. One window per workspace can be fullscreen, and the
+state clears by itself when that window closes.
 
 The `overview` action opens a navigable **HyperList of every window**,
 grouped by workspace:
