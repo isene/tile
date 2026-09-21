@@ -275,6 +275,12 @@ err_redirect_len equ $ - err_redirect
 
 env_display:     db "DISPLAY=", 0  ; placeholder; tile inherits envp directly
 naflag_str:      db "--no-autostart", 0    ; argv flag set by action_restart
+verflag_str:     db "--version", 0
+tile_ver_str:    db "tile 0.1.62", 10
+tile_ver_len     equ $ - tile_ver_str
+tile_usage_str:  db "usage: tile [--no-autostart] [--version] [--help]", 10
+                 db "tile is a window manager: with no flags it takes over $DISPLAY.", 10
+tile_usage_len   equ $ - tile_usage_str
 
 ; ICCCM atoms we intern at startup so we can speak the WM_DELETE_WINDOW
 ; protocol — gives apps a chance to save state before closing rather
@@ -1157,6 +1163,26 @@ section .text
     %%mark_data: db %1, 10
     %%mark_done:
 %endmacro
+; ----------------------------------------------------------------------------
+; argstr_eq — rdi = argument, rsi = NUL-terminated literal. ZF=1 if equal.
+; Clobbers rax, rdi, rsi.
+; ----------------------------------------------------------------------------
+argstr_eq:
+    mov al, [rsi]
+    cmp al, [rdi]
+    jne .ase_ne
+    test al, al
+    jz .ase_eq
+    inc rdi
+    inc rsi
+    jmp argstr_eq
+.ase_eq:
+    xor eax, eax
+    ret
+.ase_ne:
+    or eax, 1
+    ret
+
 global _start
 
 _start:
@@ -1168,6 +1194,51 @@ _start:
     lea rax, [rdi + 1]
     lea rcx, [rsi + rax*8]
     mov [envp], rcx
+
+    ; --version, --help and any unknown --flag print and EXIT, before a
+    ; lock file, a log or an X connection exists. `tile --version` used to
+    ; take over $DISPLAY and never return, so asking three binaries for
+    ; their versions in one line put a second window manager on Geir's
+    ; live session. frame had the same trap until its v0.1.11.
+    push rdi
+    push rsi
+    mov r13, rsi
+    add r13, 8                               ; argv[1]
+.start_flag_loop:
+    mov r15, [r13]
+    test r15, r15
+    jz .start_flags_ok
+    cmp byte [r15], '-'
+    jne .start_flag_next
+    cmp byte [r15 + 1], '-'
+    jne .start_flag_next
+    mov rdi, r15
+    lea rsi, [rel naflag_str]
+    call argstr_eq
+    je .start_flag_next                      ; the one flag tile accepts
+    mov rdi, r15
+    lea rsi, [rel verflag_str]
+    call argstr_eq
+    je .start_flag_version
+    lea rsi, [rel tile_usage_str]            ; --help, or anything unknown
+    mov edx, tile_usage_len
+    jmp .start_flag_say
+.start_flag_version:
+    lea rsi, [rel tile_ver_str]
+    mov edx, tile_ver_len
+.start_flag_say:
+    mov edi, 1
+    mov eax, SYS_WRITE
+    syscall
+    xor edi, edi
+    mov eax, SYS_EXIT
+    syscall
+.start_flag_next:
+    add r13, 8
+    jmp .start_flag_loop
+.start_flags_ok:
+    pop rsi
+    pop rdi
     ; TILE_LOG_KEYS=1 turns the per-KeyPress log back on. It used to be
     ; unconditional; when the adopt desync made tile spin on garbage
     ; keycodes it wrote 4.9 million lines and 98 MB into /tmp.
