@@ -276,7 +276,7 @@ err_redirect_len equ $ - err_redirect
 env_display:     db "DISPLAY=", 0  ; placeholder; tile inherits envp directly
 naflag_str:      db "--no-autostart", 0    ; argv flag set by action_restart
 verflag_str:     db "--version", 0
-tile_ver_str:    db "tile 0.1.62", 10
+tile_ver_str:    db "tile 0.1.63", 10
 tile_ver_len     equ $ - tile_ver_str
 tile_usage_str:  db "usage: tile [--no-autostart] [--version] [--help]", 10
                  db "tile is a window manager: with no flags it takes over $DISPLAY.", 10
@@ -8587,24 +8587,40 @@ switch_workspace:
     mov byte [rdi+6], 'w'
     mov byte [rdi+7], 's'
     mov byte [rdi+8], '='
+    ; Two digits. Workspace 10 used to come out as ':', because 10 + '0'
+    ; is the character after '9'. Every "ws=:" line in a tile log is that.
     mov rax, [rsp]
+    mov ecx, ' '
+    cmp al, 10
+    jb .sw_lg_new
+    mov ecx, '1'
+    sub al, 10
+.sw_lg_new:
+    mov [rdi+9], cl
     add al, '0'
-    mov [rdi+9], al
-    mov byte [rdi+10], ' '
-    mov byte [rdi+11], '('
-    mov byte [rdi+12], 'w'
-    mov byte [rdi+13], 'a'
-    mov byte [rdi+14], 's'
-    mov byte [rdi+15], ' '
+    mov [rdi+10], al
+    mov byte [rdi+11], ' '
+    mov byte [rdi+12], '('
+    mov byte [rdi+13], 'w'
+    mov byte [rdi+14], 'a'
+    mov byte [rdi+15], 's'
+    mov byte [rdi+16], ' '
     movzx eax, byte [current_ws]
+    mov ecx, ' '
+    cmp al, 10
+    jb .sw_lg_old
+    mov ecx, '1'
+    sub al, 10
+.sw_lg_old:
+    mov [rdi+17], cl
     add al, '0'
-    mov [rdi+16], al
-    mov byte [rdi+17], ')'
-    mov byte [rdi+18], 10
+    mov [rdi+18], al
+    mov byte [rdi+19], ')'
+    mov byte [rdi+20], 10
     mov rax, SYS_WRITE
     mov edi, 2
     lea rsi, [dkp_buf]
-    mov edx, 19
+    mov edx, 21
     syscall
     call log_write_buf
     pop rdi
