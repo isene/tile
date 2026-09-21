@@ -1354,6 +1354,18 @@ _start:
     call adopt_existing_windows
 .post_startup:
 
+    ; The EWMH handshake, AFTER the adopt. It was written in v0.1.50 and
+    ; disconnected the same day, because calling it before QueryTree made
+    ; the adopt report zero children and drop every window. It was never
+    ; reconnected anywhere, so tile published neither
+    ; _NET_SUPPORTING_WM_CHECK nor _NET_SUPPORTED for months.
+    ;
+    ; The cost: GDK reads the check window on every key press, finds
+    ; nothing and stops trusting _NET_ACTIVE_WINDOW, and xdotool
+    ; windowactivate gives up and sends keys to whatever had focus.
+    ; Here the tree walk is already done, so it cannot disturb it.
+    call ewmh_publish_wm_check
+
     ; Enter event loop.
     jmp event_loop
 
