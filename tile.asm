@@ -276,7 +276,7 @@ err_redirect_len equ $ - err_redirect
 env_display:     db "DISPLAY=", 0  ; placeholder; tile inherits envp directly
 naflag_str:      db "--no-autostart", 0    ; argv flag set by action_restart
 verflag_str:     db "--version", 0
-tile_ver_str:    db "tile 0.1.63", 10
+tile_ver_str:    db "tile 0.1.64", 10
 tile_ver_len     equ $ - tile_ver_str
 tile_usage_str:  db "usage: tile [--no-autostart] [--version] [--help]", 10
                  db "tile is a window manager: with no flags it takes over $DISPLAY.", 10
@@ -2337,6 +2337,8 @@ adopt_existing_windows:
     ; Unmapped + non-trivial size — preserve the window across restart so
     ; the user doesn't lose work. Routing priority:
     ;   1. skip rule by WM_CLASS    → don't track (just leaves it alone)
+    ;   1b. _NET_WM_DESKTOP         → the workspace it was on before
+    ;      the restart (tile publishes it on every managed window)
     ;   2. assign rule by WM_CLASS  → matched workspace
     ;   3. stash-on-map by WM_CLASS → push to stash_xids (no track)
     ;   4. fallback                 → track on current_ws as a tab the
@@ -2349,7 +2351,11 @@ adopt_existing_windows:
     call apply_skip
     test eax, eax
     jnz .aew_next                          ; skipped — leave alone
-    xor ebx, ebx                          ; ebx = pending_assign_ws (0 = current_ws)
+    mov edi, r13d                          ; 0. the workspace it was on
+    call read_wm_desktop
+    mov ebx, eax                          ; ebx = pending_assign_ws (0 = current_ws)
+    test eax, eax
+    jnz .aew_um_track
     cmp dword [assign_count], 0
     je .aew_um_try_stash
     mov edi, r13d
@@ -2425,8 +2431,13 @@ adopt_existing_windows:
     call apply_skip
     test eax, eax
     jnz .aew_next                          ; skipped — leave mapped, no track
+    mov edi, r13d                          ; the workspace it was on, else
+    call read_wm_desktop                   ; the assign rule
+    test eax, eax
+    jnz .aew_mapped_ws
     mov edi, r13d
     call apply_assign
+.aew_mapped_ws:
     mov [pending_assign_ws], al
     mov eax, r13d
     call track_client
@@ -6430,6 +6441,71 @@ read_wm_class:
     ret
 .rwc_fail:
     xor eax, eax
+    pop r12
+    pop rbx
+    ret
+
+; read_wm_desktop — edi = window XID. Returns eax = the workspace (1-based)
+; the window was on, from the _NET_WM_DESKTOP tile publishes on every
+; managed window, or 0 if it has none. Used when adopting after a restart,
+; so windows go back where they were instead of piling onto the current ws.
+read_wm_desktop:
+    push rbx
+    push r12
+    mov r12d, edi
+    xor ebx, ebx
+    cmp dword [net_wm_desktop_atom], 0
+    je .rwd_ret
+    call x11_flush
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_GET_PROPERTY
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 6
+    mov [rdi+4], r12d
+    mov eax, [net_wm_desktop_atom]
+    mov [rdi+8], eax
+    mov dword [rdi+12], 6                 ; CARDINAL
+    mov dword [rdi+16], 0                 ; long-offset
+    mov dword [rdi+20], 1                 ; long-length: one value
+    mov rax, SYS_WRITE
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 24
+    syscall
+    inc dword [x11_seq]
+    lea rdi, [wm_class_buf]
+    call read_reply_or_queue
+    test eax, eax
+    jz .rwd_ret
+    ; The value (0 or 4 bytes) follows the header; it must leave the
+    ; socket either way.
+    mov edx, [wm_class_buf + 4]
+    shl edx, 2
+.rwd_tail:
+    test edx, edx
+    jz .rwd_have
+    push rdx
+    lea rsi, [wm_class_buf + 36]
+    sub rsi, rdx
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    syscall
+    pop rdx
+    test rax, rax
+    jle .rwd_ret
+    sub edx, eax
+    jmp .rwd_tail
+.rwd_have:
+    cmp byte [wm_class_buf + 1], 32       ; format
+    jne .rwd_ret
+    cmp dword [wm_class_buf + 16], 1      ; one item
+    jne .rwd_ret
+    mov eax, [wm_class_buf + 32]          ; 0-based desktop
+    cmp eax, WS_COUNT
+    jae .rwd_ret
+    lea ebx, [rax + 1]
+.rwd_ret:
+    mov eax, ebx
     pop r12
     pop rbx
     ret
