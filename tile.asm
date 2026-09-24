@@ -276,7 +276,9 @@ err_redirect_len equ $ - err_redirect
 env_display:     db "DISPLAY=", 0  ; placeholder; tile inherits envp directly
 naflag_str:      db "--no-autostart", 0    ; argv flag set by action_restart
 verflag_str:     db "--version", 0
-tile_ver_str:    db "tile 0.1.65", 10
+rsflag_str:      db "--restarted", 0       ; argv flag: a real restart, say so
+restart_note_cmd: db "notify-send -a tile -t 3000 -h string:bgcolor:#B7472A -h string:fgcolor:#FFFFFF -h string:frcolor:#B7472A 'tile restarted'", 0
+tile_ver_str:    db "tile 0.1.66", 10
 tile_ver_len     equ $ - tile_ver_str
 tile_usage_str:  db "usage: tile [--no-autostart] [--version] [--help]", 10
                  db "tile is a window manager: with no flags it takes over $DISPLAY.", 10
@@ -621,6 +623,7 @@ section .bss
 envp:                resq 1
 argv0:               resq 1          ; saved argv[0] for action_restart fallback
 skip_autostart:      resb 1          ; set by --no-autostart (action_restart re-exec)
+was_restarted:       resb 1          ; set by --restarted: show the restart notice
 display_num:         resq 1
 x11_fd:              resq 1
 x11_seq:             resd 1
@@ -1215,7 +1218,14 @@ _start:
     mov rdi, r15
     lea rsi, [rel naflag_str]
     call argstr_eq
-    je .start_flag_next                      ; the one flag tile accepts
+    je .start_flag_next                      ; the flags tile accepts
+    mov rdi, r15
+    lea rsi, [rel rsflag_str]
+    call argstr_eq
+    jne .start_flag_not_rs
+    mov byte [was_restarted], 1
+    jmp .start_flag_next
+.start_flag_not_rs:
     mov rdi, r15
     lea rsi, [rel verflag_str]
     call argstr_eq
@@ -1436,6 +1446,15 @@ _start:
     ; windowactivate gives up and sends keys to whatever had focus.
     ; Here the tree walk is already done, so it cannot disturb it.
     call ewmh_publish_wm_check
+
+    ; A red "tile restarted" notice, sent only after a real restart and
+    ; only now that the windows are adopted and stacked: sent any earlier,
+    ; the adopted windows landed on top of dunst's box and hid it.
+    cmp byte [was_restarted], 0
+    je .no_restart_note
+    lea rdi, [rel restart_note_cmd]
+    call fork_exec_string
+.no_restart_note:
 
     ; Enter event loop.
     jmp event_loop
@@ -8473,14 +8492,12 @@ action_restart:
     ; needs to outlive this process.
     lea rdi, [rel .ar_snixembed]
     call fork_exec_string
-    ; A red notification, so a restart is visible. Sent from here, the
-    ; old process, not from the new tile: --no-autostart alone also
-    ; marks test runs on scratch displays, which must stay silent.
-    lea rdi, [rel .ar_notify]
-    call fork_exec_string
-    ; Build argv = [path, "--no-autostart", NULL] so the re-exec'd tile
-    ; doesn't run autostart again (which would spawn a duplicate
-    ; firefox/strip/feh/glass over the user's existing session).
+    ; Build argv = [path, "--no-autostart", "--restarted", NULL] so the
+    ; re-exec'd tile skips autostart and shows the restart notice.
+    ; --restarted is its own flag because test runs on scratch displays
+    ; use --no-autostart too, and those must stay silent. Running
+    ; autostart again would spawn a duplicate firefox/strip/feh/glass
+    ; over the existing session.
     ;
     ; Order of execve attempts matters: when the on-disk binary has been
     ; rebuilt (atomic rename via `cp` or some linkers), /proc/self/exe
@@ -8493,7 +8510,9 @@ action_restart:
     sub rsp, 32
     lea rax, [rel naflag_str]
     mov [rsp + 8], rax
-    mov qword [rsp + 16], 0
+    lea rax, [rel rsflag_str]
+    mov [rsp + 16], rax
+    mov qword [rsp + 24], 0
     ; Attempt 1: /home/geir/bin/tile (symlink → fresh on-disk binary)
     lea rax, [rel .ar_path3]
     mov [rsp], rax
@@ -8535,7 +8554,6 @@ action_restart:
 .ar_path1: db "/proc/self/exe", 0
 .ar_path3: db "/home/geir/bin/tile", 0
 .ar_snixembed: db "snixembed", 0
-.ar_notify: db "notify-send -a tile -t 3000 -h string:bgcolor:#B7472A -h string:fgcolor:#FFFFFF -h string:frcolor:#B7472A 'tile restarted'", 0
 .ar_fail_msg: db "tile: action_restart: all execve attempts failed", 10
 .ar_fail_msg_len equ $ - .ar_fail_msg
 
