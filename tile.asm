@@ -276,7 +276,7 @@ err_redirect_len equ $ - err_redirect
 env_display:     db "DISPLAY=", 0  ; placeholder; tile inherits envp directly
 naflag_str:      db "--no-autostart", 0    ; argv flag set by action_restart
 verflag_str:     db "--version", 0
-tile_ver_str:    db "tile 0.1.64", 10
+tile_ver_str:    db "tile 0.1.65", 10
 tile_ver_len     equ $ - tile_ver_str
 tile_usage_str:  db "usage: tile [--no-autostart] [--version] [--help]", 10
                  db "tile is a window manager: with no flags it takes over $DISPLAY.", 10
@@ -8473,6 +8473,11 @@ action_restart:
     ; needs to outlive this process.
     lea rdi, [rel .ar_snixembed]
     call fork_exec_string
+    ; A red notification, so a restart is visible. Sent from here, the
+    ; old process, not from the new tile: --no-autostart alone also
+    ; marks test runs on scratch displays, which must stay silent.
+    lea rdi, [rel .ar_notify]
+    call fork_exec_string
     ; Build argv = [path, "--no-autostart", NULL] so the re-exec'd tile
     ; doesn't run autostart again (which would spawn a duplicate
     ; firefox/strip/feh/glass over the user's existing session).
@@ -8530,6 +8535,7 @@ action_restart:
 .ar_path1: db "/proc/self/exe", 0
 .ar_path3: db "/home/geir/bin/tile", 0
 .ar_snixembed: db "snixembed", 0
+.ar_notify: db "notify-send -a tile -t 3000 -h string:bgcolor:#B7472A -h string:fgcolor:#FFFFFF -h string:frcolor:#B7472A 'tile restarted'", 0
 .ar_fail_msg: db "tile: action_restart: all execve attempts failed", 10
 .ar_fail_msg_len equ $ - .ar_fail_msg
 
