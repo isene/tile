@@ -30,6 +30,11 @@
 %define SYS_EXIT_GROUP    231
 %define SYS_WAIT4         61
 %define SYS_CLOCK_GETTIME 228
+%define SYS_RT_SIGACTION  13
+%define SYS_RT_SIGRETURN  15
+%define SIGURG            23
+%define SA_RESTORER       0x04000000
+%define SA_RESTART        0x10000000
 
 %define CLOCK_REALTIME    0
 %define WNOHANG           1
@@ -331,6 +336,7 @@ strip_y:             resw 1
 cfg_bg:              resd 1
 cfg_fg:              resd 1
 strip_dirty:         resb 1            ; non-zero → re-render needed
+rerun_pending:       resb 1            ; SIGURG seen: rerun segments now
 cfg_gap:             resd 1            ; pixels of padding between segments
 
 ; XEMBED system tray.
@@ -532,7 +538,27 @@ _start:
     ; Mark all segments due now.
     call seed_next_runs
 
+    ; SIGURG = "rerun every segment now". A segment helper sends it when
+    ; it knows the world changed: net does, the moment the Internet
+    ; works after a new network or a captive portal, so the IP and the
+    ; ping show at once instead of at their next interval. SIGURG is
+    ; ignored by default, so a stray one, or one sent to an older strip,
+    ; does nothing. SA_RESTART: only poll sees the interruption.
+    sub rsp, 32
+    mov qword [rsp], on_sigurg
+    mov qword [rsp + 8], SA_RESTORER | SA_RESTART
+    mov qword [rsp + 16], sig_restorer
+    mov qword [rsp + 24], 0               ; empty mask
+    mov eax, SYS_RT_SIGACTION
+    mov edi, SIGURG
+    mov rsi, rsp
+    xor edx, edx
+    mov r10d, 8
+    syscall
+    add rsp, 32
+
     jmp main_loop
+
 
 .die_x11:
     lea rsi, [.die_x11_msg]
@@ -555,6 +581,10 @@ _start:
 ; segments. On any output change, redraw.
 ; ══════════════════════════════════════════════════════════════════════
 main_loop:
+    cmp byte [rerun_pending], 0
+    je .ml_no_rerun
+    call rerun_segments
+.ml_no_rerun:
     call x11_flush
     call build_poll_set                   ; returns rcx = nfds
     push rcx                              ; save across compute_timeout_ms
@@ -1371,6 +1401,39 @@ fork_segment:
     pop r13
     pop r12
     pop rbx
+    ret
+
+; SIGURG handler: note it; main_loop does the work.
+on_sigurg:
+    mov byte [rerun_pending], 1
+    ret
+sig_restorer:
+    mov eax, SYS_RT_SIGRETURN
+    syscall
+
+; rerun_segments — SIGURG arrived: every timer segment that is not
+; running now becomes due at once. Output stays on the bar until the new
+; one arrives; built-ins and static segments are left alone.
+rerun_segments:
+    mov byte [rerun_pending], 0
+    xor ecx, ecx
+.rs_loop:
+    cmp ecx, [segment_count]
+    jge .rs_done
+    mov rax, rcx
+    imul rax, SEG_STRIDE_REAL
+    lea rdi, [segments + rax]
+    test byte [rdi + SEG_OFF_FLAGS], SEG_FLAG_BUILTIN_CLOCK | SEG_FLAG_BUILTIN_WINTITLE | SEG_FLAG_BUILTIN_WORKSPACES
+    jnz .rs_next
+    cmp dword [rdi + SEG_OFF_INTERVAL], 0
+    je .rs_next
+    cmp dword [rdi + SEG_OFF_PID], 0
+    jne .rs_next
+    mov dword [rdi + SEG_OFF_NEXT_RUN], 0
+.rs_next:
+    inc ecx
+    jmp .rs_loop
+.rs_done:
     ret
 
 ; Mark every segment as due now.
