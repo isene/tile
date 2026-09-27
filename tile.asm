@@ -278,7 +278,7 @@ naflag_str:      db "--no-autostart", 0    ; argv flag set by action_restart
 verflag_str:     db "--version", 0
 rsflag_str:      db "--restarted", 0       ; argv flag: a real restart, say so
 restart_note_cmd: db "notify-send -a tile -t 3000 -h string:bgcolor:#B7472A -h string:fgcolor:#FFFFFF -h string:frcolor:#B7472A 'tile restarted'", 0
-tile_ver_str:    db "tile 0.1.67", 10
+tile_ver_str:    db "tile 0.1.68", 10
 tile_ver_len     equ $ - tile_ver_str
 tile_usage_str:  db "usage: tile [--no-autostart] [--version] [--help]", 10
                  db "tile is a window manager: with no flags it takes over $DISPLAY.", 10
@@ -891,6 +891,16 @@ focused_xid:             resd 1
 ; the dialog can restore the parent's focus.
 transient_focused_xid:    resd 1
 transient_prev_focus_xid: resd 1
+; Dialogs (is_transient_window = 1) live outside the tab strip, so
+; switch_workspace used to leave them mapped everywhere: back on their
+; own workspace the parent's tab covered them. Each is tied to its
+; parent's workspace and hidden/shown with it. xid 0 = free slot.
+DLG_MAX                   equ 16
+dlg_xids:                 resd DLG_MAX
+dlg_ws:                   resb DLG_MAX   ; workspace 1..10
+dlg_shown:                resb DLG_MAX   ; 1 = mapped
+dlg_unmap_exp:            resb DLG_MAX   ; tile hid it; eat the UnmapNotify
+itw_parent:               resd 1         ; WM_TRANSIENT_FOR, set by is_transient_window
 
 ; Master/stack layout: master takes cfg_master_ratio percent of the
 ; workspace's width on the left; the remaining clients stack as equal-
@@ -3177,6 +3187,8 @@ event_loop:
     mov rdx, 8
     call x11_buffer
     inc dword [x11_seq]
+    mov eax, [x11_read_buf + 8]
+    call dlg_track                         ; hide/show it with its workspace
     ; Remember the dialog and the previously-focused window. When the
     ; dialog is unmapped/destroyed we restore focus to whatever was
     ; focused before — typically the GTK app that owns the modal.
@@ -3391,6 +3403,11 @@ event_loop:
     jmp event_loop
 
 .ev_unmap_notify:
+    ; A dialog tile hid on a workspace switch: not a dismissal.
+    mov eax, [x11_read_buf + 8]
+    call dlg_unmapped
+    test eax, eax
+    jnz event_loop
     ; Transient-dialog dismissal: if the unmapping XID is the one we
     ; routed focus to in the MapRequest transient path, hand focus back
     ; to whatever was focused before. find_client_index won't match
@@ -3418,6 +3435,11 @@ event_loop:
     jmp event_loop
 
 .ev_destroy_notify:
+    mov eax, [x11_read_buf + 8]
+    call dlg_find
+    js .edn_not_dlg
+    mov dword [dlg_xids + rcx*4], 0        ; gone for good
+.edn_not_dlg:
     mov eax, [x11_read_buf + 8]
     call transient_dismiss_check
     test eax, eax
@@ -6546,6 +6568,7 @@ is_transient_window:
     push rbx
     push r12
     mov r12d, edi
+    mov dword [itw_parent], 0
     ; --- Pass 1: WM_TRANSIENT_FOR (predefined atoms 68/33). ---
     call x11_flush
     lea rdi, [tmp_buf]
@@ -6587,6 +6610,7 @@ is_transient_window:
     cmp rax, 4
     jl .itw_try_ewmh
     mov eax, [tmp_buf + 96]
+    mov [itw_parent], eax                  ; dlg_track ties it to this workspace
     test eax, eax
     jnz .itw_yes
     jmp .itw_try_ewmh
@@ -6793,6 +6817,168 @@ transient_dismiss_check:
     ret
 .tdc_no:
     xor eax, eax
+    ret
+
+; dlg_find — eax = xid. ecx = its dlg slot, or -1 (flags from test ecx).
+dlg_find:
+    xor ecx, ecx
+    test eax, eax
+    jz .df_miss
+.df_loop:
+    cmp [dlg_xids + rcx*4], eax
+    je .df_hit
+    inc ecx
+    cmp ecx, DLG_MAX
+    jb .df_loop
+.df_miss:
+    mov ecx, -1
+.df_hit:
+    test ecx, ecx
+    ret
+
+; dlg_track — eax = dialog xid, just mapped. Its workspace is its
+; parent's (itw_parent: a tab, or another dialog), else the current one.
+; A re-map reuses the xid's slot; a full table leaves it untracked.
+dlg_track:
+    push rbx
+    mov ebx, eax
+    movzx edx, byte [current_ws]
+    mov eax, [itw_parent]
+    test eax, eax
+    jz .dt_have_ws
+    xor ecx, ecx
+.dt_client:
+    cmp ecx, [client_count]
+    jge .dt_dlg_parent
+    cmp [client_xids + rcx*4], eax
+    je .dt_client_ws
+    inc ecx
+    jmp .dt_client
+.dt_client_ws:
+    movzx edx, byte [client_ws + rcx]
+    jmp .dt_have_ws
+.dt_dlg_parent:
+    call dlg_find
+    js .dt_have_ws
+    movzx edx, byte [dlg_ws + rcx]
+.dt_have_ws:
+    mov eax, ebx
+    call dlg_find                          ; keeps edx
+    jns .dt_set
+    xor ecx, ecx
+.dt_free:                                  ; first free slot
+    cmp dword [dlg_xids + rcx*4], 0
+    je .dt_set
+    inc ecx
+    cmp ecx, DLG_MAX
+    jb .dt_free
+    jmp .dt_done
+.dt_set:
+    mov [dlg_xids + rcx*4], ebx
+    mov [dlg_ws + rcx], dl
+    mov byte [dlg_shown + rcx], 1
+    mov byte [dlg_unmap_exp + rcx], 0
+.dt_done:
+    pop rbx
+    ret
+
+; dlg_unmapped — eax = xid of an UnmapNotify. eax = 1 when tile hid this
+; dialog itself (the caller drops the event). A dialog the app closed is
+; forgotten and eax = 0, so the usual dismissal path runs.
+dlg_unmapped:
+    call dlg_find
+    js .du_no
+    cmp byte [dlg_unmap_exp + rcx], 0
+    je .du_closed
+    mov byte [dlg_unmap_exp + rcx], 0
+    mov eax, 1
+    ret
+.du_closed:
+    mov dword [dlg_xids + rcx*4], 0
+.du_no:
+    xor eax, eax
+    ret
+
+; dlg_hide_ws — eax = workspace being left. Unmaps its dialogs, flagged
+; so their UnmapNotify is not read as the app closing them.
+dlg_hide_ws:
+    push rbx
+    push r12
+    mov r12d, eax
+    xor ebx, ebx
+.dh_loop:
+    mov eax, [dlg_xids + rbx*4]
+    test eax, eax
+    jz .dh_next
+    movzx ecx, byte [dlg_ws + rbx]
+    cmp ecx, r12d
+    jne .dh_next
+    cmp byte [dlg_shown + rbx], 0
+    je .dh_next
+    mov byte [dlg_shown + rbx], 0
+    mov byte [dlg_unmap_exp + rbx], 1
+    cmp eax, [transient_focused_xid]       ; Mod4+q must not close a
+    jne .dh_unmap                          ; dialog on another workspace
+    mov dword [transient_focused_xid], 0
+.dh_unmap:
+    call send_unmap_window
+.dh_next:
+    inc ebx
+    cmp ebx, DLG_MAX
+    jb .dh_loop
+    pop r12
+    pop rbx
+    ret
+
+; dlg_show_ws — eax = workspace now shown. Maps its hidden dialogs,
+; raises all of them over the tabs, and hands keys to the last one.
+dlg_show_ws:
+    push rbx
+    push r12
+    push r13
+    mov r12d, eax
+    xor r13d, r13d                         ; dialog to focus
+    xor ebx, ebx
+.ds_loop:
+    mov eax, [dlg_xids + rbx*4]
+    test eax, eax
+    jz .ds_next
+    movzx ecx, byte [dlg_ws + rbx]
+    cmp ecx, r12d
+    jne .ds_next
+    mov r13d, eax
+    cmp byte [dlg_shown + rbx], 0
+    jne .ds_raise
+    mov byte [dlg_shown + rbx], 1
+    call send_map_window
+.ds_raise:
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_CONFIGURE_WINDOW
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 4
+    mov [rdi+4], eax
+    mov word [rdi+8], CFG_STACK
+    mov word [rdi+10], 0
+    mov dword [rdi+12], 0                  ; stack-mode = Above
+    lea rsi, [tmp_buf]
+    mov rdx, 16
+    call x11_buffer
+    inc dword [x11_seq]
+.ds_next:
+    inc ebx
+    cmp ebx, DLG_MAX
+    jb .ds_loop
+    test r13d, r13d
+    jz .ds_done
+    mov eax, [focused_xid]                 ; the tab switch_workspace focused
+    mov [transient_prev_focus_xid], eax
+    mov [transient_focused_xid], r13d
+    mov eax, r13d
+    call set_input_focus
+.ds_done:
+    pop r13
+    pop r12
+    pop rbx
     ret
 
 ; rdi = window XID. If WM_CLASS class half matches an `assign` table
@@ -8772,6 +8958,8 @@ switch_workspace:
     jz .sw_no_old_hide
     mov eax, ebx
     call hide_workspace_clients
+    mov eax, ebx
+    call dlg_hide_ws
 .sw_no_old_hide:
 .sw_just_focus:
     ; Focus the target workspace's active tab if any.
@@ -8779,8 +8967,12 @@ switch_workspace:
     dec ecx
     mov eax, [ws_active_xid + rcx*4]
     test eax, eax
-    jz .sw_render
+    jz .sw_dialogs
     call set_input_focus
+.sw_dialogs:
+    ; Its dialogs go back on top of the tabs, and the top one gets keys.
+    mov eax, r12d
+    call dlg_show_ws
 .sw_render:
     call render_bar
     call x11_flush
