@@ -40,7 +40,7 @@
   <!-- One large active tile (filled with terminal feel) -->
   <rect x="38" y="60" width="180" height="116" rx="4" fill="#1a1b26" stroke="#bd93f9" stroke-width="2"/>
   <!-- Mini "screen content" inside the tile -->
-  <text x="46" y="78" font-family="monospace" font-size="7" fill="#9ece6a" opacity="0.7">geir@juba</text>
+  <text x="46" y="78" font-family="monospace" font-size="7" fill="#9ece6a" opacity="0.7">user@host</text>
   <text x="100" y="78" font-family="monospace" font-size="7" fill="#a9b1d6" opacity="0.5">:~/$</text>
   <text x="124" y="78" font-family="monospace" font-size="7" fill="#c0caf5" opacity="0.6">tile</text>
   <text x="46" y="92" font-family="monospace" font-size="6.5" fill="#565f89" opacity="0.55">pure x86_64 asm tiling</text>
