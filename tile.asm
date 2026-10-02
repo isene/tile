@@ -278,7 +278,7 @@ naflag_str:      db "--no-autostart", 0    ; argv flag set by action_restart
 verflag_str:     db "--version", 0
 rsflag_str:      db "--restarted", 0       ; argv flag: a real restart, say so
 restart_note_cmd: db "notify-send -a tile -t 3000 -h string:bgcolor:#B7472A -h string:fgcolor:#FFFFFF -h string:frcolor:#B7472A 'tile restarted'", 0
-tile_ver_str:    db "tile 0.1.68", 10
+tile_ver_str:    db "tile 0.1.69", 10
 tile_ver_len     equ $ - tile_ver_str
 tile_usage_str:  db "usage: tile [--no-autostart] [--version] [--help]", 10
                  db "tile is a window manager: with no flags it takes over $DISPLAY.", 10
@@ -622,6 +622,7 @@ section .bss
 
 envp:                resq 1
 argv0:               resq 1          ; saved argv[0] for action_restart fallback
+ar_exe_buf:          resb 512        ; action_restart: this binary's own path
 skip_autostart:      resb 1          ; set by --no-autostart (action_restart re-exec)
 was_restarted:       resb 1          ; set by --restarted: show the restart notice
 display_num:         resq 1
@@ -8584,9 +8585,10 @@ action_recover:
 ; reconnects). Pattern matches i3's `restart` command.
 ;
 ; Try execve in order:
-;   1. /proc/self/exe   — works when binary hasn't been replaced
+;   1. the path /proc/self/exe points at — the file there now, so a
+;      rebuilt binary takes over
 ;   2. saved argv[0]    — the path the user originally invoked
-;   3. /home/geir/bin/tile — the symlink most setups use
+;   3. /proc/self/exe   — the running inode, when its path is gone
 ;
 ; Earlier code closed x11_fd BEFORE the first execve. When the on-disk
 ; binary had been atomically replaced (rebuild-then-rename), execve of
@@ -8689,24 +8691,43 @@ action_restart:
     ; rebuilt (atomic rename via `cp` or some linkers), /proc/self/exe
     ; still references the OLD inode the kernel loaded at our launch.
     ; execve(/proc/self/exe) succeeds but re-loads the stale inode, so
-    ; bug fixes never take effect even after a Mod4+Shift+x. Try the
-    ; symlink path first; that always resolves to whatever's currently
-    ; on disk. /proc/self/exe is the last-resort fallback for the case
-    ; where the symlink itself was deleted.
+    ; bug fixes never take effect even after a Mod4+Shift+x. So first ask
+    ; the kernel where that inode lived (readlink of /proc/self/exe) and
+    ; exec the PATH: whatever file sits there now is the fresh build. A
+    ; replaced binary reads back as "<path> (deleted)"; the suffix is cut.
     sub rsp, 32
     lea rax, [rel naflag_str]
     mov [rsp + 8], rax
     lea rax, [rel rsflag_str]
     mov [rsp + 16], rax
     mov qword [rsp + 24], 0
-    ; Attempt 1: /home/geir/bin/tile (symlink → fresh on-disk binary)
-    lea rax, [rel .ar_path3]
-    mov [rsp], rax
+    ; Attempt 1: the path this binary was started from, as it is on disk now
+    mov rax, 89                              ; SYS_READLINK
+    lea rdi, [rel .ar_path1]
+    lea rsi, [ar_exe_buf]
+    mov edx, 500
+    syscall
+    test rax, rax
+    jle .ar_try_argv0
+    lea rdi, [ar_exe_buf]
+    mov byte [rdi + rax], 0
+    cmp rax, 10
+    jbe .ar_exe_ok
+    lea rsi, [rdi + rax - 10]                ; " (deleted)" is 10 bytes
+    cmp dword [rsi], " (de"
+    jne .ar_exe_ok
+    cmp dword [rsi + 4], "lete"
+    jne .ar_exe_ok
+    cmp word [rsi + 8], "d)"
+    jne .ar_exe_ok
+    mov byte [rsi], 0
+.ar_exe_ok:
+    mov [rsp], rdi
     mov rax, SYS_EXECVE
-    lea rdi, [rel .ar_path3]
     mov rsi, rsp
     mov rdx, [envp]
     syscall
+.ar_try_argv0:
     ; Attempt 2: saved argv[0] (whatever path tile was originally launched as)
     mov rax, [argv0]
     test rax, rax
@@ -8738,7 +8759,6 @@ action_restart:
     pop rax
     ret
 .ar_path1: db "/proc/self/exe", 0
-.ar_path3: db "/home/geir/bin/tile", 0
 .ar_snixembed: db "snixembed", 0
 .ar_fail_msg: db "tile: action_restart: all execve attempts failed", 10
 .ar_fail_msg_len equ $ - .ar_fail_msg
