@@ -109,11 +109,11 @@ border = none
 font = -*-terminus-*-*-*-*-16-*-*-*-*-*-iso10646-1
 
 # Autostart (one exec per line)
-exec feh --bg-fill /home/geir/setup/wallpapers/blue.png
-exec picom --config /home/geir/.config/picom/picom.conf
+exec feh --bg-fill /home/you/setup/wallpapers/blue.png
+exec picom --config /home/you/.config/picom/picom.conf
 exec strip
 exec nm-applet
-exec /home/geir/bin/xps14
+exec /home/you/bin/xps14
 ```
 
 **Modifier names**: `Mod1` (Alt), `Mod4` (Win/Super), `Shift`, `Ctrl`.
@@ -166,9 +166,9 @@ segment_right volume
 segment_right datetime  "%H:%M  %Y-%m-%d"
 
 # Refresher children (strip spawns these on startup)
-refresher /tmp/strip-weather  600  curl -s "wttr.in/Tromso?format=%t+%C+%h"
-refresher /tmp/strip-gmail    300  /home/geir/bin/gmail-count
-refresher /tmp/strip-geo      3600 /home/geir/bin/geolocate
+refresher /tmp/strip-weather  600  curl -s "wttr.in/YourCity?format=%t+%C+%h"
+refresher /tmp/strip-gmail    300  /home/you/bin/gmail-count
+refresher /tmp/strip-geo      3600 /home/you/bin/geolocate
 
 # Colors
 color_workspace_active = #ffffff,#000000
