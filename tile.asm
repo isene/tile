@@ -278,7 +278,7 @@ naflag_str:      db "--no-autostart", 0    ; argv flag set by action_restart
 verflag_str:     db "--version", 0
 rsflag_str:      db "--restarted", 0       ; argv flag: a real restart, say so
 restart_note_cmd: db "notify-send -a tile -t 3000 -h string:bgcolor:#B7472A -h string:fgcolor:#FFFFFF -h string:frcolor:#B7472A 'tile restarted'", 0
-tile_ver_str:    db "tile 0.1.70", 10
+tile_ver_str:    db "tile 0.1.71", 10
 tile_ver_len     equ $ - tile_ver_str
 tile_usage_str:  db "usage: tile [--no-autostart] [--version] [--help]", 10
                  db "tile is a window manager: with no flags it takes over $DISPLAY.", 10
@@ -1411,6 +1411,17 @@ _start:
     ; instead of WS1. Show it on whichever output it is pinned to
     ; (single-screen: output 0), and make it the global current_ws.
     movzx eax, byte [cfg_startup_ws]
+    ; After a restart, land where the old tile was. A restart used to
+    ; throw you back to the start workspace (v0.1.71).
+    cmp byte [was_restarted], 0
+    je .start_ws_have
+    push rax
+    call read_cur_desktop
+    pop rcx
+    test eax, eax
+    jnz .start_ws_have
+    mov eax, ecx                              ; nothing to read: as before
+.start_ws_have:
     mov [current_ws], al
     movzx ecx, al
     dec ecx                                   ; ws index (0-based)
@@ -6501,17 +6512,18 @@ read_wm_desktop:
     push rbx
     push r12
     mov r12d, edi
-    xor ebx, ebx
-    cmp dword [net_wm_desktop_atom], 0
-    je .rwd_ret
+    mov ebx, [net_wm_desktop_atom]
+.rwd_go:                                  ; r12d = window, ebx = property
+    test ebx, ebx
+    jz .rwd_ret
     call x11_flush
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_GET_PROPERTY
     mov byte [rdi+1], 0
     mov word [rdi+2], 6
     mov [rdi+4], r12d
-    mov eax, [net_wm_desktop_atom]
-    mov [rdi+8], eax
+    mov [rdi+8], ebx
+    xor ebx, ebx                          ; the answer: 0 until proven
     mov dword [rdi+12], 6                 ; CARDINAL
     mov dword [rdi+16], 0                 ; long-offset
     mov dword [rdi+20], 1                 ; long-length: one value
@@ -6557,6 +6569,16 @@ read_wm_desktop:
     pop r12
     pop rbx
     ret
+
+; read_cur_desktop — returns eax = the workspace (1-based) named by
+; _NET_CURRENT_DESKTOP on the root window, or 0 if there is none. Until
+; this tile draws its bar, that is the workspace the tile before it was on.
+read_cur_desktop:
+    push rbx
+    push r12
+    mov r12d, [x11_root_window]
+    mov ebx, [net_current_desktop_atom]
+    jmp read_wm_desktop.rwd_go
 
 ; rdi = window XID. Returns:
 ;   rax = 0  → tile this window normally

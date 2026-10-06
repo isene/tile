@@ -113,15 +113,18 @@ is "and the window of workspace 10 is hidden there" "$(shown "$ten")" no
 go 5
 is "workspace 5 still has its window" "$(shown "$five")" yes
 
-echo "== v0.1.66, v0.1.69: a restart"
+echo "== v0.1.66, v0.1.69, v0.1.71: a restart"
 kill -USR2 $TPID
 for _ in {1..30}; do [ -s "$T/notify-send.calls" ] && break; sleep 0.1; done
 sleep 0.5
 is "tile restarts from the file it was started from" "$(readlink /proc/$TPID/exe)" "$TILE"
 grep -q 'tile restarted' "$T/notify-send.calls" 2>/dev/null && got=yes || got=no
 is "the new tile sends the restart notice" "$got" yes
+is "a restart lands on the workspace it came from" "$(cur)" 4
+is "and that workspace still shows its window" "$(shown "$five")" yes
 go 1
 is "the windows are still there after the restart" "$(shown "$one")" yes
+is "and the window of workspace 5 is hidden there" "$(shown "$five")" no
 
 echo
 if [ $fails -eq 0 ]; then echo "tile tests: all good"; else echo "tile tests: $fails failed"; fi
