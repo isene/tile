@@ -147,7 +147,8 @@ with `strip_glyphs.inc` beside it) and run `TILE=/path/to/old test/run.sh`.
 A restart lands on the workspace it came from (v0.1.71): the new tile
 reads `_NET_CURRENT_DESKTOP` from the root before it draws its bar.
 
-Two faults the tests found and that are not fixed (2026-10-06):
+Two faults the tests found and that are not fixed (2026-10-06). The
+second is parked by Geir: do not fix it unless he asks.
 
 - A tile started fresh over a session that lost its tile (not a restart)
   lands on `startup_workspace`, and the window the old tile was showing
