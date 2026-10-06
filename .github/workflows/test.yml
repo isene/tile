@@ -1,0 +1,32 @@
+name: Tests
+
+# Each check in test/run.sh is a fault that was once reported. They run on
+# a scratch frame that draws to plain memory, so no screen is needed.
+
+on:
+  push:
+    paths:
+      - tile.asm
+      - test/**
+      - .github/workflows/test.yml
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: tile
+      - uses: actions/checkout@v4
+        with:
+          repository: isene/frame
+          path: frame
+      - name: Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm gcc libx11-dev xdotool x11-utils
+      - name: Build tile and frame
+        run: make -C tile tile && make -C frame
+      - name: Run the checks
+        run: tile/test/run.sh

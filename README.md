@@ -188,6 +188,18 @@ does (the default) and the command behind it. `Esc` closes. Bind it with
 e.g. `bind Mod4+Shift+plus keys` (on a Norwegian layout that is Mod4+?).
 Both popups leave the strip and the square row visible.
 
+## Tests
+
+```bash
+make && test/run.sh
+```
+
+Each check is a fault that was once reported, and it fails on the build
+from before its fix. They run on a scratch
+[frame](https://github.com/isene/frame) that draws to plain memory (build
+it beside this repo, or set `FRAME=`), so no screen is needed and a real
+desktop is never touched. GitHub runs them on every push.
+
 ## Packages
 
 **Debian/Ubuntu**: every release ships a dependency-free static amd64

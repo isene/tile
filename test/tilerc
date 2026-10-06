@@ -1,0 +1,11 @@
+# The config tile's tests run with: workspace keys and nothing else.
+bind Mod4+1 workspace 1
+bind Mod4+2 workspace 2
+bind Mod4+3 workspace 3
+bind Mod4+4 workspace 4
+bind Mod4+5 workspace 5
+bind Mod4+6 workspace 6
+bind Mod4+7 workspace 7
+bind Mod4+8 workspace 8
+bind Mod4+9 workspace 9
+bind Mod4+0 workspace 10
