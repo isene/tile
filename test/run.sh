@@ -73,6 +73,10 @@ echo "== v0.1.59: a pager can switch the workspace"
 xdotool set_desktop 3 2>/dev/null; sleep 0.3
 is "set_desktop 3 moves tile to workspace 4" "$(cur)" 3
 
+echo "== v0.1.70: a pager asking for the workspace in view stays there"
+go 5; xdotool set_desktop 4 2>/dev/null; sleep 0.3
+is "set_desktop for the current workspace does not jump back" "$(cur)" 4
+
 echo "== v0.1.63: workspace 10 in the log"
 go 10; go 3
 grep -q 'ws= 3 (was 10)' "$T/tile.log" && got=yes || got=no
