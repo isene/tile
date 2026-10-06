@@ -278,7 +278,7 @@ naflag_str:      db "--no-autostart", 0    ; argv flag set by action_restart
 verflag_str:     db "--version", 0
 rsflag_str:      db "--restarted", 0       ; argv flag: a real restart, say so
 restart_note_cmd: db "notify-send -a tile -t 3000 -h string:bgcolor:#B7472A -h string:fgcolor:#FFFFFF -h string:frcolor:#B7472A 'tile restarted'", 0
-tile_ver_str:    db "tile 0.1.69", 10
+tile_ver_str:    db "tile 0.1.70", 10
 tile_ver_len     equ $ - tile_ver_str
 tile_usage_str:  db "usage: tile [--no-autostart] [--version] [--help]", 10
                  db "tile is a window manager: with no flags it takes over $DISPLAY.", 10
@@ -2860,6 +2860,12 @@ event_loop:
     cmp eax, WS_COUNT
     jae event_loop                        ; out of range, negative included
     lea edi, [rax + 1]
+    ; A program that asks for the workspace in view wants to stay there.
+    ; Back-and-forth is for the Mod4+N key only. xdotool windowactivate
+    ; sends this request by itself, so tile went there and straight back
+    ; (v0.1.70).
+    cmp dil, [current_ws]
+    je event_loop
     call switch_workspace
     jmp event_loop
 .ev_cm_active:
