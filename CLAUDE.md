@@ -129,6 +129,28 @@ LAYOUT_GLYPH_GAP      = 14    ; gap before tab strip
 
 These are pragmatic hardcodes — could move to `~/.tilerc` later.
 
+## Tests
+
+`test/run.sh` holds one check per reported fault. A fix ships with a check
+that fails without it: build the old `tile.asm` (`git show REV^:tile.asm`,
+with `strip_glyphs.inc` beside it) and run `TILE=/path/to/old test/run.sh`.
+
+- `test/xwin NAME [PARENT]` is a plain window; with PARENT it is a dialog.
+- Workspaces change with faked keys (`go N`), bound in `test/tilerc`.
+- A restarting tile runs `snixembed` and `notify-send` through the shell.
+  Both are dummies in the test, and the session bus address points
+  nowhere. Unsetting the address is not enough: programs then find the
+  real bus through `XDG_RUNTIME_DIR`.
+- Test adoption by stopping tile and starting a new one, not by a restart:
+  an old build restarts into whatever tile is installed.
+
+Two faults the tests found and that are not fixed (2026-10-06):
+
+- A restart lands on `startup_workspace`, not on the workspace it came
+  from, and the window that was showing stays mapped there.
+- A dialog that is open during a restart is adopted as a normal tab on the
+  workspace tile lands on. It no longer follows its parent.
+
 ## Pitfalls
 
 See the global x86_64-asm skill for the 15 NASM/x86_64 pitfalls that
