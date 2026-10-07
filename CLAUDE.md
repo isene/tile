@@ -17,7 +17,7 @@ build independently but live in the same source tree because
 
 ## Reload vs restart
 
-- `Mod4+Shift+r` (`restart` action) → `execve("/proc/self/exe")` —
+- `Mod4+Shift+x` (`restart` action) → `execve("/proc/self/exe")` —
   picks up a new tile binary in place, preserving the X session and
   workspace state. Uses the action_restart pattern, with argv built
   on the **stack** (data in .text is read-only and writing argv
