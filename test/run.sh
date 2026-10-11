@@ -94,6 +94,18 @@ is "the dialog is back with its workspace" "$(shown "$dialog")" yes
 
 close dialog parent
 
+echo "== v0.1.72: a moved window moves on screen"
+# Two windows side by side. Moving one in the order changed the bar only;
+# the windows stayed put until the next workspace switch.
+go 7; left=$(win left); right=$(win right)
+xdotool key super+Tab; sleep 0.3
+xat() { xwininfo -id "$1" 2>/dev/null | sed -n 's/.*Absolute upper-left X: *//p'; }
+before="$(xat "$left") $(xat "$right")"
+xdotool key super+comma; sleep 0.3
+is "the two windows are side by side" "$([ "${before% *}" != "${before#* }" ] && echo yes || echo no)" yes
+is "moving a window left swaps the two on screen" "$(xat "$right") $(xat "$left")" "$before"
+close left right
+
 echo "== v0.1.64: windows keep their workspace when a new tile takes over"
 go 1; one=$(win one)
 go 5; five=$(win five)

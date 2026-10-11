@@ -278,7 +278,7 @@ naflag_str:      db "--no-autostart", 0    ; argv flag set by action_restart
 verflag_str:     db "--version", 0
 rsflag_str:      db "--restarted", 0       ; argv flag: a real restart, say so
 restart_note_cmd: db "notify-send -a tile -t 3000 -h string:bgcolor:#B7472A -h string:fgcolor:#FFFFFF -h string:frcolor:#B7472A 'tile restarted'", 0
-tile_ver_str:    db "tile 0.1.71", 10
+tile_ver_str:    db "tile 0.1.72", 10
 tile_ver_len     equ $ - tile_ver_str
 tile_usage_str:  db "usage: tile [--no-autostart] [--version] [--help]", 10
                  db "tile is a window manager: with no flags it takes over $DISPLAY.", 10
@@ -7801,6 +7801,14 @@ move_tab:
     mov dil, [client_color + rsi]
     mov [client_color + rsi], al
     mov [client_color + r12], dil
+    ; In a split layout each window sits where the order puts it, so the
+    ; new order is laid out. Only the bar was redrawn, and the windows
+    ; stayed put until the next workspace switch (fixed v0.1.72).
+    movzx eax, byte [current_ws]
+    cmp byte [ws_layout + rax - 1], 0    ; tabbed: one window shows, bar only
+    je .mt_bar
+    call apply_workspace_layout
+.mt_bar:
     call render_bar
     call x11_flush
 .mt_done:

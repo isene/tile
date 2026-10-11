@@ -1,4 +1,5 @@
-# The config tile's tests run with: workspace keys and nothing else.
+# The config tile's tests run with: workspace keys, the layout key and the
+# keys that move a window in the order.
 bind Mod4+1 workspace 1
 bind Mod4+2 workspace 2
 bind Mod4+3 workspace 3
@@ -9,3 +10,6 @@ bind Mod4+7 workspace 7
 bind Mod4+8 workspace 8
 bind Mod4+9 workspace 9
 bind Mod4+0 workspace 10
+bind Mod4+Tab layout toggle
+bind Mod4+comma move-tab left
+bind Mod4+period move-tab right
