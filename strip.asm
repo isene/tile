@@ -143,6 +143,7 @@
 %define SEG_OUT_LEN         96
 %define ARG_POOL_SIZE       8192
 %define CFG_BUF_SIZE        8192
+%define TZ_BUF_SIZE         8192
 %define MAX_POLL_FDS        (MAX_SEGMENTS + 1)
 
 ; Per-segment record (SEG_STRIDE = 128 bytes):
@@ -178,6 +179,7 @@ default_font_name: db "-*-terminus-*-*-*-*-16-*-*-*-*-*-iso10646-1", 0
 default_font_name_len equ $ - default_font_name - 1
 
 striprc_suffix:  db "/.striprc", 0
+tz_path:         db "/etc/localtime", 0
 
 randr_name:       db "RANDR"
 randr_name_len    equ $ - randr_name
@@ -374,6 +376,9 @@ arg_pool_pos:        resd 1
 
 config_buf:          resb CFG_BUF_SIZE
 config_len:          resq 1
+tz_buf:              resb TZ_BUF_SIZE  ; /etc/localtime, read on the first clock
+tz_len:              resq 1            ; bytes in tz_buf; 0 or less is UTC
+tz_read:             resb 1            ; 1 once the read was tried
 config_path:         resb 512
 
 ; Poll fd array: x11_fd at slot 0, then one slot per live segment child.
@@ -1475,17 +1480,89 @@ now_seconds:
     ret
 
 ; ══════════════════════════════════════════════════════════════════════
+; local_time: rdi = unix time, returns rax = the same time on the local
+; clock. The offset comes from /etc/localtime (TZif), read once on the
+; first call. Its 32-bit table lists every summer-time change up to
+; 2037; the newest change at or before rdi gives the offset. No file,
+; or one too short for its own counts, gives UTC.
+; Clobbers rcx, rdx, rsi, rdi, r8-r11.
+local_time:
+    push rdi
+    cmp byte [tz_read], 0
+    jne .look
+    mov byte [tz_read], 1
+    mov rax, SYS_OPEN
+    lea rdi, [tz_path]
+    xor esi, esi
+    xor edx, edx
+    syscall
+    test rax, rax
+    js .look
+    mov r8, rax
+    mov rax, SYS_READ
+    mov rdi, r8
+    lea rsi, [tz_buf]
+    mov edx, TZ_BUF_SIZE
+    syscall
+    mov [tz_len], rax
+    mov rax, SYS_CLOSE
+    mov rdi, r8
+    syscall
+.look:
+    pop rdi
+    mov rax, rdi
+    mov rcx, [tz_len]
+    cmp rcx, 44
+    jl .done
+    cmp dword [tz_buf], 'TZif'
+    jne .done
+    mov r8d, [tz_buf + 32]                  ; timecnt, big-endian
+    bswap r8d
+    mov r9d, [tz_buf + 36]                  ; typecnt
+    bswap r9d
+    test r9, r9
+    jz .done
+    lea r10, [r8 + r8*4]                    ; 44 + 5*timecnt + 6*typecnt
+    lea r11, [r9 + r9*2]
+    lea r10, [r10 + r11*2 + 44]
+    cmp r10, rcx
+    ja .done
+    xor edx, edx                            ; before the first change: type 0
+    mov rcx, r8
+.scan:                                      ; newest change first
+    test rcx, rcx
+    jz .type
+    dec rcx
+    mov eax, [tz_buf + 44 + rcx*4]
+    bswap eax
+    movsxd rax, eax
+    cmp rax, rdi
+    jg .scan
+    movzx edx, byte [tz_buf + 44 + r8*4 + rcx]
+.type:
+    mov rax, rdi
+    cmp rdx, r9
+    jae .done
+    lea r10, [r8 + r8*4]                    ; ttinfo = 44 + 5*timecnt + 6*type
+    lea r11, [rdx + rdx*2]
+    lea r10, [r10 + r11*2]
+    mov eax, [tz_buf + 44 + r10]            ; utoff, big-endian
+    bswap eax
+    movsxd rax, eax
+    add rax, rdi
+.done:
+    ret
+
+; ══════════════════════════════════════════════════════════════════════
 ; Built-in clock segment — format " HH:MM  YYYY-MM-DD WW.D " directly
 ; into the caller's output buffer. Replaces forking chasm-bits/clock
 ; once per second (86,400 forks/day) with one syscall + arithmetic +
 ; ~25 stores once per minute. Date math is Howard Hinnant's
 ; civil_from_days; ISO weekday from days-since-epoch (Thursday=1970-01-01);
-; ISO week via ordinal_day. TZ offset is hardcoded CEST per the existing
-; clock asmite (real DST handling was deferred there too).
+; ISO week via ordinal_day. The UTC offset comes from local_time.
 ;
 ; Arg:    rdi = output buffer (caller-allocated, must hold ≥24 bytes).
 ; Returns rax = bytes written (24).
-%define CLK_TZ_OFFSET_S 7200                ; CEST = UTC+2
 format_clock_into:
     push rbx
     push r12
@@ -1498,9 +1575,9 @@ format_clock_into:
     mov rdi, CLOCK_REALTIME
     mov rsi, rsp
     syscall
-    mov rax, [rsp]                          ; tv_sec
+    mov rdi, [rsp]                          ; tv_sec
     add rsp, 16                             ; output base now at [rsp]
-    add rax, CLK_TZ_OFFSET_S
+    call local_time
 
     ; Days since epoch + seconds-into-day.
     mov rcx, 86400

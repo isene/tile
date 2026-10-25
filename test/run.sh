@@ -59,6 +59,57 @@ is "--version prints the version and exits" "${out%% *} $rc" "tile 0"
 out=$(timeout 3 "$TILE" --help 2>&1); rc=$?
 is "--help prints the usage and exits" "${out%% *} $rc" "usage: 0"
 
+echo "== v0.1.73: strip's clock follows summer time"
+# strip's local_time, alone in a harness that exits with the UTC offset
+# of the time in argv[1], in quarter hours plus 64.
+{ cat <<'EOF'
+%define SYS_OPEN 2
+%define SYS_READ 0
+%define SYS_CLOSE 3
+%define TZ_BUF_SIZE 8192
+section .data
+tz_path: db "/etc/localtime", 0
+section .bss
+tz_buf:  resb TZ_BUF_SIZE
+tz_len:  resq 1
+tz_read: resb 1
+section .text
+global _start
+_start:
+    mov rsi, [rsp + 16]
+    xor edi, edi
+.digit:
+    movzx eax, byte [rsi]
+    sub eax, '0'
+    jb .go
+    cmp eax, 9
+    ja .go
+    imul rdi, rdi, 10
+    add rdi, rax
+    inc rsi
+    jmp .digit
+.go:
+    mov rbx, rdi
+    call local_time
+    sub rax, rbx
+    cqo
+    mov rcx, 900
+    idiv rcx
+    lea rdi, [rax + 64]
+    mov eax, 60
+    syscall
+EOF
+sed -n '/^local_time:/,/^\.done:/p' "${STRIP_ASM:-$here/../strip.asm}"
+echo "    ret"; } > "$T/clock.asm"
+nasm -f elf64 -w-all "$T/clock.asm" -o "$T/clock.o" 2>/dev/null && ld "$T/clock.o" -o "$T/clock"
+for when in "2026-03-29 00:59:59" "2026-03-29 01:00:00" "2026-10-25 00:59:59" "2026-10-25 01:00:00"; do
+    t=$(date -u -d "$when" +%s)
+    z=$(date -d "@$t" +%z)
+    want=$(( ${z:0:1}1 * (10#${z:1:2} * 4 + 10#${z:3:2} / 15) + 64 ))
+    "$T/clock" "$t" 2>/dev/null; got=$?
+    is "the offset at $when UTC" "$got" "$want"
+done
+
 "$TILE" --no-autostart 2> "$T/tile.log" &
 TPID=$!; pids+=($TPID)
 for _ in {1..30}; do [ -n "$(cur)" ] && break; sleep 0.1; done
