@@ -275,6 +275,7 @@ section .bss
 %define SEG_FLAG_BUILTIN_CLOCK      0x02 ; @clock — bake date/time, no fork
 %define SEG_FLAG_BUILTIN_WINTITLE   0x04 ; @wintitle — event-driven, no fork
 %define SEG_FLAG_BUILTIN_WORKSPACES 0x08 ; @workspaces — event-driven, no fork
+%define SEG_FLAG_RIGHT              0x10 ; '>': this and later segments sit flush right
 %define SEG_OFF_DEFAULT_FG 140     ; uint32 (0 = use cfg_fg)
 %define SEG_OFF_GAP_OVR   144      ; uint32 extra pixels before this segment
 %define SEG_OFF_INC_BUF   148      ; staging buffer for in-flight output (96B)
@@ -2868,6 +2869,8 @@ render_strip:
     push rbx
     push r12
     push r13
+    push r14
+    push r15
 
     ; Heartbeat: re-issue PROPERTY_CHANGE_MASK on root. The subscription
     ; gets silently lost periodically (mechanism unknown, observed via
@@ -2904,6 +2907,9 @@ render_strip:
 
     ; Walk segments: render each via SGR-aware run emitter.
     mov r12d, 4                           ; running x in pixels
+    call right_x
+    mov r14d, ecx                         ; first '>' segment, -1 if none
+    mov r15d, eax                         ; the x it starts at
     xor ebx, ebx
 .rs_loop:
     cmp ebx, [segment_count]
@@ -2912,6 +2918,13 @@ render_strip:
     imul rax, SEG_STRIDE_REAL
     lea r13, [segments + rax]
     movzx ecx, byte [r13 + SEG_OFF_OUT_LEN]
+    ; Jump right to the flush-right block, unless the left part reaches past it.
+    cmp ebx, r14d
+    jne .rs_left
+    cmp r12d, r15d
+    jge .rs_left
+    mov r12d, r15d
+.rs_left:
     test ecx, ecx
     jz .rs_next
     ; Apply per-segment leading gap override BEFORE drawing.
@@ -2957,10 +2970,92 @@ render_strip:
     call x11_flush
     mov byte [strip_dirty], 0
 
+    pop r15
+    pop r14
     pop r13
     pop r12
     pop rbx
 .rs_skip:
+    ret
+
+; The first segment marked '>' and the x where it starts, so that it and
+; every segment after it end flush against the tray icons (or the right
+; edge when there are none). The walk's last cfg_gap is the right margin.
+; Returns ecx = that segment's index (-1 if none), eax = its x.
+right_x:
+    push rbx
+    xor ebx, ebx
+.rx_find:
+    cmp ebx, [segment_count]
+    jge .rx_none
+    mov rax, rbx
+    imul rax, SEG_STRIDE_REAL
+    test byte [segments + rax + SEG_OFF_FLAGS], SEG_FLAG_RIGHT
+    jnz .rx_found
+    inc ebx
+    jmp .rx_find
+.rx_none:
+    mov ecx, -1
+    xor eax, eax
+    pop rbx
+    ret
+.rx_found:
+    push rbx                              ; the index, returned in ecx
+    movzx r9d, word [x11_screen_width]
+    mov eax, [tray_icon_size]
+    add eax, [tray_padding]
+    imul eax, [tray_icon_count]
+    sub r9d, eax                          ; r9d = right edge of the text
+.rx_sum:
+    cmp ebx, [segment_count]
+    jge .rx_summed
+    mov rax, rbx
+    imul rax, SEG_STRIDE_REAL
+    lea r10, [segments + rax]
+    movzx edx, byte [r10 + SEG_OFF_OUT_LEN]
+    test edx, edx
+    jz .rx_next
+    lea rsi, [r10 + SEG_OFF_OUTPUT]
+    call seg_chars
+    imul eax, [char_width_var]
+    sub r9d, eax
+    sub r9d, [r10 + SEG_OFF_GAP_OVR]
+    sub r9d, [cfg_gap]
+.rx_next:
+    inc ebx
+    jmp .rx_sum
+.rx_summed:
+    pop rcx
+    mov eax, r9d
+    pop rbx
+    ret
+
+; Display characters in a segment's output, counted the way
+; render_segment_sgr draws them: UTF-8 lead bytes outside ESC[...m.
+; rsi = buffer, edx = byte length. Returns eax. Clobbers ecx, r8d.
+seg_chars:
+    xor eax, eax
+    xor ecx, ecx
+.sc_loop:
+    cmp ecx, edx
+    jge .sc_done
+    movzx r8d, byte [rsi + rcx]
+    inc ecx
+    cmp r8b, 0x1B
+    je .sc_esc
+    and r8b, 0xC0
+    cmp r8b, 0x80                         ; continuation byte
+    je .sc_loop
+    inc eax
+    jmp .sc_loop
+.sc_esc:
+    cmp ecx, edx
+    jge .sc_done
+    cmp byte [rsi + rcx], 'm'
+    lea ecx, [ecx + 1]
+    jne .sc_esc
+    jmp .sc_loop
+.sc_done:
     ret
 
 ; edi = x, esi = y, rdx = ptr to text; assumes text terminates at NUL
@@ -3313,6 +3408,29 @@ register_segment:
     mov al, [r13]
     test al, al
     jz .rseg_done
+
+    ; Optional '>' (then whitespace): this segment and every one after
+    ; it sit flush right.
+    cmp byte [r13], '>'
+    jne .rseg_no_right
+    movzx eax, byte [r13 + 1]
+    cmp al, ' '
+    je .rseg_right_take
+    cmp al, 9
+    jne .rseg_no_right
+.rseg_right_take:
+    or byte [r15 + SEG_OFF_FLAGS], SEG_FLAG_RIGHT
+    inc r13
+.rseg_right_ws:
+    movzx eax, byte [r13]
+    cmp al, ' '
+    je .rseg_right_inc
+    cmp al, 9
+    jne .rseg_no_right
+.rseg_right_inc:
+    inc r13
+    jmp .rseg_right_ws
+.rseg_no_right:
 
     ; Optional gap override: if remainder starts with '+digits' followed
     ; by whitespace, parse the integer pixel count into GAP_OVR.
@@ -4400,6 +4518,7 @@ tray_undock_icon:
 tray_layout:
     push rbx
     push r12
+    mov byte [strip_dirty], 1             ; the flush-right text moves with the tray
     mov ecx, [tray_icon_count]
     test ecx, ecx
     jz .tl_done

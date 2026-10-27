@@ -2,7 +2,7 @@
 
 <img src="img/tile.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.73-blue)
+![Version](https://img.shields.io/badge/version-0.1.74-blue)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
 ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue)
@@ -121,7 +121,8 @@ DISPLAY=:9 glass                        # or: DISPLAY=:9 xterm
   the [chasm-bits](https://github.com/isene/chasm-bits) asmites
   (clock, battery, cpu, mem, disk, net, mailbox, brightness, vol,
   weather, wintitle). Per-segment refresh interval, `+N` leading-gap
-  override, default-fg colour, all driven by `~/.striprc`.
+  override, `>` to set a segment and all after it flush right,
+  default-fg colour, all driven by `~/.striprc`.
 - **XEMBED system tray** (phase 2c) — apps that emit `_NET_WM_S0`
   selection requests dock into strip's tray area.
 - **Stash / unstash** — i3 scratchpad replacement: a small LIFO of
