@@ -164,10 +164,12 @@ go 10; ten=$(win ten)
 # A new tile, not a restart: before v0.1.69 a restart ran the tile installed
 # in one fixed home folder, so the build under test never did the adopting.
 kill $TPID; wait $TPID 2>/dev/null
+spare=$(win spare)                      # takes the slot below the next tile's
 "$TILE" --no-autostart 2> "$T/tile2.log" &
 TPID=$!; pids+=($TPID)
 for _ in {1..30}; do grep -q 'adopt N=' "$T/tile2.log" && break; sleep 0.1; done
 sleep 0.3
+close spare                             # its slot stays free for the restarted tile
 go 10
 is "workspace 10 still has its window" "$(shown "$ten")" yes
 go 1
@@ -188,6 +190,14 @@ is "and that workspace still shows its window" "$(shown "$five")" yes
 go 1
 is "the windows are still there after the restart" "$(shown "$one")" yes
 is "and the window of workspace 5 is hidden there" "$(shown "$five")" no
+
+echo "== v0.1.75: tile still places windows after a restart"
+# frame ignored the new tile's claim while the old tile still had it, so
+# windows opened after the restart kept their own size. A race, but the
+# window closed above makes the build before the fix fail here each run.
+go 8; after=$(win after)
+is "a window opened after the restart fills the screen" \
+    "$(xwininfo -id "$after" 2>/dev/null | sed -n 's/.*Width: *//p')" 1920
 
 echo
 if [ $fails -eq 0 ]; then echo "tile tests: all good"; else echo "tile tests: $fails failed"; fi

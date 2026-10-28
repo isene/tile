@@ -278,7 +278,7 @@ naflag_str:      db "--no-autostart", 0    ; argv flag set by action_restart
 verflag_str:     db "--version", 0
 rsflag_str:      db "--restarted", 0       ; argv flag: a real restart, say so
 restart_note_cmd: db "notify-send -a tile -t 3000 -h string:bgcolor:#B7472A -h string:fgcolor:#FFFFFF -h string:frcolor:#B7472A 'tile restarted'", 0
-tile_ver_str:    db "tile 0.1.73", 10
+tile_ver_str:    db "tile 0.1.75", 10
 tile_ver_len     equ $ - tile_ver_str
 tile_usage_str:  db "usage: tile [--no-autostart] [--version] [--help]", 10
                  db "tile is a window manager: with no flags it takes over $DISPLAY.", 10
@@ -1094,6 +1094,7 @@ recent_unmap_head:    resd 1                  ; next slot to overwrite
 %define PENDING_MAX 64
 pending_events:      resb 32 * PENDING_MAX
 pending_count:       resd 1
+rrq_error:           resb 1        ; the last X error code read_reply_or_queue dropped
 pending_head:        resd 1
 
 ; Binding table.
@@ -1387,7 +1388,6 @@ _start:
 
     ; Become the WM by selecting substructure-redirect on root.
     call select_substructure_redirect
-    call x11_flush
     call check_redirect_ok
     test rax, rax
     jnz .die_redirect
@@ -2023,7 +2023,9 @@ resolve_and_grab_binds:
 ; ══════════════════════════════════════════════════════════════════════
 
 select_substructure_redirect:
-    ; ChangeWindowAttributes(root, CW_EVENT_MASK, mask)
+    mov esi, SUBSTRUCTURE_REDIRECT_MASK | SUBSTRUCTURE_NOTIFY_MASK | PROPERTY_CHANGE_MASK | KEY_PRESS_MASK
+set_root_event_mask:
+    ; ChangeWindowAttributes(root, CW_EVENT_MASK, esi)
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_CHANGE_WINDOW_ATTRS
     mov byte [rdi+1], 0
@@ -2031,7 +2033,7 @@ select_substructure_redirect:
     mov eax, [x11_root_window]
     mov [rdi+4], eax
     mov dword [rdi+8], CW_EVENT_MASK
-    mov dword [rdi+12], SUBSTRUCTURE_REDIRECT_MASK | SUBSTRUCTURE_NOTIFY_MASK | PROPERTY_CHANGE_MASK | KEY_PRESS_MASK
+    mov [rdi+12], esi
     lea rsi, [tmp_buf]
     mov rdx, 16
     call x11_buffer
@@ -2528,44 +2530,28 @@ adopt_existing_windows:
     pop rbx
     ret
 
-; After flushing the substructure-redirect request, read once with a short
-; poll; if an X error of code BadAccess arrives, another WM is running.
+; Ask for the input focus and read up to the reply. The answer to the
+; claim comes before it, so a BadAccess read on the way means another
+; client has the redirect: rax = 1, else 0. The old check read only the
+; first packet, so a refusal that came after an event went unseen.
 check_redirect_ok:
-    push rbx
-    ; poll(fd, POLLIN, 100ms)
-    sub rsp, 16
-    mov dword [rsp], 0          ; padding
-    mov eax, [x11_fd]
-    mov [rsp + 0], eax
-    mov word [rsp + 4], 1       ; POLLIN
-    mov word [rsp + 6], 0
-    mov rax, SYS_POLL
-    lea rdi, [rsp]
-    mov esi, 1
-    mov edx, 100                ; ms
-    syscall
-    test rax, rax
-    jle .cro_ok                 ; timeout = no error = we own it
-    ; Read a 32-byte event/error
-    mov rax, SYS_READ
+    call x11_flush
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_GET_INPUT_FOCUS
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 1
+    mov rax, SYS_WRITE
     mov rdi, [x11_fd]
-    lea rsi, [x11_read_buf]
-    mov rdx, 32
+    lea rsi, [tmp_buf]
+    mov rdx, 4
     syscall
-    cmp rax, 32
-    jl .cro_ok
-    cmp byte [x11_read_buf], 0  ; 0 = error
-    jne .cro_ok
-    cmp byte [x11_read_buf + 1], 10   ; 10 = BadAccess
-    jne .cro_ok
-    add rsp, 16
-    mov rax, 1
-    pop rbx
-    ret
-.cro_ok:
-    add rsp, 16
+    inc dword [x11_seq]
+    mov byte [rrq_error], 0
+    lea rdi, [recov_reply_buf]
+    call read_reply_or_queue
     xor eax, eax
-    pop rbx
+    cmp byte [rrq_error], 10    ; 10 = BadAccess
+    sete al
     ret
 
 ; edi = keycode (low 8 bits), esi = base modifier mask (low 16 bits).
@@ -7245,7 +7231,7 @@ read_reply_or_queue:
     cmp al, 1
     je .rrq_reply
     cmp al, 0
-    je .rrq_loop                          ; X error — drop, keep waiting
+    je .rrq_error                         ; X error — drop, keep waiting
     ; Event — append to pending queue.
     mov ecx, [pending_count]
     cmp ecx, PENDING_MAX
@@ -7272,6 +7258,10 @@ read_reply_or_queue:
     dec ecx
     jnz .rrq_copy
     inc dword [pending_count]
+    jmp .rrq_loop
+.rrq_error:
+    mov al, [r12 + 1]
+    mov [rrq_error], al                   ; its code, for check_redirect_ok
     jmp .rrq_loop
 .rrq_reply:
     mov eax, 1
@@ -8716,6 +8706,15 @@ action_restart:
     ; needs to outlive this process.
     lea rdi, [rel .ar_snixembed]
     call fork_exec_string
+    ; Give up the right to place windows, and wait until frame has read
+    ; it. Frame ignores a claim while the old tile still has it, with no
+    ; error, and it can read the new tile before it sees the old one
+    ; close: after a client quits, the new tile gets the lower slot. Then
+    ; every window went unplaced (gluon over the strip, 2026-10-28). A
+    ; window mapped in the gap is adopted by the new tile.
+    mov esi, SUBSTRUCTURE_NOTIFY_MASK | PROPERTY_CHANGE_MASK | KEY_PRESS_MASK
+    call set_root_event_mask
+    call check_redirect_ok
     ; Build argv = [path, "--no-autostart", "--restarted", NULL] so the
     ; re-exec'd tile skips autostart and shows the restart notice.
     ; --restarted is its own flag because test runs on scratch displays
