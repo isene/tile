@@ -13,3 +13,4 @@ bind Mod4+0 workspace 10
 bind Mod4+Tab layout toggle
 bind Mod4+comma move-tab left
 bind Mod4+period move-tab right
+bind Mod4+Shift+? workspace 6

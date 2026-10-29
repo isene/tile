@@ -278,7 +278,7 @@ naflag_str:      db "--no-autostart", 0    ; argv flag set by action_restart
 verflag_str:     db "--version", 0
 rsflag_str:      db "--restarted", 0       ; argv flag: a real restart, say so
 restart_note_cmd: db "notify-send -a tile -t 3000 -h string:bgcolor:#B7472A -h string:fgcolor:#FFFFFF -h string:frcolor:#B7472A 'tile restarted'", 0
-tile_ver_str:    db "tile 0.1.75", 10
+tile_ver_str:    db "tile 0.1.76", 10
 tile_ver_len     equ $ - tile_ver_str
 tile_usage_str:  db "usage: tile [--no-autostart] [--version] [--help]", 10
                  db "tile is a window manager: with no flags it takes over $DISPLAY.", 10
@@ -1962,28 +1962,38 @@ x11_get_keymap:
     pop rbx
     ret
 
-; Find first keycode whose group-1 keysym matches eax. Returns keycode in
-; al (0 if not found).
+; Find the keycode for the keysym in eax: first a key where it is the
+; plain symbol, then one where it needs Shift, so "?" finds the slash key
+; on a US keyboard. Returns keycode in al (0 if not found).
 find_keycode_for_keysym:
     push rbx
+    push r8
     mov ebx, eax
+    xor r8d, r8d              ; column: 0 plain, 1 with Shift
+.fkc_col:
     movzx ecx, byte [x11_min_keycode]
     movzx edx, byte [x11_max_keycode]
 .fkc_loop:
     cmp ecx, edx
-    jg .fkc_none
+    jg .fkc_next_col
     mov eax, ecx
     shl eax, 3                ; keycode * 8 (8 syms per keycode)
+    add eax, r8d
     cmp dword [keysym_map + rax*4], ebx
     je .fkc_hit
     inc ecx
     jmp .fkc_loop
-.fkc_none:
+.fkc_next_col:
+    inc r8d
+    cmp r8d, 2
+    jb .fkc_col
     xor eax, eax
+    pop r8
     pop rbx
     ret
 .fkc_hit:
     mov eax, ecx
+    pop r8
     pop rbx
     ret
 

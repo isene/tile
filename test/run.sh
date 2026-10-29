@@ -199,6 +199,12 @@ go 8; after=$(win after)
 is "a window opened after the restart fills the screen" \
     "$(xwininfo -id "$after" 2>/dev/null | sed -n 's/.*Width: *//p')" 1920
 
+echo "== v0.1.76: a bind on a key that needs Shift, like ?"
+# On frame's US keymap "?" is Shift+slash. tile looked only at the plain
+# symbol of each key, found no key for "?" and grabbed nothing.
+go 1; xdotool key super+shift+slash; sleep 0.3
+is "Mod4+? reaches its bind" "$(cur)" 5
+
 echo
 if [ $fails -eq 0 ]; then echo "tile tests: all good"; else echo "tile tests: $fails failed"; fi
 exit $((fails > 0))
