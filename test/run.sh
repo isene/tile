@@ -277,6 +277,9 @@ echo "== v0.1.85: bold letters keep a gap between them"
 # bold = 1 drew each letter twice, a pixel apart, and the 4 of the
 # battery's "4.54W" ran into its W. Terminus Bold, drawn once, leaves a
 # blank column after each letter: the first run of ink is the 4 alone.
+# Terminus Bold starts its letters a pixel left of the regular ones, at
+# the edge of an LCARS block; strip moves them back. The text starts at
+# x=4, so the 4's ink starts at x=5.
 kill "${pids[-1]}"; sleep 0.3
 printf '%s\n' 'height = 22' 'fg = #cccccc' 'bg = #000000' 'bold = 1' \
     'segment a #cccccc printf 4W 0' > "$HOME/.striprc"
@@ -290,10 +293,10 @@ for f in /tmp/frame${D}_win_*.raw; do
     run=$(for r in {0..21}; do od -An -v -tu1 -w1600 -j $((r * 7680)) -N 1600 "$f"; done | awk '
         { for (c = 0; c < 400; c++) if ($(c * 4 + 1) > 100) lit[c] = 1 }
         END { for (c = 0; c < 400 && !lit[c]; c++); n = 0
-              while (lit[c + n]) n++; print n }')
+              while (lit[c + n]) n++; print c, n }')
 done
 rm -f /tmp/frame${D}_*.raw
-is "the 4 is 7 columns of ink, then a gap" "$run" 7
+is "the 4 starts at x=5, 7 columns of ink, then a gap" "$run" "5 7"
 
 echo
 if [ $fails -eq 0 ]; then echo "tile tests: all good"; else echo "tile tests: $fails failed"; fi

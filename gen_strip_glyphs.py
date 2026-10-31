@@ -11,7 +11,9 @@ from PIL import ImageFont
 
 FONT = os.path.expanduser("~/.local/share/fonts/TerminessNerdFontMono-Regular.ttf")
 # bold = 1 in .striprc takes these letters instead. Terminus Bold leaves a
-# blank column after each letter, so "4W" stays two letters.
+# blank column after each letter, so "4W" stays two letters. Its letters
+# start one pixel left of the regular ones, at the very edge of an LCARS
+# block, so rasterize() moves each one that has room a pixel right.
 FONT_BOLD = os.path.expanduser("~/.local/share/fonts/TerminessNerdFontMono-Bold.ttf")
 SIZE = 16                      # Terminus (narrow, crisp) at adv 8 / ascent 15 — taller
                                # than the DejaVu 13 and a narrower typeface. Restores the
@@ -54,8 +56,9 @@ if fallback:
     CODEPOINTS = sorted(set(CODEPOINTS) | set(KATAKANA))
 
 
-def rasterize(path):
-    """One table and atlas: entries (cp, w, h, x, y, adv, off) and the blob."""
+def rasterize(path, shift=False):
+    """One table and atlas: entries (cp, w, h, x, y, adv, off) and the blob.
+    shift: move a letter one pixel right when its last column is blank."""
     font = ImageFont.truetype(path, SIZE)
     ascent = font.getmetrics()[0]
     entries, blob = [], bytearray()
@@ -75,6 +78,10 @@ def rasterize(path):
             line = raw[row * w:(row + 1) * w]
             blob += line + b"\x00" * (stride - w)
         bearing_x = ox                       # left side bearing
+        if shift and cp not in KATAKANA:
+            ink = [c for c in range(w) if any(raw[r * w + c] > 64 for r in range(h))]
+            if ink and ox + ink[-1] < adv - 1:
+                bearing_x += 1
         bearing_y = top - oy                 # top bearing (baseline-up to bitmap top)
         x = (-bearing_x) & 0xFFFF            # GLYPHINFO x = -bearingL (s16)
         y = bearing_y & 0xFFFF               # GLYPHINFO y = +bearingT (s16)
@@ -84,7 +91,7 @@ def rasterize(path):
 
 ascent, descent = ImageFont.truetype(FONT, SIZE).getmetrics()
 entries, blob = rasterize(FONT)
-entries_bold, blob_bold = rasterize(FONT_BOLD)
+entries_bold, blob_bold = rasterize(FONT_BOLD, shift=True)
 
 # Worst-case single-glyph AddGlyphs payload (28 header + padded alpha).
 max_payload = 0
