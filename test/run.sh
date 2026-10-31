@@ -211,8 +211,10 @@ echo "== v0.1.77: strip's LCARS look"
 # background. "fg" comes first: a key that half matched used to move the
 # parser on, so a line after it could miss its own key.
 printf '%s\n' 'height = 22' 'fg = #cccccc' 'bg = #000000' 'blocks = 1' \
-    'colours = #ff9900, #ffcc99' \
-    'segment a #cccccc printf ABCDEF 0' 'segment b #cccccc printf GH 0' > "$HOME/.striprc"
+    'colours = #ff9900, #ffcc99, #cc99cc, #00ff00' \
+    'segment a #cccccc printf ABCDEF 0' 'segment b #cccccc printf GH 0' \
+    "segment v #cccccc sh -c 'printf \" \"' 0" \
+    "segment c #cccccc sh -c 'printf \" \\033[38;2;0;0;255mIJ\"' 0" > "$HOME/.striprc"
 "${STRIP:-$here/../strip}" 2> "$T/strip.log" &
 pids+=($!); sleep 1
 rm -f /tmp/frame${D}_win_*.raw; kill -USR1 "${pids[0]}"; sleep 0.5
@@ -222,6 +224,7 @@ for f in /tmp/frame${D}_win_*.raw; do
     px=$(od -An -tx1 -j $(((1920 + 4) * 4)) -N3 "$f" | tr -d ' ')
     edge=$(od -An -tx1 -j $(((1920 + 1) * 4)) -N3 "$f" | tr -d ' ')
     tail=$(od -An -tx1 -j $(((1920 + 1919) * 4)) -N3 "$f" | tr -d ' ')
+    row=$(od -An -v -tx1 -w4 -j $((1920 * 4)) -N $((1920 * 4)) "$f" | tr -d ' ' | cut -c1-6 | sort -u | tr '\n' ' ')
 done
 rm -f /tmp/frame${D}_*.raw
 is "the pixel above the first letters is orange (BGR)" "$px" 0099ff
@@ -230,10 +233,17 @@ echo "== v0.1.78: no black between LCARS segments"
 # The margin left of the first segment takes its colour.
 is "the left margin is orange too" "$edge" 0099ff
 
-echo "== v0.1.79: the segment before fills the gap after it"
-# The second segment, peach in the colours above, runs on to the right
-# edge, where 0.1.78 left the margin black.
-is "the right edge is the last segment's peach" "$tail" 99ccff
+echo "== v0.1.79, v0.1.80: the segment before fills the gap after it"
+# The last segment prints its letters in blue, and that blue, not its
+# orange from the colours above, runs on to the right edge.
+is "the right edge is the blue of the last letters" "$tail" ff0000
+
+echo "== v0.1.80: a blank segment draws no block of its own"
+# Segment v prints a space, like the vpn mark with no tunnel up, and c
+# starts with one, like the mail counts. Neither lilac (v's turn in the
+# colours) nor green (c's) may show: the bar above the letters is orange
+# (a), peach (b) and the blue of c's letters alone.
+is "the colours on the bar" "$row" "0099ff 99ccff ff0000 "
 
 echo
 if [ $fails -eq 0 ]; then echo "tile tests: all good"; else echo "tile tests: $fails failed"; fi

@@ -351,7 +351,9 @@ cfg_block_text:      resd 1            ; block_text = #RRGGBB, the letters on a 
 block_colours:       resd MAX_BLOCK_COLOURS ; colours = #a,#b,...: segments take them in turn
 block_count:         resd 1            ; how many; 0: each segment keeps its own colour
 block_x:             resd 1            ; where the last segment's text ended
-block_prev:          resd 1            ; and its colour
+block_prev:          resd 1            ; and the colour of its last letters
+block_join:          resd 1            ; x where a run of spaces began, 0: none
+block_drawn:         resb 1            ; this segment has drawn a block
 
 ; XEMBED system tray.
 %define MAX_TRAY_ICONS 24
@@ -2224,11 +2226,71 @@ block_colour:
 ; One run as a block: its cells, the bar's full height, filled in the
 ; run's colour (gc_id has it as foreground), and the letters in
 ; block_text. edi = x, edx = codepoints.
+; A run of spaces draws no block: its room goes to the next block, so a
+; segment's leading space and a blank segment (the vpn mark prints one
+; with no tunnel up) take the colour of the letters after them. The first
+; block of a segment fills the gap before it in the colour of the last
+; letters before it (its own colour at the left edge).
 block_run:
+    lea rsi, [tmp_buf + 1024]
+    xor ecx, ecx
+.br_scan:
+    cmp ecx, edx
+    jge .br_spaces
+    cmp word [rsi + rcx*2], 0x2000        ; ' ', big-endian
+    jne .br_letters
+    inc ecx
+    jmp .br_scan
+.br_spaces:
+    cmp dword [block_join], 0
+    jne .br_done
+    mov [block_join], edi
+.br_done:
+    ret
+.br_letters:
+    push rbx
+    push r12
+    mov r12d, [text_color]                ; this run's colour
     imul edx, [char_width_var]
+    mov eax, [block_join]
+    test eax, eax
+    jz .br_from
+    add edx, edi
+    sub edx, eax
+    mov edi, eax
+    mov dword [block_join], 0
+.br_from:
+    cmp byte [block_drawn], 0
+    jne .br_fill
+    mov byte [block_drawn], 1
+    mov ebx, [block_x]
+    test ebx, ebx
+    jnz .br_gap
+    add edx, edi                          ; the left edge: from x = 0
+    xor edi, edi
+    jmp .br_fill
+.br_gap:
+    push rdi
+    push rdx
+    mov eax, [block_prev]
+    call change_gc_fg
+    mov edx, [rsp + 8]
+    sub edx, ebx
+    jle .br_nogap
+    mov edi, ebx
     call block_rect
+.br_nogap:
+    mov eax, r12d
+    call change_gc_fg
+    pop rdx
+    pop rdi
+.br_fill:
+    call block_rect
+    mov [block_prev], r12d
     mov eax, [cfg_block_text]
     mov [text_color], eax
+    pop r12
+    pop rbx
     ret
 
 ; Fill edx pixels from x = edi, the bar's full height, in gc_id's colour.
@@ -2990,6 +3052,7 @@ render_strip:
     mov r14d, ecx                         ; first '>' segment, -1 if none
     mov r15d, eax                         ; the x it starts at
     mov dword [block_x], 0
+    mov dword [block_join], 0
     xor ebx, ebx
 .rs_loop:
     cmp ebx, [segment_count]
@@ -3013,26 +3076,8 @@ render_strip:
     mov ecx, [r13 + SEG_OFF_DEFAULT_FG]   ; default fg (0 → cfg_fg)
     cmp byte [cfg_blocks], 0
     je .rs_draw
+    mov byte [block_drawn], 0
     call block_colour
-    ; No black between segments: the one before fills the gap after it
-    ; (this one fills the left margin when it comes first).
-    push rcx
-    push rdx
-    mov eax, [block_prev]
-    cmp dword [block_x], 0
-    jne .rs_gap
-    mov eax, ecx
-.rs_gap:
-    mov [block_prev], ecx
-    call change_gc_fg
-    mov edi, [block_x]
-    mov edx, r12d
-    sub edx, edi
-    jle .rs_filled
-    call block_rect
-.rs_filled:
-    pop rdx
-    pop rcx
 .rs_draw:
     mov edi, r12d                         ; start x
     lea rsi, [r13 + SEG_OFF_OUTPUT]       ; buffer
@@ -3040,7 +3085,10 @@ render_strip:
     ; rax = display chars drawn. Advance x by chars*char_width + cfg_gap.
     imul eax, [char_width_var]
     add r12d, eax
+    cmp byte [block_drawn], 0
+    je .rs_blank
     mov [block_x], r12d
+.rs_blank:
     add r12d, [cfg_gap]
     and byte [r13 + SEG_OFF_FLAGS], ~SEG_FLAG_DIRTY
 .rs_next:
