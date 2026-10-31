@@ -33,6 +33,12 @@ SYMBOLS = [
 ]
 _cand = sorted(set(range(32, 127)) | set(range(160, 256)) | set(SYMBOLS))
 
+# Half-width katakana (U+FF66..FF9D), the letters of the Matrix code, for
+# the matrix view's bar. Terminus has none; Droid Sans Fallback draws them
+# 8 px wide at this size, one cell each.
+FALLBACK = "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf"
+KATAKANA = list(range(0xFF66, 0xFF9E))
+
 try:
     from fontTools.ttLib import TTFont
     _cmap = TTFont(FONT).getBestCmap()
@@ -42,14 +48,18 @@ except Exception:
 
 font = ImageFont.truetype(FONT, SIZE)
 ascent, descent = font.getmetrics()
+fallback = ImageFont.truetype(FALLBACK, SIZE) if os.path.exists(FALLBACK) else None
+if fallback:
+    CODEPOINTS = sorted(set(CODEPOINTS) | set(KATAKANA))
 
 entries = []   # (cp, w, h, x, y, adv, data_off)
 blob = bytearray()
 
 for cp in CODEPOINTS:
     ch = chr(cp)
-    adv = round(font.getlength(ch))
-    mask, (ox, oy) = font.getmask2(ch, mode="L")
+    f, top = (fallback, fallback.getmetrics()[0]) if cp in KATAKANA else (font, ascent)
+    adv = round(f.getlength(ch))
+    mask, (ox, oy) = f.getmask2(ch, mode="L")
     w, h = mask.size
     if w == 0 or h == 0:                 # space / empty glyph
         entries.append((cp, 0, 0, 0, 0, adv, len(blob)))
@@ -61,7 +71,7 @@ for cp in CODEPOINTS:
         line = raw[row * w:(row + 1) * w]
         blob += line + b"\x00" * (stride - w)
     bearing_x = ox                       # left side bearing
-    bearing_y = ascent - oy              # top bearing (baseline-up to bitmap top)
+    bearing_y = top - oy                 # top bearing (baseline-up to bitmap top)
     x = (-bearing_x) & 0xFFFF            # GLYPHINFO x = -bearingL (s16)
     y = bearing_y & 0xFFFF               # GLYPHINFO y = +bearingT (s16)
     entries.append((cp, w, h, x, y, adv, off))

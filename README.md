@@ -127,6 +127,9 @@ DISPLAY=:9 glass                        # or: DISPLAY=:9 xterm
   it; `colours = #a, #b, ...` gives the segments colours in turn,
   `block_text` the letters on a block and `bold = 1` bold letters. The
   LCARS view of [fe2o3](https://github.com/isene/fe2o3) sets them.
+  `segment_fg = #rrggbb` gives every segment's letters one colour
+  instead of the one on its own line; colours a segment prints itself
+  stay. The bar draws half-width katakana too. The matrix view uses both.
 - **XEMBED system tray** (phase 2c) — apps that emit `_NET_WM_S0`
   selection requests dock into strip's tray area.
 - **Stash / unstash** — i3 scratchpad replacement: a small LIFO of

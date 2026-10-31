@@ -347,6 +347,10 @@ cfg_gap:             resd 1            ; pixels of padding between segments
 cfg_blocks:          resb 1            ; blocks = 1
 cfg_bold:            resb 1            ; bold = 1: every letter drawn twice, a pixel apart
 cfg_block_text:      resd 1            ; block_text = #RRGGBB, the letters on a block (black)
+; segment_fg = #RRGGBB: every segment's letters in this colour instead of
+; the one on its own line; colours a segment prints itself stay (the matrix
+; view). 0: each keeps its own.
+cfg_segment_fg:      resd 1
 %define MAX_BLOCK_COLOURS 8
 block_colours:       resd MAX_BLOCK_COLOURS ; colours = #a,#b,...: segments take them in turn
 block_count:         resd 1            ; how many; 0: each segment keeps its own colour
@@ -3074,6 +3078,9 @@ render_strip:
     add r12d, [r13 + SEG_OFF_GAP_OVR]
     mov edx, ecx                          ; byte length
     mov ecx, [r13 + SEG_OFF_DEFAULT_FG]   ; default fg (0 → cfg_fg)
+    mov eax, [cfg_segment_fg]             ; segment_fg, when set, over it
+    test eax, eax
+    cmovnz ecx, eax
     cmp byte [cfg_blocks], 0
     je .rs_draw
     mov byte [block_drawn], 0
@@ -3954,6 +3961,16 @@ apply_setting:
     call .as_streq
     test eax, eax
     jnz .as_colours
+    lea rsi, [.k_segment_fg]
+    call .as_streq
+    test eax, eax
+    jnz .as_segment_fg
+    pop rbx
+    ret
+.as_segment_fg:
+    mov rdi, rbx
+    call parse_hex
+    mov [cfg_segment_fg], eax
     pop rbx
     ret
 .as_blocks:
@@ -4144,6 +4161,7 @@ apply_setting:
 .k_bold:       db "bold", 0
 .k_block_text: db "block_text", 0
 .k_colours:    db "colours", 0
+.k_segment_fg: db "segment_fg", 0
 .k_palette:    db "palette.", 0
 
 ; rdi = source NUL-terminated string. Copy into arg_pool, return offset
