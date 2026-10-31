@@ -278,7 +278,7 @@ naflag_str:      db "--no-autostart", 0    ; argv flag set by action_restart
 verflag_str:     db "--version", 0
 rsflag_str:      db "--restarted", 0       ; argv flag: a real restart, say so
 restart_note_cmd: db "notify-send -a tile -t 3000 -h string:bgcolor:#B7472A -h string:fgcolor:#FFFFFF -h string:frcolor:#B7472A 'tile restarted'", 0
-tile_ver_str:    db "tile 0.1.81", 10
+tile_ver_str:    db "tile 0.1.82", 10
 tile_ver_len     equ $ - tile_ver_str
 tile_usage_str:  db "usage: tile [--no-autostart] [--version] [--help]", 10
                  db "tile is a window manager: with no flags it takes over $DISPLAY.", 10
@@ -2942,23 +2942,17 @@ event_loop:
     ; this is a re-map of an existing client (e.g. GIMP's first-run
     ; plug-in scan unmaps its splash and remaps the main window
     ; minutes later, after the recent_unmap ring has expired). Skip
-    ; track_client and just send MapWindow — the client is already
-    ; bound to its workspace and will get re-tiled on the next layout
-    ; pass.
+    ; track_client and let its workspace's layout decide: it maps the
+    ; window only when that workspace is in view, and in tabs only the
+    ; front one. A plain MapWindow here showed gaze, which asks twice
+    ; at login, on top of whatever workspace was in view, and no
+    ; workspace switch hid it again.
     mov eax, [x11_read_buf + 8]
     call find_client_index
     cmp eax, -1
     je .ev_mr_not_tracked
-    lea rdi, [tmp_buf]
-    mov byte [rdi], X11_MAP_WINDOW
-    mov byte [rdi+1], 0
-    mov word [rdi+2], 2
-    mov eax, [x11_read_buf + 8]
-    mov [rdi+4], eax
-    lea rsi, [tmp_buf]
-    mov rdx, 8
-    call x11_buffer
-    inc dword [x11_seq]
+    movzx eax, byte [client_ws + rax]
+    call apply_workspace_layout
     call x11_flush
     jmp event_loop
 .ev_mr_not_tracked:

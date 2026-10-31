@@ -212,6 +212,14 @@ go 5; kill -USR1 $TPID; sleep 0.5
 is "workspace 1's window stays hidden after a reload" "$(shown "$one")" no
 is "and workspace 5's window is still there" "$(shown "$five")" yes
 
+echo "== v0.1.82: a window that asks again stays on its own workspace"
+# gaze asks to be shown twice at login. tile mapped the second ask at
+# once, on top of the workspace in view, and no switch hid it again.
+go 5; xdotool windowmap "$one"; sleep 0.3
+is "workspace 1's window stays hidden when it asks to be shown" "$(shown "$one")" no
+go 1
+is "and it shows when its workspace does" "$(shown "$one")" yes
+
 echo "== v0.1.77: strip's LCARS look"
 # blocks = 1 puts each text run on a block of colour. The first segment's
 # block is orange, so a pixel above its letters is orange, not the black
