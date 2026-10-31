@@ -358,6 +358,7 @@ block_count:         resd 1            ; how many; 0: each segment keeps its own
 block_x:             resd 1            ; where the last segment's text ended
 block_prev:          resd 1            ; and the colour of its last letters
 block_join:          resd 1            ; x where a run of spaces began, 0: none
+block_ink:           resd 1            ; x where the last letters drawn end
 block_drawn:         resb 1            ; this segment has drawn a block
 
 ; XEMBED system tray.
@@ -2256,14 +2257,36 @@ block_run:
     push rbx
     push r12
     mov r12d, [text_color]                ; this run's colour
+    mov eax, edx                          ; where this run's last letter ends
+.br_tail:
+    dec eax
+    cmp word [rsi + rax*2], 0x2000
+    je .br_tail
+    inc eax
+    imul eax, [char_width_var]
+    add eax, edi
+    mov ebx, [block_ink]                  ; and where the letters before it end
+    mov [block_ink], eax
     imul edx, [char_width_var]
     mov eax, [block_join]
     test eax, eax
-    jz .br_from
+    jz .br_centre
     add edx, edi
     sub edx, eax
     mov edi, eax
     mov dword [block_join], 0
+.br_centre:
+    ; The block starts up to half a letter early, in the blank after the
+    ; letters before it, so "2 " shows its 2 in the middle of the block.
+    mov eax, edi
+    sub eax, ebx
+    jle .br_from
+    mov ecx, [char_width_var]
+    shr ecx, 1
+    cmp eax, ecx
+    cmovg eax, ecx
+    sub edi, eax
+    add edx, eax
 .br_from:
     cmp byte [block_drawn], 0
     jne .br_fill
@@ -3059,6 +3082,7 @@ render_strip:
     mov r15d, eax                         ; the x it starts at
     mov dword [block_x], 0
     mov dword [block_join], 0
+    mov dword [block_ink], 0
     xor ebx, ebx
 .rs_loop:
     cmp ebx, [segment_count]

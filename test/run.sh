@@ -246,11 +246,12 @@ printf '%s\n' 'height = 22' 'fg = #cccccc' 'bg = #000000' 'blocks = 1' \
 "${STRIP:-$here/../strip}" 2> "$T/strip.log" &
 pids+=($!); sleep 1
 rm -f /tmp/frame${D}_win_*.raw; kill -USR1 "${pids[0]}"; sleep 0.5
-px=no; edge=no; tail=no
+px=no; edge=no; tail=no; early=no
 for f in /tmp/frame${D}_win_*.raw; do
     [ "$(stat -c %s "$f" 2>/dev/null)" = $((1920 * 22 * 4)) ] || continue
     px=$(od -An -tx1 -j $(((1920 + 4) * 4)) -N3 "$f" | tr -d ' ')
     edge=$(od -An -tx1 -j $(((1920 + 1) * 4)) -N3 "$f" | tr -d ' ')
+    early=$(od -An -tx1 -j $(((1920 + 57) * 4)) -N3 "$f" | tr -d ' ')
     tail=$(od -An -tx1 -j $(((1920 + 1919) * 4)) -N3 "$f" | tr -d ' ')
     row=$(od -An -v -tx1 -w4 -j $((1920 * 4)) -N $((1920 * 4)) "$f" | tr -d ' ' | cut -c1-6 | sort -u | tr '\n' ' ')
 done
@@ -260,6 +261,11 @@ is "the pixel above the first letters is orange (BGR)" "$px" 0099ff
 echo "== v0.1.78: no black between LCARS segments"
 # The margin left of the first segment takes its colour.
 is "the left margin is orange too" "$edge" 0099ff
+
+echo "== v0.1.87: a block starts half a letter early"
+# A block's letters sit in its middle: GH starts at x=60, after the gap
+# that follows ABCDEF, so its peach block starts at x=56.
+is "the pixel at x=57 is peach (BGR)" "$early" 99ccff
 
 echo "== v0.1.79, v0.1.80: the segment before fills the gap after it"
 # The last segment prints its letters in blue, and that blue, not its
