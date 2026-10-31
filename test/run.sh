@@ -220,6 +220,19 @@ is "workspace 1's window stays hidden when it asks to be shown" "$(shown "$one")
 go 1
 is "and it shows when its workspace does" "$(shown "$one")" yes
 
+echo "== v0.1.83: a window fleet starts opens on its workspace, then shows"
+# fleet switched to a session's workspace before its glass existed, so the
+# wallpaper flashed until glass came up. Now fleet names the workspace and
+# the pid, and tile switches only once the window is on that workspace.
+go 2
+opened=$(OPEN_ON=6 win opened)
+is "tile shows the workspace fleet named" "$(cur)" 6
+is "with the window on it" "$(shown "$opened")" yes
+go 2
+later=$(win later)
+is "the next window opens where you are" "$(cur)" 1
+is "and shows there" "$(shown "$later")" yes
+
 echo "== v0.1.77: strip's LCARS look"
 # blocks = 1 puts each text run on a block of colour. The first segment's
 # block is orange, so a pixel above its letters is orange, not the black

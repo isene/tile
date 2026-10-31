@@ -278,7 +278,7 @@ naflag_str:      db "--no-autostart", 0    ; argv flag set by action_restart
 verflag_str:     db "--version", 0
 rsflag_str:      db "--restarted", 0       ; argv flag: a real restart, say so
 restart_note_cmd: db "notify-send -a tile -t 3000 -h string:bgcolor:#B7472A -h string:fgcolor:#FFFFFF -h string:frcolor:#B7472A 'tile restarted'", 0
-tile_ver_str:    db "tile 0.1.82", 10
+tile_ver_str:    db "tile 0.1.83", 10
 tile_ver_len     equ $ - tile_ver_str
 tile_usage_str:  db "usage: tile [--no-autostart] [--version] [--help]", 10
                  db "tile is a window manager: with no flags it takes over $DISPLAY.", 10
@@ -297,6 +297,8 @@ net_current_desktop_str: db "_NET_CURRENT_DESKTOP"
 net_current_desktop_len  equ $ - net_current_desktop_str
 tile_bar_state_str:      db "_TILE_BAR_STATE"
 tile_bar_state_len       equ $ - tile_bar_state_str
+tile_open_on_str:        db "_TILE_OPEN_ON"
+tile_open_on_len         equ $ - tile_open_on_str
 net_active_window_str: db "_NET_ACTIVE_WINDOW"
 net_active_window_len equ 18
 net_wm_desktop_str: db "_NET_WM_DESKTOP"
@@ -792,6 +794,14 @@ stash_class_count:       resd 1
 ; this in place of current_ws, then the byte is cleared.
 pending_assign_ws:       resb 1
 
+; _TILE_OPEN_ON from a launcher (fleet): the next window of process
+; open_on_pid goes on workspace open_on_ws, and tile switches there once
+; it is placed, so the empty workspace never shows. One shot: the next
+; MapRequest clears it, whichever window it is.
+open_on_pid:             resd 1
+open_on_ws:              resb 1             ; 1-based
+open_on_switch:          resb 1             ; ws to switch to after the map
+
 ; Scratch buffer for one synchronous WM_CLASS GetProperty round-trip.
 ; 32-byte reply header + room for the value bytes (instance\0class\0).
 %define WM_CLASS_BUF_SIZE 512
@@ -1050,6 +1060,7 @@ utf8_string_atom:       resd 1
 wm_check_window:        resd 1
 net_wm_pid_atom:        resd 1
 tile_bar_state_atom:    resd 1
+tile_open_on_atom:      resd 1
 
 ; EWMH window-type atoms (resolved at startup; 0 if unresolved means
 ; the X server has never seen the atom, which implies no window has
@@ -2854,6 +2865,8 @@ event_loop:
     ; screen being typed on. ClientMessage layout: window at +4,
     ; message_type atom at +8, data.l[0] at +12.
     mov eax, [x11_read_buf + 8]
+    cmp eax, [tile_open_on_atom]
+    je .ev_cm_open_on
     cmp eax, [net_current_desktop_atom]
     jne .ev_cm_active
     ; _NET_CURRENT_DESKTOP to the root (EWMH pager request: fleet, wmctrl
@@ -2874,6 +2887,23 @@ event_loop:
     cmp dil, [current_ws]
     je event_loop
     call switch_workspace
+    jmp event_loop
+.ev_cm_open_on:
+    ; _TILE_OPEN_ON to the root: data.l[0] is the 0-based workspace,
+    ; data.l[1] the pid of the program about to map a window there.
+    ; fleet sends it right after it starts a glass (v0.1.83).
+    test eax, eax
+    jz event_loop                         ; atom not interned
+    mov ecx, [x11_read_buf + 4]
+    cmp ecx, [x11_root_window]
+    jne event_loop
+    mov eax, [x11_read_buf + 12]
+    cmp eax, WS_COUNT
+    jae event_loop
+    inc eax
+    mov [open_on_ws], al
+    mov eax, [x11_read_buf + 16]
+    mov [open_on_pid], eax
     jmp event_loop
 .ev_cm_active:
     cmp eax, [net_active_window_atom]
@@ -3266,6 +3296,21 @@ event_loop:
     ;   1. `assign <class> <ws>`   → route to <ws> instead of current
     ;   2. `stash-on-map <class>`  → after tracking, push to stash
     ;                                 (i3-scratchpad equivalent)
+    mov eax, [open_on_pid]                ; did a launcher name this
+    test eax, eax                         ; window's workspace?
+    jz .ev_mr_no_open_on
+    mov dword [open_on_pid], 0            ; one shot
+    push rax
+    mov edi, [x11_read_buf + 8]
+    mov esi, [net_wm_pid_atom]
+    call read_cardinal
+    pop rcx
+    cmp eax, ecx
+    jne .ev_mr_no_open_on
+    movzx eax, byte [open_on_ws]
+    mov [open_on_switch], al
+    jmp .ev_mr_assigned
+.ev_mr_no_open_on:
     mov edi, [x11_read_buf + 8]
     call apply_assign                     ; eax = target ws or 0
     test eax, eax
@@ -3360,6 +3405,13 @@ event_loop:
     pop rax
     call set_active_tab_on_ws
 .ev_mr_done:
+    movzx edi, byte [open_on_switch]      ; placed for a launcher: show
+    test edi, edi                         ; its workspace now, with the
+    jz event_loop                         ; window already on it
+    mov byte [open_on_switch], 0
+    cmp dil, [current_ws]
+    je event_loop
+    call switch_workspace
     jmp event_loop
 
 .ev_configure_request:
@@ -6108,6 +6160,10 @@ intern_wm_atoms:
     mov esi, tile_bar_state_len
     call intern_one_atom
     mov [tile_bar_state_atom], eax
+    lea rdi, [tile_open_on_str]
+    mov esi, tile_open_on_len
+    call intern_one_atom
+    mov [tile_open_on_atom], eax
 
     ; _NET_WM_NAME — the overview popup reads it per window for labels.
     lea rdi, [net_wm_name_str]
@@ -6494,18 +6550,16 @@ read_wm_class:
     pop rbx
     ret
 
-; read_wm_desktop — edi = window XID. Returns eax = the workspace (1-based)
-; the window was on, from the _NET_WM_DESKTOP tile publishes on every
-; managed window, or 0 if it has none. Used when adopting after a restart,
-; so windows go back where they were instead of piling onto the current ws.
-read_wm_desktop:
+; read_cardinal — edi = window XID, esi = property atom. Returns eax =
+; the property's one 32-bit value, or -1 when it has none (or the atom
+; is 0). One GetProperty round trip.
+read_cardinal:
     push rbx
     push r12
     mov r12d, edi
-    mov ebx, [net_wm_desktop_atom]
-.rwd_go:                                  ; r12d = window, ebx = property
+    mov ebx, esi                          ; the atom
     test ebx, ebx
-    jz .rwd_ret
+    jz .rwd_none
     call x11_flush
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_GET_PROPERTY
@@ -6513,7 +6567,7 @@ read_wm_desktop:
     mov word [rdi+2], 6
     mov [rdi+4], r12d
     mov [rdi+8], ebx
-    xor ebx, ebx                          ; the answer: 0 until proven
+    mov ebx, -1                           ; the answer: none until proven
     mov dword [rdi+12], 6                 ; CARDINAL
     mov dword [rdi+16], 0                 ; long-offset
     mov dword [rdi+20], 1                 ; long-length: one value
@@ -6550,25 +6604,39 @@ read_wm_desktop:
     jne .rwd_ret
     cmp dword [wm_class_buf + 16], 1      ; one item
     jne .rwd_ret
-    mov eax, [wm_class_buf + 32]          ; 0-based desktop
-    cmp eax, WS_COUNT
-    jae .rwd_ret
-    lea ebx, [rax + 1]
+    mov ebx, [wm_class_buf + 32]
+    jmp .rwd_ret
+.rwd_none:
+    mov ebx, -1
 .rwd_ret:
     mov eax, ebx
     pop r12
     pop rbx
     ret
 
+; read_wm_desktop — edi = window XID. Returns eax = the workspace (1-based)
+; the window was on, from the _NET_WM_DESKTOP tile publishes on every
+; managed window, or 0 if it has none. Used when adopting after a restart,
+; so windows go back where they were instead of piling onto the current ws.
+read_wm_desktop:
+    mov esi, [net_wm_desktop_atom]
+    jmp read_desktop
+
 ; read_cur_desktop — returns eax = the workspace (1-based) named by
 ; _NET_CURRENT_DESKTOP on the root window, or 0 if there is none. Until
 ; this tile draws its bar, that is the workspace the tile before it was on.
 read_cur_desktop:
-    push rbx
-    push r12
-    mov r12d, [x11_root_window]
-    mov ebx, [net_current_desktop_atom]
-    jmp read_wm_desktop.rwd_go
+    mov edi, [x11_root_window]
+    mov esi, [net_current_desktop_atom]
+read_desktop:                             ; 0-based value → 1-based ws, or 0
+    call read_cardinal
+    cmp eax, WS_COUNT
+    jae .rd_none                          ; -1 (none) included
+    inc eax
+    ret
+.rd_none:
+    xor eax, eax
+    ret
 
 ; rdi = window XID. Returns:
 ;   rax = 0  → tile this window normally
