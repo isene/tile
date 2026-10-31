@@ -229,6 +229,12 @@ ws_len_state      equ 15
 ; (standard 8), (code - 90 + 8) for 90..97 (bright 8). 16 entries.
 ; All include opaque alpha. SGR 0 (reset) is handled specially →
 ; falls back to cfg_fg.
+; The LCARS look: the segments take these colours in turn, and each
+; coloured run is a block with black text (orange, peach, lilac,
+; periwinkle, sky, red, as in the bridge look of deck and gluon).
+%define LCARS_COLOURS 6
+lcars_palette:  dd 0xFFFF9900, 0xFFFFCC99, 0xFFCC99CC, 0xFF9999FF, 0xFF99CCFF, 0xFFCC6666
+
 sgr_palette:
     dd 0xFF000000        ; 30 black
     dd 0xFFCC0000        ; 31 red
@@ -341,6 +347,7 @@ cfg_fg:              resd 1
 strip_dirty:         resb 1            ; non-zero → re-render needed
 rerun_pending:       resb 1            ; SIGURG seen: rerun segments now
 cfg_gap:             resd 1            ; pixels of padding between segments
+cfg_lcars:           resb 1            ; 1: the LCARS look (lcars = 1 in ~/.striprc)
 
 ; XEMBED system tray.
 %define MAX_TRAY_ICONS 24
@@ -2189,6 +2196,53 @@ render_segment_sgr:
     pop rbx
     ret
 
+; The LCARS colour of segment ebx: ecx = lcars_palette[ebx mod 6].
+; Keeps edx.
+lcars_colour:
+    push rdx
+    mov eax, ebx
+    xor edx, edx
+    mov ecx, LCARS_COLOURS
+    div ecx
+    mov ecx, [lcars_palette + rdx*4]
+    pop rdx
+    ret
+
+; The LCARS look for one run: its cells, the bar's full height, filled
+; in the run's colour (gc_id has it as foreground), and the text colour
+; set to black for its glyphs. A run of spaces alone stays bar colour.
+; edi = x, edx = codepoints, decoded big-endian at tmp_buf+1024.
+lcars_block:
+    xor ecx, ecx
+.lb_scan:
+    cmp ecx, edx
+    jge .lb_done                          ; all spaces: no block
+    cmp word [tmp_buf + 1024 + rcx*2], 0x2000   ; bytes 00 20, a space
+    jne .lb_fill
+    inc ecx
+    jmp .lb_scan
+.lb_fill:
+    imul edx, [char_width_var]
+    lea rsi, [tmp_buf]
+    mov byte [rsi], X11_POLY_FILL_RECT
+    mov byte [rsi+1], 0
+    mov word [rsi+2], 5
+    mov eax, [pixmap_id]
+    mov [rsi+4], eax
+    mov eax, [gc_id]
+    mov [rsi+8], eax
+    mov [rsi+12], di                      ; x
+    mov word [rsi+14], 0                  ; y
+    mov [rsi+16], dx                      ; width
+    movzx eax, word [strip_height]
+    mov [rsi+18], ax
+    mov rdx, 20
+    call x11_buffer
+    inc dword [x11_seq]
+    mov dword [text_color], 0             ; black, opaque at the pen
+.lb_done:
+    ret
+
 ; paint_text(edi=x, esi=y, rdx=ptr, ecx=byte_length).
 ; Decodes the UTF-8 source into 16-bit codepoints (UCS-2, big-endian)
 ; and sends X11_IMAGE_TEXT16. Returns eax = display codepoint count
@@ -2279,10 +2333,20 @@ paint_text:
     cmp byte [render_ok], 0
     je .pt_coretext
     mov r13d, ecx                         ; count (return value)
+    mov r12d, [text_color]                ; the src ptr is done with
+    cmp byte [cfg_lcars], 0
+    je .pt_glyphs
+    push rsi
+    mov edi, r14d
+    mov edx, ecx
+    call lcars_block
+    pop rsi
+.pt_glyphs:
     mov edi, r14d                         ; x
                                           ; esi = y already
-    mov edx, ecx                          ; count
+    mov edx, r13d                         ; count
     call render_emit_glyphs
+    mov [text_color], r12d                ; the block's colour, for the next run
     mov eax, r13d
     pop r14
     pop r13
@@ -2929,10 +2993,14 @@ render_strip:
     jz .rs_next
     ; Apply per-segment leading gap override BEFORE drawing.
     add r12d, [r13 + SEG_OFF_GAP_OVR]
-    mov edi, r12d                         ; start x
-    lea rsi, [r13 + SEG_OFF_OUTPUT]       ; buffer
     mov edx, ecx                          ; byte length
     mov ecx, [r13 + SEG_OFF_DEFAULT_FG]   ; default fg (0 → cfg_fg)
+    cmp byte [cfg_lcars], 0
+    je .rs_draw
+    call lcars_colour
+.rs_draw:
+    mov edi, r12d                         ; start x
+    lea rsi, [r13 + SEG_OFF_OUTPUT]       ; buffer
     call render_segment_sgr
     ; rax = display chars drawn. Advance x by chars*char_width + cfg_gap.
     imul eax, [char_width_var]
@@ -3768,6 +3836,16 @@ apply_setting:
     call .as_streq
     test eax, eax
     jnz .as_gap
+    lea rsi, [.k_lcars]
+    call .as_streq
+    test eax, eax
+    jnz .as_lcars
+    pop rbx
+    ret
+.as_lcars:
+    mov rdi, rbx
+    call parse_dec
+    mov [cfg_lcars], al
     pop rbx
     ret
 .as_height:
@@ -3868,8 +3946,11 @@ apply_setting:
     pop rbx
     ret
 
+; rdi = key, rsi = name. eax = 1 when equal. Keeps rdi, so the next
+; name is matched against the whole key ("baseline" after "bg").
 .as_streq:
     push rbx
+    push rdi
 .ase_loop:
     mov al, [rdi]
     mov bl, [rsi]
@@ -3882,10 +3963,12 @@ apply_setting:
     jmp .ase_loop
 .ase_yes:
     mov eax, 1
+    pop rdi
     pop rbx
     ret
 .ase_no:
     xor eax, eax
+    pop rdi
     pop rbx
     ret
 
@@ -3897,6 +3980,7 @@ apply_setting:
 .k_char_width: db "char_width", 0
 .k_baseline:   db "baseline", 0
 .k_gap:        db "gap", 0
+.k_lcars:      db "lcars", 0
 .k_palette:    db "palette.", 0
 
 ; rdi = source NUL-terminated string. Copy into arg_pool, return offset

@@ -205,6 +205,24 @@ echo "== v0.1.76: a bind on a key that needs Shift, like ?"
 go 1; xdotool key super+shift+slash; sleep 0.3
 is "Mod4+? reaches its bind" "$(cur)" 5
 
+echo "== v0.1.77: strip's LCARS look"
+# lcars = 1 puts each text run on a block of colour. The first segment's
+# block is orange, so a pixel above its letters is orange, not the black
+# background. "fg" comes first: a key that half matched used to move the
+# parser on, so a line after it could miss its own key.
+printf '%s\n' 'height = 22' 'fg = #cccccc' 'bg = #000000' 'lcars = 1' \
+    'segment a #cccccc printf ABCDEF 0' > "$HOME/.striprc"
+"${STRIP:-$here/../strip}" 2> "$T/strip.log" &
+pids+=($!); sleep 1
+rm -f /tmp/frame${D}_win_*.raw; kill -USR1 "${pids[0]}"; sleep 0.5
+px=no
+for f in /tmp/frame${D}_win_*.raw; do
+    [ "$(stat -c %s "$f" 2>/dev/null)" = $((1920 * 22 * 4)) ] || continue
+    px=$(od -An -tx1 -j $(((1920 + 4) * 4)) -N3 "$f" | tr -d ' ')
+done
+rm -f /tmp/frame${D}_*.raw
+is "the pixel above the first letters is orange (BGR)" "$px" 0099ff
+
 echo
 if [ $fails -eq 0 ]; then echo "tile tests: all good"; else echo "tile tests: $fails failed"; fi
 exit $((fails > 0))
