@@ -254,7 +254,8 @@ sgr_palette:
     dd 0xFFFFFFFF        ; 97 bright white
 
 ; Pre-rasterized A8 glyph atlas (gen_strip_glyphs.py). Defines GLYPH_COUNT,
-; GLYPH_ADVANCE, GLYPH_ADDREQ_MAX, glyph_table, glyph_atlas.
+; GLYPH_ADVANCE, GLYPH_ADDREQ_MAX, glyph_table, glyph_atlas, and the same
+; letters in bold: glyph_table_bold, glyph_atlas_bold.
 %include "strip_glyphs.inc"
 
 ; ══════════════════════════════════════════════════════════════════════
@@ -345,7 +346,7 @@ cfg_gap:             resd 1            ; pixels of padding between segments
 ; segment's colour carried on through the gap after it. A view such as
 ; LCARS sets these keys; see fe2o3's views/.
 cfg_blocks:          resb 1            ; blocks = 1
-cfg_bold:            resb 1            ; bold = 1: every letter drawn twice, a pixel apart
+cfg_bold:            resb 1            ; bold = 1: the letters of Terminus Bold
 cfg_block_text:      resd 1            ; block_text = #RRGGBB, the letters on a block (black)
 ; segment_fg = #RRGGBB: every segment's letters in this colour instead of
 ; the one on its own line; colours a segment prints itself stay (the matrix
@@ -2416,17 +2417,9 @@ paint_text:
     call block_run
     pop rsi
 .pt_glyphs:
-    push rsi                              ; y, for a second pass
     mov edi, r14d                         ; x
     mov edx, r13d                         ; count
     call render_emit_glyphs
-    pop rsi
-    cmp byte [cfg_bold], 0
-    je .pt_drawn
-    lea edi, [r14d + 1]                   ; bold: the same letters a pixel right
-    mov edx, r13d
-    call render_emit_glyphs
-.pt_drawn:
     mov [text_color], r12d                ; the block's colour, for the next run
     mov eax, r13d
     pop r14
@@ -2798,14 +2791,22 @@ render_init:
 ; ----------------------------------------------------------------------
 ; render_upload_glyphs — AddGlyphs every atlas entry into glyphset_id.
 ; entry (20 bytes): cp(u32) w(u16) h(u16) x(s16) y(s16) adv(u16) pad off(u32)
+; bold = 1 uploads the bold letters under the same codepoints.
 ; ----------------------------------------------------------------------
 render_upload_glyphs:
     push rbx
+    push rbp
     push r12
     push r13
     push r14
     push r15
     lea r12, [glyph_table]
+    lea rbp, [glyph_atlas]
+    cmp byte [cfg_bold], 0
+    je .rug_set
+    lea r12, [glyph_table_bold]
+    lea rbp, [glyph_atlas_bold]
+.rug_set:
     mov r13d, GLYPH_COUNT
 .rug_loop:
     test r13d, r13d
@@ -2841,9 +2842,9 @@ render_upload_glyphs:
     mov ax, [r12 + 12]
     mov [rdi+24], ax                      ; xOff = advance
     mov word [rdi+26], 0                  ; yOff
-    ; copy padded alpha: glyph_atlas + off → tmp_buf+28
+    ; copy padded alpha: atlas + off → tmp_buf+28
     mov eax, [r12 + 16]                   ; off
-    lea rsi, [glyph_atlas + rax]
+    lea rsi, [rbp + rax]
     lea rdi, [tmp_buf + 28]
     mov ecx, ebx                          ; padded bytes
     rep movsb
@@ -2860,6 +2861,7 @@ render_upload_glyphs:
     pop r14
     pop r13
     pop r12
+    pop rbp
     pop rbx
     ret
 

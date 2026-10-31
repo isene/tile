@@ -10,6 +10,9 @@ import sys
 from PIL import ImageFont
 
 FONT = os.path.expanduser("~/.local/share/fonts/TerminessNerdFontMono-Regular.ttf")
+# bold = 1 in .striprc takes these letters instead. Terminus Bold leaves a
+# blank column after each letter, so "4W" stays two letters.
+FONT_BOLD = os.path.expanduser("~/.local/share/fonts/TerminessNerdFontMono-Bold.ttf")
 SIZE = 16                      # Terminus (narrow, crisp) at adv 8 / ascent 15 — taller
                                # than the DejaVu 13 and a narrower typeface. Restores the
                                # original strip look. Re-run after changing FONT/SIZE.
@@ -46,39 +49,46 @@ try:
 except Exception:
     CODEPOINTS = _cand
 
-font = ImageFont.truetype(FONT, SIZE)
-ascent, descent = font.getmetrics()
 fallback = ImageFont.truetype(FALLBACK, SIZE) if os.path.exists(FALLBACK) else None
 if fallback:
     CODEPOINTS = sorted(set(CODEPOINTS) | set(KATAKANA))
 
-entries = []   # (cp, w, h, x, y, adv, data_off)
-blob = bytearray()
 
-for cp in CODEPOINTS:
-    ch = chr(cp)
-    f, top = (fallback, fallback.getmetrics()[0]) if cp in KATAKANA else (font, ascent)
-    adv = round(f.getlength(ch))
-    mask, (ox, oy) = f.getmask2(ch, mode="L")
-    w, h = mask.size
-    if w == 0 or h == 0:                 # space / empty glyph
-        entries.append((cp, 0, 0, 0, 0, adv, len(blob)))
-        continue
-    raw = bytes(mask)                    # row-major, stride = w (mode L)
-    stride = (w + 3) & ~3                # AddGlyphs pads scanlines to 4 bytes
-    off = len(blob)
-    for row in range(h):
-        line = raw[row * w:(row + 1) * w]
-        blob += line + b"\x00" * (stride - w)
-    bearing_x = ox                       # left side bearing
-    bearing_y = top - oy                 # top bearing (baseline-up to bitmap top)
-    x = (-bearing_x) & 0xFFFF            # GLYPHINFO x = -bearingL (s16)
-    y = bearing_y & 0xFFFF               # GLYPHINFO y = +bearingT (s16)
-    entries.append((cp, w, h, x, y, adv, off))
+def rasterize(path):
+    """One table and atlas: entries (cp, w, h, x, y, adv, off) and the blob."""
+    font = ImageFont.truetype(path, SIZE)
+    ascent = font.getmetrics()[0]
+    entries, blob = [], bytearray()
+    for cp in CODEPOINTS:
+        ch = chr(cp)
+        f, top = (fallback, fallback.getmetrics()[0]) if cp in KATAKANA else (font, ascent)
+        adv = round(f.getlength(ch))
+        mask, (ox, oy) = f.getmask2(ch, mode="L")
+        w, h = mask.size
+        if w == 0 or h == 0:                 # space / empty glyph
+            entries.append((cp, 0, 0, 0, 0, adv, len(blob)))
+            continue
+        raw = bytes(mask)                    # row-major, stride = w (mode L)
+        stride = (w + 3) & ~3                # AddGlyphs pads scanlines to 4 bytes
+        off = len(blob)
+        for row in range(h):
+            line = raw[row * w:(row + 1) * w]
+            blob += line + b"\x00" * (stride - w)
+        bearing_x = ox                       # left side bearing
+        bearing_y = top - oy                 # top bearing (baseline-up to bitmap top)
+        x = (-bearing_x) & 0xFFFF            # GLYPHINFO x = -bearingL (s16)
+        y = bearing_y & 0xFFFF               # GLYPHINFO y = +bearingT (s16)
+        entries.append((cp, w, h, x, y, adv, off))
+    return entries, blob
+
+
+ascent, descent = ImageFont.truetype(FONT, SIZE).getmetrics()
+entries, blob = rasterize(FONT)
+entries_bold, blob_bold = rasterize(FONT_BOLD)
 
 # Worst-case single-glyph AddGlyphs payload (28 header + padded alpha).
 max_payload = 0
-for (cp, w, h, x, y, adv, off) in entries:
+for (cp, w, h, x, y, adv, off) in entries + entries_bold:
     stride = (w + 3) & ~3
     max_payload = max(max_payload, 28 + stride * h)
 
@@ -90,13 +100,14 @@ out.append(f"%define GLYPH_COUNT {len(entries)}")
 out.append(f"%define GLYPH_ADVANCE {adv_mode}")
 out.append(f"%define GLYPH_ADDREQ_MAX {(max_payload + 3) & ~3}")
 out.append("; entry = cp(u32) w(u16) h(u16) x(s16) y(s16) adv(u16) pad(u16) off(u32) = 20 bytes")
-out.append("glyph_table:")
-for (cp, w, h, x, y, adv, off) in entries:
-    out.append(f"    dd {cp}\n    dw {w}, {h}, {x}, {y}, {adv}, 0\n    dd {off}")
-out.append(f"glyph_atlas_len equ {len(blob)}")
-out.append("glyph_atlas:")
-for i in range(0, len(blob), 32):
-    out.append("    db " + ",".join(str(b) for b in blob[i:i+32]))
+for name, ents, data in (("", entries, blob), ("_bold", entries_bold, blob_bold)):
+    out.append(f"glyph_table{name}:")
+    for (cp, w, h, x, y, adv, off) in ents:
+        out.append(f"    dd {cp}\n    dw {w}, {h}, {x}, {y}, {adv}, 0\n    dd {off}")
+    out.append(f"glyph_atlas{name}_len equ {len(data)}")
+    out.append(f"glyph_atlas{name}:")
+    for i in range(0, len(data), 32):
+        out.append("    db " + ",".join(str(b) for b in data[i:i+32]))
 out.append("")
 
 with open("strip_glyphs.inc", "w") as f:

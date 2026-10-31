@@ -273,6 +273,28 @@ echo "== v0.1.80: a blank segment draws no block of its own"
 # (a), peach (b) and the blue of c's letters alone.
 is "the colours on the bar" "$row" "0099ff 99ccff ff0000 "
 
+echo "== v0.1.85: bold letters keep a gap between them"
+# bold = 1 drew each letter twice, a pixel apart, and the 4 of the
+# battery's "4.54W" ran into its W. Terminus Bold, drawn once, leaves a
+# blank column after each letter: the first run of ink is the 4 alone.
+kill "${pids[-1]}"; sleep 0.3
+printf '%s\n' 'height = 22' 'fg = #cccccc' 'bg = #000000' 'bold = 1' \
+    'segment a #cccccc printf 4W 0' > "$HOME/.striprc"
+"${STRIP:-$here/../strip}" 2> "$T/strip.log" &
+pids+=($!); sleep 1
+rm -f /tmp/frame${D}_win_*.raw; kill -USR1 "${pids[0]}"; sleep 0.5
+run=none
+for f in /tmp/frame${D}_win_*.raw; do
+    [ "$(stat -c %s "$f" 2>/dev/null)" = $((1920 * 22 * 4)) ] || continue
+    # The left 400 pixels of each row: mawk splits a line past 32 KB.
+    run=$(for r in {0..21}; do od -An -v -tu1 -w1600 -j $((r * 7680)) -N 1600 "$f"; done | awk '
+        { for (c = 0; c < 400; c++) if ($(c * 4 + 1) > 100) lit[c] = 1 }
+        END { for (c = 0; c < 400 && !lit[c]; c++); n = 0
+              while (lit[c + n]) n++; print n }')
+done
+rm -f /tmp/frame${D}_*.raw
+is "the 4 is 7 columns of ink, then a gap" "$run" 7
+
 echo
 if [ $fails -eq 0 ]; then echo "tile tests: all good"; else echo "tile tests: $fails failed"; fi
 exit $((fails > 0))
