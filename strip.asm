@@ -229,12 +229,6 @@ ws_len_state      equ 15
 ; (standard 8), (code - 90 + 8) for 90..97 (bright 8). 16 entries.
 ; All include opaque alpha. SGR 0 (reset) is handled specially →
 ; falls back to cfg_fg.
-; The LCARS look: the segments take these colours in turn, and each
-; coloured run is a block with black text (orange, peach, lilac,
-; periwinkle, sky, red, as in the bridge look of deck and gluon).
-%define LCARS_COLOURS 6
-lcars_palette:  dd 0xFFFF9900, 0xFFFFCC99, 0xFFCC99CC, 0xFF9999FF, 0xFF99CCFF, 0xFFCC6666
-
 sgr_palette:
     dd 0xFF000000        ; 30 black
     dd 0xFFCC0000        ; 31 red
@@ -347,8 +341,17 @@ cfg_fg:              resd 1
 strip_dirty:         resb 1            ; non-zero → re-render needed
 rerun_pending:       resb 1            ; SIGURG seen: rerun segments now
 cfg_gap:             resd 1            ; pixels of padding between segments
-cfg_lcars:           resb 1            ; 1: the LCARS look (lcars = 1 in ~/.striprc)
-lcars_x:             resd 1            ; LCARS: where the last segment's text ended
+; Blocks (blocks = 1): each run of text on a block of colour, and each
+; segment's colour carried on through the gap after it. A view such as
+; LCARS sets these keys; see fe2o3's views/.
+cfg_blocks:          resb 1            ; blocks = 1
+cfg_bold:            resb 1            ; bold = 1: every letter drawn twice, a pixel apart
+cfg_block_text:      resd 1            ; block_text = #RRGGBB, the letters on a block (black)
+%define MAX_BLOCK_COLOURS 8
+block_colours:       resd MAX_BLOCK_COLOURS ; colours = #a,#b,...: segments take them in turn
+block_count:         resd 1            ; how many; 0: each segment keeps its own colour
+block_x:             resd 1            ; where the last segment's text ended
+block_prev:          resd 1            ; and its colour
 
 ; XEMBED system tray.
 %define MAX_TRAY_ICONS 24
@@ -2197,29 +2200,39 @@ render_segment_sgr:
     pop rbx
     ret
 
-; The LCARS colour of segment ebx: ecx = lcars_palette[ebx mod 6].
-; Keeps edx.
-lcars_colour:
+; The block colour of segment ebx: the next of the colours in turn, or
+; the segment's own colour (ecx, 0 for fg) when there are none. Keeps edx.
+block_colour:
+    mov eax, [block_count]
+    test eax, eax
+    jz .bc_own
     push rdx
+    mov ecx, eax
     mov eax, ebx
     xor edx, edx
-    mov ecx, LCARS_COLOURS
     div ecx
-    mov ecx, [lcars_palette + rdx*4]
+    mov ecx, [block_colours + rdx*4]
     pop rdx
     ret
+.bc_own:
+    test ecx, ecx
+    jnz .bc_done
+    mov ecx, [cfg_fg]
+.bc_done:
+    ret
 
-; The LCARS look for one run: its cells, the bar's full height, filled
-; in the run's colour (gc_id has it as foreground), and the text colour
-; set to black for its glyphs. edi = x, edx = codepoints.
-lcars_block:
+; One run as a block: its cells, the bar's full height, filled in the
+; run's colour (gc_id has it as foreground), and the letters in
+; block_text. edi = x, edx = codepoints.
+block_run:
     imul edx, [char_width_var]
-    call lcars_rect
-    mov dword [text_color], 0             ; black, opaque at the pen
+    call block_rect
+    mov eax, [cfg_block_text]
+    mov [text_color], eax
     ret
 
 ; Fill edx pixels from x = edi, the bar's full height, in gc_id's colour.
-lcars_rect:
+block_rect:
     lea rsi, [tmp_buf]
     mov byte [rsi], X11_POLY_FILL_RECT
     mov byte [rsi+1], 0
@@ -2329,18 +2342,25 @@ paint_text:
     je .pt_coretext
     mov r13d, ecx                         ; count (return value)
     mov r12d, [text_color]                ; the src ptr is done with
-    cmp byte [cfg_lcars], 0
+    cmp byte [cfg_blocks], 0
     je .pt_glyphs
     push rsi
     mov edi, r14d
     mov edx, ecx
-    call lcars_block
+    call block_run
     pop rsi
 .pt_glyphs:
+    push rsi                              ; y, for a second pass
     mov edi, r14d                         ; x
-                                          ; esi = y already
     mov edx, r13d                         ; count
     call render_emit_glyphs
+    pop rsi
+    cmp byte [cfg_bold], 0
+    je .pt_drawn
+    lea edi, [r14d + 1]                   ; bold: the same letters a pixel right
+    mov edx, r13d
+    call render_emit_glyphs
+.pt_drawn:
     mov [text_color], r12d                ; the block's colour, for the next run
     mov eax, r13d
     pop r14
@@ -2969,7 +2989,7 @@ render_strip:
     call right_x
     mov r14d, ecx                         ; first '>' segment, -1 if none
     mov r15d, eax                         ; the x it starts at
-    mov dword [lcars_x], 0
+    mov dword [block_x], 0
     xor ebx, ebx
 .rs_loop:
     cmp ebx, [segment_count]
@@ -2991,20 +3011,25 @@ render_strip:
     add r12d, [r13 + SEG_OFF_GAP_OVR]
     mov edx, ecx                          ; byte length
     mov ecx, [r13 + SEG_OFF_DEFAULT_FG]   ; default fg (0 → cfg_fg)
-    cmp byte [cfg_lcars], 0
+    cmp byte [cfg_blocks], 0
     je .rs_draw
-    call lcars_colour
-    ; No black between segments: this one's colour fills from where the
-    ; last one's text ended (from the left edge for the first).
+    call block_colour
+    ; No black between segments: the one before fills the gap after it
+    ; (this one fills the left margin when it comes first).
     push rcx
     push rdx
+    mov eax, [block_prev]
+    cmp dword [block_x], 0
+    jne .rs_gap
     mov eax, ecx
+.rs_gap:
+    mov [block_prev], ecx
     call change_gc_fg
-    mov edi, [lcars_x]
+    mov edi, [block_x]
     mov edx, r12d
     sub edx, edi
     jle .rs_filled
-    call lcars_rect
+    call block_rect
 .rs_filled:
     pop rdx
     pop rcx
@@ -3015,7 +3040,7 @@ render_strip:
     ; rax = display chars drawn. Advance x by chars*char_width + cfg_gap.
     imul eax, [char_width_var]
     add r12d, eax
-    mov [lcars_x], r12d
+    mov [block_x], r12d
     add r12d, [cfg_gap]
     and byte [r13 + SEG_OFF_FLAGS], ~SEG_FLAG_DIRTY
 .rs_next:
@@ -3023,6 +3048,24 @@ render_strip:
     jmp .rs_loop
 
 .rs_copy:
+    ; Blocks: the last segment fills the gap after it, up to the tray.
+    cmp byte [cfg_blocks], 0
+    je .rs_copy_now
+    mov edi, [block_x]
+    test edi, edi
+    jz .rs_copy_now
+    mov eax, [block_prev]
+    call change_gc_fg
+    movzx edx, word [x11_screen_width]
+    mov eax, [tray_icon_size]
+    add eax, [tray_padding]
+    imul eax, [tray_icon_count]
+    sub edx, eax
+    mov edi, [block_x]
+    sub edx, edi
+    jle .rs_copy_now
+    call block_rect
+.rs_copy_now:
     ; CopyArea(src=pixmap, dst=window, gc, src(0,0), dst(0,0), w, h).
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_COPY_AREA
@@ -3847,16 +3890,74 @@ apply_setting:
     call .as_streq
     test eax, eax
     jnz .as_gap
-    lea rsi, [.k_lcars]
+    lea rsi, [.k_blocks]
     call .as_streq
     test eax, eax
-    jnz .as_lcars
+    jnz .as_blocks
+    lea rsi, [.k_bold]
+    call .as_streq
+    test eax, eax
+    jnz .as_bold
+    lea rsi, [.k_block_text]
+    call .as_streq
+    test eax, eax
+    jnz .as_block_text
+    lea rsi, [.k_colours]
+    call .as_streq
+    test eax, eax
+    jnz .as_colours
     pop rbx
     ret
-.as_lcars:
+.as_blocks:
     mov rdi, rbx
     call parse_dec
-    mov [cfg_lcars], al
+    mov [cfg_blocks], al
+    pop rbx
+    ret
+.as_bold:
+    mov rdi, rbx
+    call parse_dec
+    mov [cfg_bold], al
+    pop rbx
+    ret
+.as_block_text:
+    mov rdi, rbx
+    call parse_hex
+    mov [cfg_block_text], eax
+    pop rbx
+    ret
+.as_colours:
+    ; colours = #ff9900, #ffcc99, ...: up to MAX_BLOCK_COLOURS.
+    mov rdi, rbx
+    xor r8d, r8d
+.asc_next:
+    cmp r8d, MAX_BLOCK_COLOURS
+    jge .asc_done
+.asc_skip:
+    mov al, [rdi]
+    test al, al
+    jz .asc_done
+    cmp al, ' '
+    je .asc_sep
+    cmp al, ','
+    jne .asc_one
+.asc_sep:
+    inc rdi
+    jmp .asc_skip
+.asc_one:
+    call parse_hex                        ; moves rdi past the digits
+    mov [block_colours + r8*4], eax
+    inc r8d
+.asc_rest:
+    mov al, [rdi]
+    test al, al
+    jz .asc_done
+    cmp al, ','
+    je .asc_next
+    inc rdi
+    jmp .asc_rest
+.asc_done:
+    mov [block_count], r8d
     pop rbx
     ret
 .as_height:
@@ -3991,7 +4092,10 @@ apply_setting:
 .k_char_width: db "char_width", 0
 .k_baseline:   db "baseline", 0
 .k_gap:        db "gap", 0
-.k_lcars:      db "lcars", 0
+.k_blocks:     db "blocks", 0
+.k_bold:       db "bold", 0
+.k_block_text: db "block_text", 0
+.k_colours:    db "colours", 0
 .k_palette:    db "palette.", 0
 
 ; rdi = source NUL-terminated string. Copy into arg_pool, return offset

@@ -206,28 +206,34 @@ go 1; xdotool key super+shift+slash; sleep 0.3
 is "Mod4+? reaches its bind" "$(cur)" 5
 
 echo "== v0.1.77: strip's LCARS look"
-# lcars = 1 puts each text run on a block of colour. The first segment's
+# blocks = 1 puts each text run on a block of colour. The first segment's
 # block is orange, so a pixel above its letters is orange, not the black
 # background. "fg" comes first: a key that half matched used to move the
 # parser on, so a line after it could miss its own key.
-printf '%s\n' 'height = 22' 'fg = #cccccc' 'bg = #000000' 'lcars = 1' \
-    'segment a #cccccc printf ABCDEF 0' > "$HOME/.striprc"
+printf '%s\n' 'height = 22' 'fg = #cccccc' 'bg = #000000' 'blocks = 1' \
+    'colours = #ff9900, #ffcc99' \
+    'segment a #cccccc printf ABCDEF 0' 'segment b #cccccc printf GH 0' > "$HOME/.striprc"
 "${STRIP:-$here/../strip}" 2> "$T/strip.log" &
 pids+=($!); sleep 1
 rm -f /tmp/frame${D}_win_*.raw; kill -USR1 "${pids[0]}"; sleep 0.5
-px=no; edge=no
+px=no; edge=no; tail=no
 for f in /tmp/frame${D}_win_*.raw; do
     [ "$(stat -c %s "$f" 2>/dev/null)" = $((1920 * 22 * 4)) ] || continue
     px=$(od -An -tx1 -j $(((1920 + 4) * 4)) -N3 "$f" | tr -d ' ')
     edge=$(od -An -tx1 -j $(((1920 + 1) * 4)) -N3 "$f" | tr -d ' ')
+    tail=$(od -An -tx1 -j $(((1920 + 1919) * 4)) -N3 "$f" | tr -d ' ')
 done
 rm -f /tmp/frame${D}_*.raw
 is "the pixel above the first letters is orange (BGR)" "$px" 0099ff
 
 echo "== v0.1.78: no black between LCARS segments"
-# The margin left of the first segment takes its colour, as does every
-# gap between two segments.
+# The margin left of the first segment takes its colour.
 is "the left margin is orange too" "$edge" 0099ff
+
+echo "== v0.1.79: the segment before fills the gap after it"
+# The second segment, peach in the colours above, runs on to the right
+# edge, where 0.1.78 left the margin black.
+is "the right edge is the last segment's peach" "$tail" 99ccff
 
 echo
 if [ $fails -eq 0 ]; then echo "tile tests: all good"; else echo "tile tests: $fails failed"; fi

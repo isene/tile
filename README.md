@@ -2,7 +2,7 @@
 
 <img src="img/tile.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.78-blue)
+![Version](https://img.shields.io/badge/version-0.1.79-blue)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
 ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue)
@@ -122,9 +122,11 @@ DISPLAY=:9 glass                        # or: DISPLAY=:9 xterm
   (clock, battery, cpu, mem, disk, net, mailbox, brightness, vol,
   weather, wintitle). Per-segment refresh interval, `+N` leading-gap
   override, `>` to set a segment and all after it flush right,
-  default-fg colour, all driven by `~/.striprc`. `lcars = 1` puts
-  each segment on a block of LCARS colour with black text, the blocks
-  joined end to end.
+  default-fg colour, all driven by `~/.striprc`. `blocks = 1` puts
+  each segment on a block of colour, carried on through the gap after
+  it; `colours = #a, #b, ...` gives the segments colours in turn,
+  `block_text` the letters on a block and `bold = 1` bold letters. The
+  LCARS view of [fe2o3](https://github.com/isene/fe2o3) sets them.
 - **XEMBED system tray** (phase 2c) — apps that emit `_NET_WM_S0`
   selection requests dock into strip's tray area.
 - **Stash / unstash** — i3 scratchpad replacement: a small LIFO of
