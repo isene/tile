@@ -205,6 +205,13 @@ echo "== v0.1.76: a bind on a key that needs Shift, like ?"
 go 1; xdotool key super+shift+slash; sleep 0.3
 is "Mod4+? reaches its bind" "$(cur)" 5
 
+echo "== v0.1.81: a reload keeps the workspace in view"
+# A reload set the screen back to workspace 1 and mapped its windows over
+# the workspace in view, so a browser on 1 showed on top of 5.
+go 5; kill -USR1 $TPID; sleep 0.5
+is "workspace 1's window stays hidden after a reload" "$(shown "$one")" no
+is "and workspace 5's window is still there" "$(shown "$five")" yes
+
 echo "== v0.1.77: strip's LCARS look"
 # blocks = 1 puts each text run on a block of colour. The first segment's
 # block is orange, so a pixel above its letters is orange, not the black

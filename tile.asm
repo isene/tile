@@ -278,7 +278,7 @@ naflag_str:      db "--no-autostart", 0    ; argv flag set by action_restart
 verflag_str:     db "--version", 0
 rsflag_str:      db "--restarted", 0       ; argv flag: a real restart, say so
 restart_note_cmd: db "notify-send -a tile -t 3000 -h string:bgcolor:#B7472A -h string:fgcolor:#FFFFFF -h string:frcolor:#B7472A 'tile restarted'", 0
-tile_ver_str:    db "tile 0.1.80", 10
+tile_ver_str:    db "tile 0.1.81", 10
 tile_ver_len     equ $ - tile_ver_str
 tile_usage_str:  db "usage: tile [--no-autostart] [--version] [--help]", 10
                  db "tile is a window manager: with no flags it takes over $DISPLAY.", 10
@@ -8817,7 +8817,15 @@ reload_runtime:
     ; load_config zeroes bind_count + exec_count and re-parses the file.
     call load_config
     call resolve_and_grab_binds
+    ; apply_pin_overrides sets each output back to its first workspace,
+    ; and the layout below then mapped that workspace's windows over the
+    ; one in view (gaze on top after every reload). Each output keeps
+    ; the workspace it shows: one byte per output, MAX_OUTPUTS = 4.
+    mov eax, [output_current_ws]
+    push rax
     call apply_pin_overrides
+    pop rax
+    mov [output_current_ws], eax
     ; Re-paint border colours on every tracked client so a changed
     ; border_focused / border_unfocused / border_width takes effect on
     ; existing windows.
