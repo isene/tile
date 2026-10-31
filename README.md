@@ -2,7 +2,7 @@
 
 <img src="img/tile.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.77-blue)
+![Version](https://img.shields.io/badge/version-0.1.78-blue)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
 ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue)
@@ -123,7 +123,8 @@ DISPLAY=:9 glass                        # or: DISPLAY=:9 xterm
   weather, wintitle). Per-segment refresh interval, `+N` leading-gap
   override, `>` to set a segment and all after it flush right,
   default-fg colour, all driven by `~/.striprc`. `lcars = 1` puts
-  each segment on a block of LCARS colour with black text.
+  each segment on a block of LCARS colour with black text, the blocks
+  joined end to end.
 - **XEMBED system tray** (phase 2c) — apps that emit `_NET_WM_S0`
   selection requests dock into strip's tray area.
 - **Stash / unstash** — i3 scratchpad replacement: a small LIFO of

@@ -7,6 +7,7 @@ on:
   push:
     paths:
       - tile.asm
+      - strip.asm
       - test/**
       - .github/workflows/test.yml
   workflow_dispatch:
@@ -26,7 +27,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y nasm gcc libx11-dev xdotool x11-utils
-      - name: Build tile and frame
-        run: make -C tile tile && make -C frame
+      - name: Build tile, strip and frame
+        run: make -C tile tile strip && make -C frame
       - name: Run the checks
         run: tile/test/run.sh

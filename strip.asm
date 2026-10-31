@@ -348,6 +348,7 @@ strip_dirty:         resb 1            ; non-zero → re-render needed
 rerun_pending:       resb 1            ; SIGURG seen: rerun segments now
 cfg_gap:             resd 1            ; pixels of padding between segments
 cfg_lcars:           resb 1            ; 1: the LCARS look (lcars = 1 in ~/.striprc)
+lcars_x:             resd 1            ; LCARS: where the last segment's text ended
 
 ; XEMBED system tray.
 %define MAX_TRAY_ICONS 24
@@ -2210,19 +2211,15 @@ lcars_colour:
 
 ; The LCARS look for one run: its cells, the bar's full height, filled
 ; in the run's colour (gc_id has it as foreground), and the text colour
-; set to black for its glyphs. A run of spaces alone stays bar colour.
-; edi = x, edx = codepoints, decoded big-endian at tmp_buf+1024.
+; set to black for its glyphs. edi = x, edx = codepoints.
 lcars_block:
-    xor ecx, ecx
-.lb_scan:
-    cmp ecx, edx
-    jge .lb_done                          ; all spaces: no block
-    cmp word [tmp_buf + 1024 + rcx*2], 0x2000   ; bytes 00 20, a space
-    jne .lb_fill
-    inc ecx
-    jmp .lb_scan
-.lb_fill:
     imul edx, [char_width_var]
+    call lcars_rect
+    mov dword [text_color], 0             ; black, opaque at the pen
+    ret
+
+; Fill edx pixels from x = edi, the bar's full height, in gc_id's colour.
+lcars_rect:
     lea rsi, [tmp_buf]
     mov byte [rsi], X11_POLY_FILL_RECT
     mov byte [rsi+1], 0
@@ -2239,8 +2236,6 @@ lcars_block:
     mov rdx, 20
     call x11_buffer
     inc dword [x11_seq]
-    mov dword [text_color], 0             ; black, opaque at the pen
-.lb_done:
     ret
 
 ; paint_text(edi=x, esi=y, rdx=ptr, ecx=byte_length).
@@ -2974,6 +2969,7 @@ render_strip:
     call right_x
     mov r14d, ecx                         ; first '>' segment, -1 if none
     mov r15d, eax                         ; the x it starts at
+    mov dword [lcars_x], 0
     xor ebx, ebx
 .rs_loop:
     cmp ebx, [segment_count]
@@ -2998,6 +2994,20 @@ render_strip:
     cmp byte [cfg_lcars], 0
     je .rs_draw
     call lcars_colour
+    ; No black between segments: this one's colour fills from where the
+    ; last one's text ended (from the left edge for the first).
+    push rcx
+    push rdx
+    mov eax, ecx
+    call change_gc_fg
+    mov edi, [lcars_x]
+    mov edx, r12d
+    sub edx, edi
+    jle .rs_filled
+    call lcars_rect
+.rs_filled:
+    pop rdx
+    pop rcx
 .rs_draw:
     mov edi, r12d                         ; start x
     lea rsi, [r13 + SEG_OFF_OUTPUT]       ; buffer
@@ -3005,6 +3015,7 @@ render_strip:
     ; rax = display chars drawn. Advance x by chars*char_width + cfg_gap.
     imul eax, [char_width_var]
     add r12d, eax
+    mov [lcars_x], r12d
     add r12d, [cfg_gap]
     and byte [r13 + SEG_OFF_FLAGS], ~SEG_FLAG_DIRTY
 .rs_next:

@@ -215,13 +215,19 @@ printf '%s\n' 'height = 22' 'fg = #cccccc' 'bg = #000000' 'lcars = 1' \
 "${STRIP:-$here/../strip}" 2> "$T/strip.log" &
 pids+=($!); sleep 1
 rm -f /tmp/frame${D}_win_*.raw; kill -USR1 "${pids[0]}"; sleep 0.5
-px=no
+px=no; edge=no
 for f in /tmp/frame${D}_win_*.raw; do
     [ "$(stat -c %s "$f" 2>/dev/null)" = $((1920 * 22 * 4)) ] || continue
     px=$(od -An -tx1 -j $(((1920 + 4) * 4)) -N3 "$f" | tr -d ' ')
+    edge=$(od -An -tx1 -j $(((1920 + 1) * 4)) -N3 "$f" | tr -d ' ')
 done
 rm -f /tmp/frame${D}_*.raw
 is "the pixel above the first letters is orange (BGR)" "$px" 0099ff
+
+echo "== v0.1.78: no black between LCARS segments"
+# The margin left of the first segment takes its colour, as does every
+# gap between two segments.
+is "the left margin is orange too" "$edge" 0099ff
 
 echo
 if [ $fails -eq 0 ]; then echo "tile tests: all good"; else echo "tile tests: $fails failed"; fi
