@@ -233,6 +233,20 @@ later=$(win later)
 is "the next window opens where you are" "$(cur)" 1
 is "and shows there" "$(shown "$later")" yes
 
+echo "== v0.1.88: closing the launcher or the key list goes back to your window"
+# With several windows on a workspace, closing the launcher showed the
+# newest window instead of the one you were on.
+go 3
+a=$(win a); b=$(win b); c=$(win c)
+xdotool windowactivate "$a" 2>/dev/null; sleep 0.3
+l=$(win launcher); close launcher
+is "after the launcher closes, your window shows" "$(shown "$a")" yes
+is "and the newest one does not" "$(shown "$c")" no
+xdotool windowactivate "$b" 2>/dev/null; sleep 0.3
+xdotool key super+k; sleep 0.3; xdotool key Escape; sleep 0.3
+is "after the key list closes, the window you were on shows" "$(shown "$b")" yes
+close a b c
+
 echo "== v0.1.77: strip's LCARS look"
 # blocks = 1 puts each text run on a block of colour. The first segment's
 # block is orange, so a pixel above its letters is orange, not the black

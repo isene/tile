@@ -278,7 +278,7 @@ naflag_str:      db "--no-autostart", 0    ; argv flag set by action_restart
 verflag_str:     db "--version", 0
 rsflag_str:      db "--restarted", 0       ; argv flag: a real restart, say so
 restart_note_cmd: db "notify-send -a tile -t 3000 -h string:bgcolor:#B7472A -h string:fgcolor:#FFFFFF -h string:frcolor:#B7472A 'tile restarted'", 0
-tile_ver_str:    db "tile 0.1.87", 10
+tile_ver_str:    db "tile 0.1.88", 10
 tile_ver_len     equ $ - tile_ver_str
 tile_usage_str:  db "usage: tile [--no-autostart] [--version] [--help]", 10
                  db "tile is a window manager: with no flags it takes over $DISPLAY.", 10
@@ -1042,6 +1042,7 @@ prev_ws:                 resb 1
 cfg_startup_ws:          resb 1
 workspace_populated:     resb WS_COUNT
 ws_active_xid:           resd WS_COUNT
+ws_prev_xid:             resd WS_COUNT     ; the tab active before it
 ws10_pub_xid:            resd 1        ; ws_active_xid[9] at last class fetch
 ws10_class:              resb 16       ; its WM_CLASS class half, NUL-padded —
                                        ; published in _TILE_BAR_STATE 22..37 so
@@ -7468,6 +7469,7 @@ set_active_tab_on_ws:
     mov ebx, [ws_active_xid + rcx*4]
     cmp ebx, r12d
     je .sat_done
+    mov [ws_prev_xid + rcx*4], ebx
     mov [ws_active_xid + rcx*4], r12d
 
     ; Find the workspace's pinned output and check visibility.
@@ -7713,12 +7715,33 @@ client_closed:
     cmp ebx, WS_COUNT
     jge .cc_done
     mov r13d, 0                  ; r13 = "this ws was affected"
+    cmp [ws_prev_xid + rbx*4], r12d
+    jne .cc_prev_ok
+    mov dword [ws_prev_xid + rbx*4], 0
+.cc_prev_ok:
     cmp [ws_active_xid + rbx*4], r12d
     jne .cc_check_split
-    ; Active was the dying XID — re-elect.
+    ; Active was the dying XID: go back to the tab that was active before
+    ; it, so closing the launcher returns to your window (v0.1.88). With
+    ; none left on this workspace, the newest tab.
+    mov eax, [ws_prev_xid + rbx*4]
+    mov dword [ws_prev_xid + rbx*4], 0
+    test eax, eax
+    jz .cc_top
+    call find_client_index
+    cmp eax, -1
+    je .cc_top
+    movzx ecx, byte [client_ws + rax]
+    lea edx, [rbx + 1]
+    cmp ecx, edx
+    jne .cc_top
+    mov eax, [client_xids + rax*4]
+    jmp .cc_elect
+.cc_top:
     mov eax, ebx
     inc eax
     call find_top_of_workspace
+.cc_elect:
     mov [ws_active_xid + rbx*4], eax
     mov r13d, 1
 .cc_check_split:
