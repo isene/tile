@@ -2,7 +2,7 @@
 
 <img src="img/tile.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.88-blue)
+![Version](https://img.shields.io/badge/version-0.1.89-blue)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
 ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue)
@@ -185,8 +185,8 @@ or polled when it's closed. Bind it with e.g. `bind Mod4+o
 overview`.
 
 The `keys` action opens a **key reference** on the same overlay: every
-key combo the CHasm suite owns, in columns, one colour per group (tile,
-frame, glass). The content is the live output of
+key combo the CHasm suite owns, in columns, one colour per section. A
+section stays whole in one column when it fits. The content is the live output of
 [`chasm-keys --popup`](https://github.com/isene/chasm/blob/master/chasm-keys),
 which reads the three rc files on every open.
 

@@ -278,7 +278,7 @@ naflag_str:      db "--no-autostart", 0    ; argv flag set by action_restart
 verflag_str:     db "--version", 0
 rsflag_str:      db "--restarted", 0       ; argv flag: a real restart, say so
 restart_note_cmd: db "notify-send -a tile -t 3000 -h string:bgcolor:#B7472A -h string:fgcolor:#FFFFFF -h string:frcolor:#B7472A 'tile restarted'", 0
-tile_ver_str:    db "tile 0.1.88", 10
+tile_ver_str:    db "tile 0.1.89", 10
 tile_ver_len     equ $ - tile_ver_str
 tile_usage_str:  db "usage: tile [--no-autostart] [--version] [--help]", 10
                  db "tile is a window manager: with no flags it takes over $DISPLAY.", 10
@@ -330,7 +330,8 @@ kr_env_path:       db "/usr/bin/env", 0
 kr_arg_name:       db "chasm-keys", 0
 kr_arg_flag:       db "--popup", 0
 kr_argv:           dq kr_env_path, kr_arg_name, kr_arg_flag, 0
-kr_palette:        dd 0xFF9ECE6A, 0xFFE0AF68, 0xFF7AA2F7, 0xFFBB9AF7   ; per group header
+kr_palette:        dd 0xFF9ECE6A, 0xFF7AA2F7, 0xFFE0AF68, 0xFFBB9AF7   ; one per header and sub-header, in turn
+                   dd 0xFF7DCFFF, 0xFFF7768E, 0xFF73DACA, 0xFFFF9E64
 ; Keysyms the overview popup passively grabs while open: Up Down Return
 ; KP_Enter Escape j k PgUp PgDn Home End. Resolved against the server keymap
 ; on every open (ov_resolve_keys), so xmodmap/framerc remaps (e.g. Escape on
@@ -14251,8 +14252,8 @@ keyref_load:
     je .kl_tag_r
     jmp .kl_rec_done
 .kl_tag_h:
-    inc dword [kr_cur_grp]                ; new group → next palette colour
 .kl_tag_s:
+    inc dword [kr_cur_grp]                ; each section → the next palette colour
     mov [kr_type + rbx], al
     lea rdx, [rsi + 2]
     mov [kr_p1 + rbx*8], rdx
@@ -14335,8 +14336,8 @@ keyref_load:
     ret
 
 ; draw_keyref — paint the key reference: title, help, then the records
-; flowed top-down into as many columns as fit. Group headers and combos
-; take the group's palette colour, sub-headers are dimmed, actions light.
+; flowed top-down into as many columns as fit. Each header and the combos
+; under it take its own palette colour, sub-headers are dimmed, actions light.
 draw_keyref:
     push rbx
     push r12
@@ -14423,20 +14424,30 @@ draw_keyref:
 .dkr_typed:
     cmp al, 'R'
     je .dkr_place
-    ; A header stays with the first lines of its block: the header plus
-    ; up to three records (H: sub-header + two rows; S: two rows). When
-    ; the column has fewer rows left, the header opens the next column.
+    ; A section stays whole in one column: a sub-header with all its
+    ; rows, a group header with its first section (or with all its rows
+    ; when it has no sub-headers). When the column has fewer rows left,
+    ; the header opens the next column. A section taller than a column
+    ; starts at the top of one and runs on.
     call kr_block_len                     ; eax = records in the block
-    mov ecx, 2
     cmp byte [kr_type + rbx], 'H'
-    jne .dkr_need_s
-    mov ecx, 3
-.dkr_need_s:
-    cmp eax, ecx
-    jbe .dkr_need_ok
-    mov eax, ecx
+    jne .dkr_need_ok
+    lea ecx, [rbx + 1]
+    cmp ecx, [kr_count]
+    jge .dkr_need_ok
+    cmp byte [kr_type + rcx], 'S'
+    jne .dkr_need_ok
+    push rbx
+    mov ebx, ecx
+    call kr_block_len                     ; eax = rows of the first section
+    pop rbx
+    inc eax                               ; its sub-header
 .dkr_need_ok:
     inc eax                               ; the header itself
+    cmp eax, r12d
+    jbe .dkr_need_fits
+    mov eax, r12d
+.dkr_need_fits:
     mov ecx, r12d
     sub ecx, [rsp+8]                      ; rows left in this column
     cmp ecx, eax
@@ -14457,7 +14468,7 @@ draw_keyref:
     mov r15d, edx                         ; y baseline
     movzx eax, byte [kr_type + rbx]
     movzx ecx, byte [kr_grp + rbx]
-    and ecx, 3
+    and ecx, 7
     mov r8d, [kr_palette + rcx*4]         ; group colour
     cmp al, 'R'
     je .dkr_row
