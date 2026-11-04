@@ -15,3 +15,5 @@ bind Mod4+comma move-tab left
 bind Mod4+period move-tab right
 bind Mod4+Shift+? workspace 6
 bind Mod4+k keys
+bind Mod4+o overview
+bind Mod4+Down workspace 8

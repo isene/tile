@@ -247,6 +247,14 @@ xdotool key super+k; sleep 0.3; xdotool key Escape; sleep 0.3
 is "after the key list closes, the window you were on shows" "$(shown "$b")" yes
 close a b c
 
+echo "== v0.1.90: closing the window list keeps the binds on its keys"
+# The window list (Mod4+o) takes Down, Return and Escape while it is open.
+# Letting them go for every modifier let go of tile's own Mod4+Down and
+# Mod4+Return too, so a new terminal and the next tab stopped working.
+go 1; xdotool key super+o; sleep 0.3; xdotool key Escape; sleep 0.3
+xdotool key super+Down; sleep 0.3
+is "Mod4+Down still reaches its bind" "$(cur)" 7
+
 echo "== v0.1.77: strip's LCARS look"
 # blocks = 1 puts each text run on a block of colour. The first segment's
 # block is orange, so a pixel above its letters is orange, not the black

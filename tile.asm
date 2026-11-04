@@ -278,7 +278,7 @@ naflag_str:      db "--no-autostart", 0    ; argv flag set by action_restart
 verflag_str:     db "--version", 0
 rsflag_str:      db "--restarted", 0       ; argv flag: a real restart, say so
 restart_note_cmd: db "notify-send -a tile -t 3000 -h string:bgcolor:#B7472A -h string:fgcolor:#FFFFFF -h string:frcolor:#B7472A 'tile restarted'", 0
-tile_ver_str:    db "tile 0.1.89", 10
+tile_ver_str:    db "tile 0.1.90", 10
 tile_ver_len     equ $ - tile_ver_str
 tile_usage_str:  db "usage: tile [--no-autostart] [--version] [--help]", 10
                  db "tile is a window manager: with no flags it takes over $DISPLAY.", 10
@@ -13034,15 +13034,13 @@ ov_resolve_keys:
     ret
 
 ; ============================================================================
-; ov_grab_keys — edi=1 grab, 0 ungrab. Passive-grab the navigation keys on
-; the root while the popup is open. tile's Mod4+ binds already prove passive
+; ov_grab_keys — passive-grab the navigation keys on the root while the
+; popup is open; close_overview lets them go. tile's Mod4+ binds already prove passive
 ; grabs are delivered under frame; the active XGrabKeyboard the grid used
 ; silently dropped every key under frame, so we use passive grabs instead.
 ; ============================================================================
 ov_grab_keys:
     push rbx
-    push r12
-    mov r12d, edi
     xor ebx, ebx
 .ogk_loop:
     cmp ebx, ov_grab_keys_n
@@ -13050,8 +13048,6 @@ ov_grab_keys:
     movzx eax, byte [ov_kc + rbx]
     test eax, eax
     jz .ogk_next
-    test r12d, r12d
-    jz .ogk_ungrab
     lea rdi, [tmp_buf]
     mov byte [rdi], X11_GRAB_KEY
     mov byte [rdi+1], 0                  ; owner-events = False
@@ -13068,25 +13064,10 @@ ov_grab_keys:
     mov rdx, 16
     call x11_buffer
     inc dword [x11_seq]
-    jmp .ogk_next
-.ogk_ungrab:
-    lea rdi, [tmp_buf]
-    mov byte [rdi], X11_UNGRAB_KEY
-    mov [rdi+1], al                      ; keycode
-    mov word [rdi+2], 3
-    mov ecx, [x11_root_window]
-    mov [rdi+4], ecx
-    mov word [rdi+8], 0x8000             ; AnyModifier
-    mov word [rdi+10], 0
-    lea rsi, [tmp_buf]
-    mov rdx, 12
-    call x11_buffer
-    inc dword [x11_seq]
 .ogk_next:
     inc ebx
     jmp .ogk_loop
 .ogk_done:
-    pop r12
     pop rbx
     ret
 
@@ -14607,7 +14588,6 @@ open_overview:
     ; delivered nothing under frame; tile's own Mod4+ binds prove passive
     ; grabs work). Resolve keysyms → keycodes first so remaps are honoured.
     call ov_resolve_keys
-    mov edi, 1
     call ov_grab_keys
     mov byte [overview_active], 1
     call draw_overview
@@ -14625,8 +14605,11 @@ close_overview:
     call kr_ungrab_kbd                    ; key reference: active grab
     jmp .co_ungrabbed
 .co_nav:
-    xor edi, edi
-    call ov_grab_keys                     ; workspace map: passive nav grabs
+    ; Letting a nav key go for AnyModifier lets go of tile's own binds on
+    ; it too (Mod4+Return, Mod4+Up), on Xorg and on frame since v0.1.55.
+    ; Drop every grab and take the binds again, as a reload does.
+    call ungrab_all_keys
+    call resolve_and_grab_binds
 .co_ungrabbed:
     mov byte [ov_mode], 0
     lea rdi, [tmp_buf]
