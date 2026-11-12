@@ -2,7 +2,7 @@
 
 <img src="img/tile.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.90-blue)
+![Version](https://img.shields.io/badge/version-0.1.91-blue)
 ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple)
 ![License](https://img.shields.io/badge/license-Unlicense-green)
 ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue)
@@ -122,6 +122,8 @@ DISPLAY=:9 glass                        # or: DISPLAY=:9 xterm
   (clock, battery, cpu, mem, disk, net, mailbox, brightness, vol,
   weather, wintitle). Per-segment refresh interval, `+N` leading-gap
   override, `>` to set a segment and all after it flush right,
+  `@wintitle:N` a window title at least N letters wide that runs on
+  to the segments set flush right,
   default-fg colour, all driven by `~/.striprc`. `blocks = 1` puts
   each segment on a block of colour, carried on through the gap after
   it; `colours = #a, #b, ...` gives the segments colours in turn,

@@ -326,6 +326,29 @@ done
 rm -f /tmp/frame${D}_*.raw
 is "the 4 starts at x=5, 7 columns of ink, then a gap" "$run" "5 7"
 
+echo "== v0.1.91: the window title runs up to the segments on the right"
+# @wintitle:N was N letters wide whatever the room, and the bar between
+# the title and the clock stayed empty. N is now the least it takes. The
+# title is 60 letters; at 8 pixels a letter its ink reaches past x=400.
+kill "${pids[-1]}"; sleep 0.3
+printf '%s\n' 'height = 22' 'fg = #cccccc' 'bg = #000000' \
+    'segment w #cccccc @wintitle:5 0' 'segment c > #cccccc printf XY 0' > "$HOME/.striprc"
+"${STRIP:-$here/../strip}" 2> "$T/strip.log" &
+pids+=($!); sleep 0.5
+long=$(printf 'W%.0s' {1..60})
+win "$long" > /dev/null; sleep 0.5
+rm -f /tmp/frame${D}_win_*.raw; kill -USR1 "${pids[0]}"; sleep 0.5
+last=none
+for f in /tmp/frame${D}_win_*.raw; do
+    [ "$(stat -c %s "$f" 2>/dev/null)" = $((1920 * 22 * 4)) ] || continue
+    last=$(for r in {0..21}; do od -An -v -tu1 -w4000 -j $((r * 7680)) -N 4000 "$f"; done | awk '
+        { for (c = 0; c < 1000; c++) if ($(c * 4 + 1) > 100) lit[c] = 1 }
+        END { for (c = 999; c >= 0 && !lit[c]; c--); print (c > 400 ? "past 400" : "at " c) }')
+done
+rm -f /tmp/frame${D}_*.raw
+close "$long"
+is "the title's ink reaches past x=400" "$last" "past 400"
+
 echo
 if [ $fails -eq 0 ]; then echo "tile tests: all good"; else echo "tile tests: $fails failed"; fi
 exit $((fails > 0))

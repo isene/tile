@@ -434,6 +434,7 @@ tmp_buf:             resb 4096
 ; either, never poll.
 %define WT_TITLE_MAX        1024
 %define WT_DEFAULT_MAXCHARS 40
+%define WT_CAP              (SEG_OUT_LEN - 3) ; most letters: "…" is 3 bytes
 wt_atom_net_active:  resd 1               ; _NET_ACTIVE_WINDOW
 wt_atom_net_wm_name: resd 1               ; _NET_WM_NAME
 wt_atom_utf8_string: resd 1               ; UTF8_STRING
@@ -442,6 +443,9 @@ wt_seg_idx:          resd 1               ; segment slot, -1 if no @wintitle
 wt_max_chars:        resd 1               ; truncation width in codepoints
 wt_title_len:        resd 1               ; bytes in wt_title_buf
 wt_title_buf:        resb WT_TITLE_MAX
+wt_base_chars:       resd 1               ; @wintitle:N, the least width
+wt_build:            resb 512             ; the title is built here, then cut
+                                          ; to fit the segment's output
 ws10_app:            resb 17              ; WS-10 active-app class from
                                           ; _TILE_BAR_STATE bytes 22..37 —
                                           ; rendered as "[0: app]" in @wintitle
@@ -519,6 +523,7 @@ _start:
     mov dword [segment_count], 0
     mov dword [wt_seg_idx], -1
     mov dword [wt_max_chars], WT_DEFAULT_MAXCHARS
+    mov dword [wt_base_chars], WT_DEFAULT_MAXCHARS
     mov dword [ws_seg_idx], -1
 
     ; Seed font config from defaults; striprc may override.
@@ -3075,6 +3080,10 @@ render_strip:
     call x11_buffer
     inc dword [x11_seq]
 
+    cmp dword [wt_seg_idx], -1
+    je .rs_walk
+    call wt_stretch                       ; the title takes the free room
+.rs_walk:
     ; Walk segments: render each via SGR-aware run emitter.
     mov r12d, 4                           ; running x in pixels
     call right_x
@@ -3872,12 +3881,15 @@ register_segment:
     jne .rseg_real_cmd                     ; trailing junk → not a builtin
     test eax, eax
     jz .rseg_wt_default
-    cmp eax, WT_TITLE_MAX
+    cmp eax, WT_CAP
     jbe .rseg_wt_take
+    mov eax, WT_CAP                        ; the most its output holds
+    jmp .rseg_wt_take
 .rseg_wt_default:
     mov eax, WT_DEFAULT_MAXCHARS
 .rseg_wt_take:
     mov [wt_max_chars], eax
+    mov [wt_base_chars], eax
     mov eax, [segment_count]
     mov [wt_seg_idx], eax
     or byte [r15 + SEG_OFF_FLAGS], SEG_FLAG_BUILTIN_WINTITLE
@@ -5848,7 +5860,7 @@ wt_publish_segment:
     je .wps_done
     imul rax, rax, SEG_STRIDE_REAL
     lea r12, [segments + rax]
-    lea r13, [r12 + SEG_OFF_OUTPUT]       ; output buffer
+    lea r13, [wt_build]                   ; built here, then copied
     mov r14d, [wt_max_chars]              ; codepoint cap
 
     ; Sanitize wt_title_buf in place: bytes <0x20 → ' '. Keeps the bar
@@ -5959,14 +5971,26 @@ wt_publish_segment:
     jmp .wps_pad_loop
 
 .wps_finalize:
-    ; Compute output length = rdi - r13.
+    ; Copy what was built into the segment's output. A title of letters
+    ; longer than one byte can be more than the output holds: cut it
+    ; there, between two letters.
     sub rdi, r13
-    mov rax, rdi
-    cmp rax, SEG_OUT_LEN
-    jbe .wps_len_ok
-    mov rax, SEG_OUT_LEN
-.wps_len_ok:
-    mov [r12 + SEG_OFF_OUT_LEN], al
+    mov ecx, edi                          ; bytes built
+    cmp ecx, SEG_OUT_LEN
+    jbe .wps_fits
+    mov ecx, SEG_OUT_LEN
+.wps_cut:
+    movzx eax, byte [r13 + rcx]           ; the first byte left out
+    and al, 0xC0
+    cmp al, 0x80                          ; inside a letter: cut earlier
+    jne .wps_fits
+    dec ecx
+    jmp .wps_cut
+.wps_fits:
+    mov [r12 + SEG_OFF_OUT_LEN], cl
+    lea rdi, [r12 + SEG_OFF_OUTPUT]
+    mov rsi, r13
+    rep movsb
     or byte [r12 + SEG_OFF_FLAGS], SEG_FLAG_DIRTY
     mov byte [strip_dirty], 1
 .wps_done:
@@ -5974,6 +5998,63 @@ wt_publish_segment:
     pop r14
     pop r13
     pop r12
+    pop rbx
+    ret
+
+; @wintitle runs as far as it can. Its width N (@wintitle:N) is the least
+; it takes; it grows into the room left between the segments on the left
+; and the ones set flush right ('>'), up to the right edge without them.
+; The room is measured with the title at N, so the title never pushes on
+; itself. It is built again only when its width changes. Cost: one count
+; of every segment's letters per render, only with @wintitle configured.
+wt_stretch:
+    push rbx
+    mov r9d, 4                            ; render_strip's left margin
+    xor ebx, ebx
+.wst_sum:
+    cmp ebx, [segment_count]
+    jge .wst_summed
+    mov rax, rbx
+    imul rax, SEG_STRIDE_REAL
+    lea r10, [segments + rax]
+    mov eax, [wt_base_chars]
+    cmp ebx, [wt_seg_idx]
+    je .wst_add                           ; the title at its least width
+    movzx edx, byte [r10 + SEG_OFF_OUT_LEN]
+    test edx, edx
+    jz .wst_next                          ; an empty segment takes no room
+    lea rsi, [r10 + SEG_OFF_OUTPUT]
+    call seg_chars
+.wst_add:
+    imul eax, [char_width_var]
+    add r9d, eax
+    add r9d, [r10 + SEG_OFF_GAP_OVR]
+    add r9d, [cfg_gap]
+.wst_next:
+    inc ebx
+    jmp .wst_sum
+.wst_summed:
+    movzx eax, word [x11_screen_width]
+    mov ecx, [tray_icon_size]
+    add ecx, [tray_padding]
+    imul ecx, [tray_icon_count]
+    sub eax, ecx                          ; right edge of the text
+    sub eax, r9d                          ; the room left over
+    jg .wst_room
+    xor eax, eax
+.wst_room:
+    xor edx, edx
+    div dword [char_width_var]
+    add eax, [wt_base_chars]
+    cmp eax, WT_CAP
+    jbe .wst_capped
+    mov eax, WT_CAP
+.wst_capped:
+    cmp eax, [wt_max_chars]
+    je .wst_done
+    mov [wt_max_chars], eax
+    call wt_publish_segment
+.wst_done:
     pop rbx
     ret
 
